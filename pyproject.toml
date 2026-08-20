@@ -1,0 +1,33 @@
+[build-system]
+requires = ["setuptools>=77.0.3", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "mini-redis"
+version = "0.1.0"
+description = "A Redis clone from scratch: RESP2 wire protocol, single-threaded event loop, string and list types, TTL expiry, snapshot persistence, rate limiting, and leader-follower replication."
+requires-python = ">=3.11"
+license = "MIT"
+license-files = ["LICENSE"]
+dependencies = []
+
+[project.optional-dependencies]
+dev = ["pytest", "redis>=5,<9"]
+profile = ["py-spy"]
+
+[tool.setuptools]
+py-modules = [
+    "server",
+    "event_loop",
+    "connection",
+    "resp",
+    "store",
+    "persistence",
+    "ratelimit",
+    "replication",
+]
+packages = ["commands"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]

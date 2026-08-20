@@ -1,0 +1,1 @@
+"""String and key commands: SET, GET, DEL, EXISTS, TYPE, EXPIRE, PEXPIRE, PEXPIREAT, TTL, PTTL, INCR, DECR."""
