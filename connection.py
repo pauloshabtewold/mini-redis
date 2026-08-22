@@ -35,7 +35,7 @@ class Connection:
         role: Role = Role.CLIENT,
     ) -> None:
         self._sock = sock
-        # kept because it is the only way to name a connection in a log
+        # the only way to name a connection in a log line or an error message
         self.addr = addr
         # bytearray because a consumed prefix is deleted (del buf[:n]) rather than the buffer being re-allocated.
         self.read_buffer = bytearray()
@@ -50,9 +50,7 @@ class Connection:
         return self._sock.fileno()
 
     def receive(self) -> bool:
-        # true means the peer is still connected, not that data arrived
-        # the BlockingIOError branch below returns True having read nothing
-        # One recv() and not a loop until BlockingIOError
+        # true means the peer is still connected, not that data arrived: the BlockingIOError branch returns True having read nothing
         try:
             data = self._sock.recv(RECV_SIZE)
         except BlockingIOError:
