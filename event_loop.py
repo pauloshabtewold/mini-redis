@@ -1,7 +1,8 @@
 """Selectors readiness dispatch: on_readable, on_writable, on_accept, and nothing else."""
 
 import selectors
-from typing import Any, Callable
+from collections.abc import Callable
+from typing import Any
 
 from connection import Connection
 
@@ -15,7 +16,7 @@ class EventLoop:
     The same rule sets the annotations below, where on_accept takes the
     listening socket and the other two take the ready Connection, but the
     listener is typed Any rather than socket.socket, because naming that
-    type would mean importing socket here for the sake of a hint. """
+    type would mean importing socket here for the sake of a hint."""
 
     def __init__(
         self,
