@@ -39,7 +39,7 @@ MIT. Copyright (c) 2026 Paulos Habtewold. See `LICENSE`.
 
 ## Module layout
 
-Root-level modules, plus the `commands` package:
+Root-level modules, plus the `commands` package. Each entry names the boundary that module owns; where the module has code, the entry also says how far it goes. Four of them -- `store.py`, `persistence.py`, `ratelimit.py`, `replication.py` -- and every module under `commands/` have none yet, and hold only that one line.
 
 - `server.py` -- entry point: the `--port` flag (default `6379`), a non-blocking listener bound to `127.0.0.1`, `SIGINT`/`SIGTERM` handling, and the event loop's three callbacks. Parses every command it receives and answers none of them. The four periodic tasks the design calls for -- expiry sweep, snapshot interval, follower reconnect, slow-follower check -- are not wired into the run loop.
 - `event_loop.py` -- `selectors` readiness dispatch: `on_readable`, `on_writable`, `on_accept`, driven by a `select()` bounded to a 100 ms timeout.
