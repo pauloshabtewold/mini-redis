@@ -18,8 +18,12 @@ One limitation is worth knowing before pointing anything at it, because nothing 
 ## Setup
 
 ```
+python3 -m venv .venv
+source .venv/bin/activate
 pip install -e '.[dev]'
 ```
+
+The virtual environment is not optional on a current Python: `pip install` run against a system interpreter either writes into it or refuses outright with `externally-managed-environment`. Activating it is also what puts `python` and `pip` on `PATH`.
 
 The single quotes around `.[dev]` are required: unquoted, `[dev]` is a glob pattern in zsh (the default macOS shell), so the shell expands it before pip ever sees it and the install silently does nothing.
 
