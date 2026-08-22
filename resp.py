@@ -6,9 +6,9 @@ CRLF = b"\r\n"
 
 
 class ProtocolError(Exception):
-    """A RESP2 grammar violation. message is the RESP error body a
-    client eventually sees, carried as `bytes` rather than `str` because
-    it reaches the wire unchanged.
+    """A RESP2 grammar violation. message is the error's RESP body,
+    carried as `bytes` rather than `str` because it goes on the wire
+    unchanged.
     """
 
     def __init__(self, message: bytes) -> None:
