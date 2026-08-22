@@ -11,7 +11,7 @@ from event_loop import EventLoop
 DEFAULT_PORT = 6379
 # the replication sync command is unauthenticated and is safe only bound to loopback.
 LISTEN_HOST = "127.0.0.1"
-# matches the shortest periodic interval this project will schedule (a 100 ms expiry sweep) and bounds how long a stop signal waits to be noticed.
+# bounds how long a stop signal waits to be noticed, and is the floor of this design's periodic intervals (a 100 ms expiry sweep).
 SELECT_TIMEOUT_SECONDS = 0.1
 
 
@@ -67,7 +67,7 @@ class Server:
         )
 
     def _close(self, conn: Connection) -> None:
-        # unregister before closing, so the selector looks a registration up by calling fileno(), which returns -1 on a closed socket.
+        # unregister before closing: fileno() is -1 once the socket is closed, and the selector then finds the registration only by scanning its whole map for a matching object.
         self._loop.unregister(conn)
         conn.close()
         self._connections.discard(conn)
@@ -76,11 +76,12 @@ class Server:
         self._running = False
 
     def run(self) -> None:
+        # raised before the handlers exist, because a signal delivered between installing them and this line would be cleared by the handler and then overwritten here.
+        self._running = True
         signal.signal(signal.SIGINT, self._request_stop)
         signal.signal(signal.SIGTERM, self._request_stop)
         listener = self._open_listener()
         self._loop.register_listener(listener)
-        self._running = True
         try:
             while self._running:
                 self._loop.run_once()

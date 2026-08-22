@@ -1,9 +1,15 @@
 import contextlib
+import pathlib
 import socket
+import subprocess
+import sys
 
 import pytest
 
 from server import Server
+from tests.int_ceiling import NO_CEILING_REASON, NO_CONVERSION_CEILING, OVERSIZED_DIGIT_RUN
+
+REPO_ROOT = pathlib.Path(__file__).resolve().parent.parent
 
 
 @contextlib.contextmanager
@@ -97,14 +103,20 @@ def test_protocol_error_closes_only_the_sending_connection():
         assert len(server._connections) == 1
 
 
+@pytest.mark.skipif(NO_CONVERSION_CEILING, reason=NO_CEILING_REASON)
 def test_oversized_length_header_does_not_take_the_server_down():
-    # a length header of ~4.3 KB is refused by the interpreter, not the parser, so an unguarded server dies on it and takes every connection down
+    # a length header past what the interpreter converts is refused by the interpreter, not the parser, so an unguarded server dies on it and takes every connection down
     with listening() as (server, connect, _listener):
         bystander = connect()
         attacker = connect()
         pump(server)
 
-        attacker.sendall(b"*" + b"9" * 4301 + b"\r\n")
+        # chunked, with the loop pumped between: the header is as long as the interpreter's
+        # ceiling, which can exceed what a socket will buffer while nothing is reading it
+        header = b"*" + OVERSIZED_DIGIT_RUN + b"\r\n"
+        for start in range(0, len(header), 32768):
+            attacker.sendall(header[start:start + 32768])
+            pump(server, times=1)
         pump(server)
 
         assert len(server._connections) == 1, "only the sender should be dropped"
@@ -130,6 +142,37 @@ def test_write_interest_is_unreachable_and_says_so():
         conn = next(iter(server._connections))
         with pytest.raises(RuntimeError, match="no drain to service it"):
             server._on_writable(conn)
+
+
+# delivers a real SIGTERM from inside run()'s own setup, which is the only place the window
+# between installing the handler and raising the stop flag can be reached at all
+_STOP_DURING_STARTUP = """
+import os, signal, sys
+sys.path.insert(0, %r)
+from server import Server
+
+
+class SignalledDuringSetup(Server):
+    def _open_listener(self):
+        listener = super()._open_listener()
+        os.kill(os.getpid(), signal.SIGTERM)
+        return listener
+
+
+SignalledDuringSetup(0).run()
+print("returned")
+"""
+
+
+def test_a_stop_signal_delivered_during_startup_is_not_lost():
+    # a subprocess with a deadline, for two reasons: the failure is a run loop that never
+    # returns, which in-process would hang the suite rather than fail it -- and run() installs
+    # SIGINT and SIGTERM handlers it never restores, which would outlive this test
+    probe = subprocess.run(
+        [sys.executable, "-c", _STOP_DURING_STARTUP % str(REPO_ROOT)],
+        capture_output=True, text=True, timeout=15,
+    )
+    assert probe.stdout.strip() == "returned", (probe.returncode, probe.stdout, probe.stderr)
 
 
 def test_accept_with_nothing_pending_adds_no_connection():
