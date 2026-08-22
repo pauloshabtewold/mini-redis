@@ -98,7 +98,7 @@ def test_protocol_error_closes_only_the_sending_connection():
 
 
 def test_oversized_length_header_does_not_take_the_server_down():
-    # a single ~4.3 KB write once killed the process and every connection on it
+    # a length header of ~4.3 KB is refused by the interpreter, not the parser, so an unguarded server dies on it and takes every connection down
     with listening() as (server, connect, _listener):
         bystander = connect()
         attacker = connect()

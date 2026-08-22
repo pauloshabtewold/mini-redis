@@ -1,4 +1,4 @@
-"""Entry point: CLI flags, signal handling, and the event loop's three callback bodies; periodic tasks aren't wired in yet."""
+"""Entry point: CLI flags, signal handling, and the event loop's three callback bodies. Nothing is scheduled to run periodically."""
 
 import argparse
 import signal
