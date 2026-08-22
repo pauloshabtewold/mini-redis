@@ -86,7 +86,7 @@ def test_take_commands_propagates_protocol_error(pair):
 
 
 def test_oversized_length_header_is_a_protocol_error_not_a_crash(pair):
-    # the shape that killed the process: isdigit() passes, int() refuses, and an escaping ValueError takes down every connection rather than this one
+    # isdigit() passes this and int() refuses it, so an unguarded parser raises ValueError here and drops every connection instead of only this one
     conn, peer = pair
     peer.sendall(b"*" + b"9" * 4301 + b"\r\n")
     conn.receive()

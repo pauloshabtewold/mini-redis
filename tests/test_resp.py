@@ -4,7 +4,7 @@ import resp
 
 
 def _feed_one_byte_at_a_time(wire, expected_argv):
-    #Append wire into a bytearray one byte at a time, calling parse command after every byte and deleting the consumed prefix
+    # Append wire into a bytearray one byte at a time, calling parse command after every byte and deleting the consumed prefix
     buf = bytearray()
     last_index = len(wire) - 1
     for index, byte in enumerate(wire):
@@ -20,7 +20,7 @@ def _feed_one_byte_at_a_time(wire, expected_argv):
     assert buf == bytearray()
 
 
-#literal wire strings 
+# literal wire strings
 
 
 def test_literal_wire_multibulk_ping():
@@ -35,7 +35,7 @@ def test_response_encoders_match_literal_wire_bytes():
     assert resp.encode_bulk_string(None) == b"$-1\r\n"
 
 
-#round trips
+# round trips
 
 def test_multi_argument_command_round_trips_through_encoder():
     argv_in = [b"SET", b"k", b"v"]
@@ -53,7 +53,7 @@ def test_nested_array_matches_literal_encoding():
     assert wire == b"*2\r\n*1\r\n:1\r\n$1\r\na\r\n"
 
 
-#buffer boundaries
+# buffer boundaries
 
 
 def test_bulk_body_containing_crlf_is_one_value():
@@ -154,7 +154,7 @@ def test_parsed_argv_elements_are_bytes():
     assert type(argv[1]) is bytes, type(argv[1])
 
 
-# inline commands 
+# inline commands
 
 
 def test_inline_command_without_framing():
