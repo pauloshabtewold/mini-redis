@@ -1,3 +1,5 @@
+"""RESP2 parser and serializer: bytes in, bytes out."""
+
 from collections.abc import Sequence
 
 CRLF = b"\r\n"
@@ -27,7 +29,11 @@ def _parse_length(field: bytes | bytearray, error_message: bytes) -> int:
     # isdigit() is False for a leading "-" as well as for any non-digit content, so "negative" and "not a decimal integer" collapse into the one check the shared error message already implies.
     if not field.isdigit():
         raise ProtocolError(error_message)
-    return int(field)
+    try:
+        return int(field)
+    except ValueError:
+        # isdigit() passes digit strings longer than CPython will convert, 4300 by default, and an escaping ValueError kills the process instead of the connection
+        raise ProtocolError(error_message) from None
 
 
 def _parse_multibulk(buf: bytes | bytearray) -> tuple[list[bytes] | None, int]:

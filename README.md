@@ -39,7 +39,7 @@ MIT. Copyright (c) 2026 Paulos Habtewold. See `LICENSE`.
 
 Root-level modules, plus the `commands` package:
 
-- `server.py` -- entry point: the `--port` flag (default `6379`), a non-blocking listener bound to `127.0.0.1`, `SIGINT`/`SIGTERM` handling, and the event loop's three callbacks. Parses every command it receives and answers none of them. The four periodic tasks named in its docstring aren't wired into the run loop yet.
+- `server.py` -- entry point: the `--port` flag (default `6379`), a non-blocking listener bound to `127.0.0.1`, `SIGINT`/`SIGTERM` handling, and the event loop's three callbacks. Parses every command it receives and answers none of them. The four periodic tasks the design calls for -- expiry sweep, snapshot interval, follower reconnect, slow-follower check -- are not wired into the run loop.
 - `event_loop.py` -- `selectors` readiness dispatch: `on_readable`, `on_writable`, `on_accept`, driven by a `select()` bounded to a 100 ms timeout.
 - `connection.py` -- the `Connection` class: private socket, read and write buffers, a `closed` flag, `role`, and two state slots read and written only by the rate limiter and the replication link. `queue(bytes)` is the only outbound API; nothing drains the buffer it fills yet, so nothing calling it puts a byte on the wire.
 - `resp.py` -- RESP2 parser and serializer, `bytes` in and `bytes` out. Parses multibulk arrays and inline commands and reports an incomplete command without consuming it; its response encoders exist and have no caller yet.

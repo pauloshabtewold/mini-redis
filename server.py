@@ -1,4 +1,4 @@
-"""Entry point: CLI flags, signal handling, and the four periodic tasks that run after each select() return."""
+"""Entry point: CLI flags, signal handling, and the event loop's three callback bodies; periodic tasks aren't wired in yet."""
 
 import argparse
 import signal
@@ -43,6 +43,7 @@ class Server:
         try:
             sock, addr = listener.accept()
         except OSError:
+            # a peer aborting between readiness and accept is normal, and no per-connection boundary can cover this because no connection exists yet; EMFILE arrives here too and looks identical
             return
         # one accept per readable event, so the level-triggered readiness re-reports a remaining backlog on the next select() return.
         sock.setblocking(False)

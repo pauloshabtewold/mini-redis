@@ -139,6 +139,15 @@ def test_empty_bulk_string():
     assert resp.encode_bulk_string(b"") == b"$0\r\n\r\n"
 
 
+def test_every_buffer_type_parses_and_always_yields_bytes():
+    # memoryview has no .find(), so the parser normalises it first; nothing else in the suite exercises that branch
+    wire = b"*1\r\n$1\r\nx\r\n"
+    for buf in (wire, bytearray(wire), memoryview(wire)):
+        argv, consumed = resp.parse_command(buf)
+        assert argv == [b"x"] and consumed == len(wire), (type(buf), argv, consumed)
+        assert type(argv[0]) is bytes, type(argv[0])
+
+
 def test_parsed_argv_elements_are_bytes():
     argv, _ = resp.parse_command(b"*2\r\n$3\r\nfoo\r\n$3\r\nbar\r\n")
     assert type(argv[0]) is bytes, type(argv[0])
