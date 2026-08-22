@@ -8,6 +8,8 @@ The server accepts TCP connections, reads the bytes each one sends, and parses t
 
 A client speaking to it with `redis-cli` gets no answer to anything it sends, `PING` included: the connection opens, the request goes out, and nothing comes back, because the command layer on the other end doesn't exist yet. A command that fails to parse closes only the connection that sent it -- the server, and every other connection on it, keeps running.
 
+One limitation is worth knowing before pointing anything at it, because nothing in the transcript reveals it: no size or count cap is applied to a request. A command that never completes -- a bulk string whose declared length runs to a gigabyte, whose body never arrives -- holds every byte sent so far in that connection's read buffer for as long as the connection stays open, and one client may open as many connections as the process has descriptors. The caps that refuse such a request, and the connection limit that bounds how many may be open at once, ship with the flags that configure them. Binding `127.0.0.1` and nothing else is what keeps that a local concern in the meantime.
+
 ## Requirements
 
 - Python >=3.11
