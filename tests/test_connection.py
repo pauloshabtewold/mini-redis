@@ -4,6 +4,17 @@ import pytest
 
 import resp
 from connection import Connection, Role
+from tests.int_ceiling import NO_CEILING_REASON, NO_CONVERSION_CEILING, OVERSIZED_DIGIT_RUN
+
+
+def _deliver(conn, peer, payload):
+    # drains as it sends: a socketpair holds 8 KiB unread, and a header sized from the
+    # interpreter's conversion ceiling can be larger than that, which blocks sendall() forever
+    view = memoryview(payload)
+    while view:
+        sent = peer.send(view[:4096])
+        view = view[sent:]
+        conn.receive()
 
 
 @pytest.fixture
@@ -85,11 +96,11 @@ def test_take_commands_propagates_protocol_error(pair):
         conn.take_commands()
 
 
+@pytest.mark.skipif(NO_CONVERSION_CEILING, reason=NO_CEILING_REASON)
 def test_oversized_length_header_is_a_protocol_error_not_a_crash(pair):
     # isdigit() passes this and int() refuses it, so an unguarded parser raises ValueError here and drops every connection instead of only this one
     conn, peer = pair
-    peer.sendall(b"*" + b"9" * 4301 + b"\r\n")
-    conn.receive()
+    _deliver(conn, peer, b"*" + OVERSIZED_DIGIT_RUN + b"\r\n")
     with pytest.raises(resp.ProtocolError):
         conn.take_commands()
 

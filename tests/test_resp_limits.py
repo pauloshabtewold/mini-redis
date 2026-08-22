@@ -1,18 +1,33 @@
-import sys
-
 import pytest
 
 import resp
+from tests.int_ceiling import (
+    NO_CEILING_REASON,
+    NO_CONVERSION_CEILING,
+    OVERSIZED_DIGIT_RUN,
+)
 
 # one row per input shape the parser must refuse from the header alone, with no body bytes following it
 REJECTED_HEADERS = [
-    (b"*1\r\n$-1\r\n", b"ERR Protocol error: invalid bulk length"),
-    (b"*1\r\n$-2\r\n", b"ERR Protocol error: invalid bulk length"),
-    (b"*-1\r\n", b"ERR Protocol error: invalid multibulk length"),
-    (b"*-5\r\n", b"ERR Protocol error: invalid multibulk length"),
-    # a digit run longer than CPython converts: isdigit() passes it and int() raises, so an unguarded parser dies here rather than rejecting
-    (b"*1\r\n$" + b"9" * 4301 + b"\r\n", b"ERR Protocol error: invalid bulk length"),
-    (b"*" + b"9" * 4301 + b"\r\n", b"ERR Protocol error: invalid multibulk length"),
+    pytest.param(b"*1\r\n$-1\r\n", b"ERR Protocol error: invalid bulk length", id="bulk -1"),
+    pytest.param(b"*1\r\n$-2\r\n", b"ERR Protocol error: invalid bulk length", id="bulk -2"),
+    pytest.param(b"*-1\r\n", b"ERR Protocol error: invalid multibulk length", id="multibulk -1"),
+    pytest.param(b"*-5\r\n", b"ERR Protocol error: invalid multibulk length", id="multibulk -5"),
+    # a digit run longer than the interpreter converts: isdigit() passes it and int() raises, so an
+    # unguarded parser dies here rather than rejecting. Skipped rather than silently dropped where
+    # the ceiling is disabled, since the shape has no witness there at all
+    pytest.param(
+        b"*1\r\n$" + OVERSIZED_DIGIT_RUN + b"\r\n",
+        b"ERR Protocol error: invalid bulk length",
+        id="bulk length past the conversion ceiling",
+        marks=pytest.mark.skipif(NO_CONVERSION_CEILING, reason=NO_CEILING_REASON),
+    ),
+    pytest.param(
+        b"*" + OVERSIZED_DIGIT_RUN + b"\r\n",
+        b"ERR Protocol error: invalid multibulk length",
+        id="multibulk count past the conversion ceiling",
+        marks=pytest.mark.skipif(NO_CONVERSION_CEILING, reason=NO_CEILING_REASON),
+    ),
 ]
 
 
@@ -24,11 +39,16 @@ def test_rejected_from_header_alone(wire, message):
 
 
 def test_oversized_digit_run_raises_protocol_error_not_value_error():
-    # the guard is the interpreter's, so pin the assumption it rests on: a field one digit past the ceiling must not reach int() unguarded
-    ceiling = sys.get_int_max_str_digits()
-    field = b"9" * (ceiling + 1)
+    # the guard is the interpreter's, so pin the assumption it rests on rather than a constant.
+    # Both arms assert, so no interpreter setting leaves this test running and checking nothing
+    if NO_CONVERSION_CEILING:
+        # nothing isdigit() admits can make int() raise here, so the contract is not that the
+        # header is refused but that it is still incomplete -- waiting, never crashing
+        assert resp.parse_command(b"*" + b"9" * 5000 + b"\r\n") == (None, 0)
+        assert resp.parse_command(b"*1\r\n$" + b"9" * 5000 + b"\r\n") == (None, 0)
+        return
     with pytest.raises(ValueError):
-        int(field)              # the raw conversion the parser must never let escape
-    assert field.isdigit()      # and which the isdigit() guard alone does not stop
+        int(OVERSIZED_DIGIT_RUN)              # the raw conversion the parser must never let escape
+    assert OVERSIZED_DIGIT_RUN.isdigit()      # and which the isdigit() guard alone does not stop
     with pytest.raises(resp.ProtocolError):
-        resp.parse_command(b"*" + field + b"\r\n")
+        resp.parse_command(b"*" + OVERSIZED_DIGIT_RUN + b"\r\n")
