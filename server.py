@@ -1,9 +1,12 @@
 """Entry point: CLI flags, signal handling, and the event loop's three callback bodies. Nothing is scheduled to run periodically."""
 
 import argparse
+import logging
 import signal
 import socket
+from collections.abc import Callable
 
+import commands
 import resp
 from connection import Connection, Role
 from event_loop import EventLoop
@@ -13,6 +16,9 @@ DEFAULT_PORT = 6379
 LISTEN_HOST = "127.0.0.1"
 # bounds how long a stop signal waits to be noticed, and is the floor of this design's periodic intervals (a 100 ms expiry sweep).
 SELECT_TIMEOUT_SECONDS = 0.1
+
+# logging.lastResort sends an ERROR record to stderr with no configuration
+logger = logging.getLogger(__name__)
 
 
 def build_arg_parser() -> argparse.ArgumentParser:
@@ -53,18 +59,48 @@ class Server:
         self._connections.add(conn)
 
     def _on_readable(self, conn: Connection) -> None:
+        self._guard(conn, self._read_and_dispatch)
+
+    def _on_writable(self, conn: Connection) -> None:
+        # the drain has two entry points and one body, so the write-interest decision is taken in exactly one place
+        self._guard(conn, self._flush)
+
+    def _guard(self, conn: Connection, step: Callable[[Connection], None]) -> None:
+        # a single-threaded loop turns every uncaught exception into a total outage for every client, which is why this boundary is mandatory rather than defensive -- BlockingIOError and InterruptedError are named first because both are OSError subclasses
+        try:
+            step(conn)
+        except (BlockingIOError, InterruptedError):
+            return
+        except Exception:
+            logger.exception("closing %s after an unhandled exception", conn.addr)
+            self._close(conn)
+
+    def _read_and_dispatch(self, conn: Connection) -> None:
         if not conn.receive():
             self._close(conn)
             return
         try:
-            conn.take_commands()
-        except resp.ProtocolError:
+            parsed_commands = conn.take_commands()
+        except resp.ProtocolError as exc:
+            # exc.message is already the RESP error body; delivery is best-effort since the connection closes right after, so a short send() drops the tail of a message the peer was about to lose anyway
+            conn.queue(resp.encode_error(exc.message))
+            self._flush(conn)
             self._close(conn)
+            return
+        # every command take_commands() returns is dispatched: level-triggered readiness re-reports unread socket bytes, not commands already taken out of the buffer, so a leftover here is never revisited and the client waits forever
+        for argv in parsed_commands:
+            conn.queue(commands.dispatch(conn, argv))
+        # one flush for the whole batch, not one per command: N replies concatenate into one buffer and N syscalls buy nothing
+        self._flush(conn)
 
-    def _on_writable(self, conn: Connection) -> None:
-        raise RuntimeError(
-            f"write interest registered for {conn.addr} with no drain to service it"
-        )
+    def _flush(self, conn: Connection) -> None:
+        if conn.closed:
+            return
+        if not conn.flush():
+            self._close(conn)
+            return
+        # write interest tracks the buffer's emptiness exactly: a connection left permanently writable spins the loop at 100% CPU without dropping a single reply
+        self._loop.set_write_interest(conn, bool(conn.write_buffer))
 
     def _close(self, conn: Connection) -> None:
         # unregister before closing: fileno() is -1 once the socket is closed, and the selector then finds the registration only by scanning its whole map for a matching object.

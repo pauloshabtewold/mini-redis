@@ -4,11 +4,9 @@ mini-redis is a Redis clone built from scratch in Python: a single-threaded even
 
 ## Status
 
-The server accepts TCP connections, reads the bytes each one sends, and parses the RESP2 commands in that stream -- multibulk arrays and inline commands such as a bare `PING\r\n` alike, well-formed or not. It sends nothing back. No command has a handler, and nothing carries a reply out to the socket even if one existed: the dispatcher that would route a parsed command to a handler, and the write-buffer drain that would carry the handler's answer back out, arrive together.
+The server accepts TCP connections, reads the bytes each one sends, and parses the RESP2 commands in that stream -- multibulk arrays and inline commands such as a bare `PING\r\n` alike, well-formed or not. Three commands answer: `PING`, `ECHO` and `HELLO`. Everything else gets `-ERR unknown command '<name>'`, and the connection stays open either way -- an unrecognized command is a mistake in one request, not a reason to drop the connection, so a real client's own probes fail harmlessly instead of hanging it. A reply that can't go out in one `send()` -- the kernel's send buffer is full -- sits in a per-connection write buffer until a later writable event drains what's left; nothing is lost to a partial write. There is still no keyspace: nothing stores a value, so this is not yet usable as a key-value store, and a command like `SET` gets the same unknown-command error a typo would. A command that fails to parse closes only the connection that sent it -- the server, and every other connection on it, keeps running.
 
-A client speaking to it with `redis-cli` gets no answer to anything it sends, `PING` included: the connection opens, the request goes out, and nothing comes back, because the command layer on the other end doesn't exist yet. A command that fails to parse closes only the connection that sent it -- the server, and every other connection on it, keeps running.
-
-One limitation is worth knowing before pointing anything at it, because nothing in the transcript reveals it: no size or count cap is applied to a request. A command that never completes -- a bulk string whose declared length runs to a gigabyte, whose body never arrives -- holds every byte sent so far in that connection's read buffer for as long as the connection stays open, and one client may open as many connections as the process has descriptors. The caps that refuse such a request, and the connection limit that bounds how many may be open at once, ship with the flags that configure them. Binding `127.0.0.1` and nothing else is what keeps that a local concern in the meantime.
+One limitation is worth knowing before pointing anything at it, because nothing in a transcript reveals it: no size or count cap is applied to a request, and none is applied to a queued reply either. A command that never completes -- a bulk string whose declared length runs to a gigabyte, whose body never arrives -- holds every byte sent so far in that connection's read buffer for as long as the connection stays open, and a large enough `ECHO` queues a reply just as large on the way out, with nothing yet capping either direction. One client may also open as many connections as the process has descriptors. The caps that refuse an oversized request, the ceiling on a queued reply, and the connection limit that bounds how many may be open at once all ship with the flags that configure them. Binding `127.0.0.1` and nothing else is what keeps that a local concern in the meantime.
 
 ## Requirements
 
@@ -35,7 +33,22 @@ This installs the `dev` extra: `pytest` and the `redis` client (`>=5,<9`).
 python3 server.py [--port PORT]
 ```
 
-`--port` defaults to `6379`, the same default `redis-cli` uses, so `redis-cli` run with no arguments reaches a locally running instance. What it gets past the connection is silence: nothing sent to it gets a reply, `PING` included, for the reason the Status section above gives.
+`--port` defaults to `6379`, the same default `redis-cli` uses, so `redis-cli` run with no arguments reaches a locally running instance:
+
+```
+$ redis-cli PING
+PONG
+```
+
+Anything other than `PING`, `ECHO` or `HELLO` gets `-ERR unknown command`, rendered by `redis-cli` without the leading `-`; the connection stays open either way, so a client can keep sending after one request gets rejected.
+
+## Running the tests
+
+```
+python -m pytest
+```
+
+Run from the repository root, with the virtual environment from Setup active.
 
 ## License
 
@@ -43,17 +56,17 @@ MIT. Copyright (c) 2026 Paulos Habtewold. See `LICENSE`.
 
 ## Module layout
 
-Root-level modules, plus the `commands` package. Each entry names the boundary that module owns; where the module has code, the entry also says how far it goes. Four of them -- `store.py`, `persistence.py`, `ratelimit.py`, `replication.py` -- and every module under `commands/` have none yet, and hold only that one line.
+Root-level modules, plus the `commands` package. Each entry names the boundary that module owns; where the module has code, the entry also says how far it goes. Four of them -- `store.py`, `persistence.py`, `ratelimit.py`, `replication.py` -- and two modules under `commands/` -- `string.py`, `list.py` -- have none yet, and hold only that one line.
 
-- `server.py` -- entry point: the `--port` flag (default `6379`), a non-blocking listener bound to `127.0.0.1`, `SIGINT`/`SIGTERM` handling, and the event loop's three callbacks. Parses every command it receives and answers none of them. The four periodic tasks the design calls for -- expiry sweep, snapshot interval, follower reconnect, slow-follower check -- are not wired into the run loop.
-- `event_loop.py` -- `selectors` readiness dispatch: `on_readable`, `on_writable`, `on_accept`, driven by a `select()` bounded to a 100 ms timeout.
-- `connection.py` -- the `Connection` class: private socket, read and write buffers, a `closed` flag, `role`, and two state slots read and written only by the rate limiter and the replication link. `queue(bytes)` is the only outbound API; nothing drains the buffer it fills yet, so nothing calling it puts a byte on the wire.
-- `resp.py` -- RESP2 parser and serializer, `bytes` in and `bytes` out. Parses multibulk arrays and inline commands and reports an incomplete command without consuming it; its response encoders exist and have no caller yet.
+- `server.py` -- entry point: the `--port` flag (default `6379`), a non-blocking listener bound to `127.0.0.1`, `SIGINT`/`SIGTERM` handling, and the event loop's three callbacks. Every command parsed out of a connection's buffer is dispatched and its reply queued, one flush runs against the whole batch after the last one, and write interest is updated from what that flush leaves behind. A single per-connection exception boundary wraps every step of that path; anything other than a retryable error closes only the connection that raised it. The four periodic tasks the design calls for -- expiry sweep, snapshot interval, follower reconnect, slow-follower check -- are not wired into the run loop.
+- `event_loop.py` -- `selectors` readiness dispatch: `on_readable`, `on_writable`, `on_accept`, driven by a `select()` bounded to a 100 ms timeout, plus `set_write_interest()` to register or clear `EVENT_WRITE` against the selector's own mask.
+- `connection.py` -- the `Connection` class: private socket, read and write buffers, a `closed` flag, `role`, a per-connection `id`, and two state slots read and written only by the rate limiter and the replication link. `queue(bytes)` appends to the write buffer and is the only outbound API; `flush()` is the only thing that writes to the socket, looping until the buffer empties or the kernel refuses more, and it reports whether the peer is still connected rather than whether the buffer is empty.
+- `resp.py` -- RESP2 parser and serializer, `bytes` in and `bytes` out. Parses multibulk arrays and inline commands and reports an incomplete command without consuming it; its response encoders are what every handler under `commands/` calls to build a reply.
 - `store.py` -- the keyspace, the expiry index, and the pending-effects queue.
 - `persistence.py` -- versioned snapshot format: save and load.
 - `ratelimit.py` -- per-connection sliding-window rate limiter.
 - `replication.py` -- leader-side follower manager and follower mode.
-- `commands/` -- the command layer, split by type: `registry.py` (name, arity, read/write/other tag, dispatch), `string.py`, `list.py`, and `server.py` (connection and server commands).
+- `commands/` -- the command layer, split by type. `registry.py` (name, arity, read/write/other tag, dispatch) and `server.py` (`PING`, `ECHO`, `HELLO` today) hold code; `string.py` and `list.py` are still one docstring line each.
 - `tests/` -- the test suite.
 
 ### Why the protocol layer works in bytes
@@ -78,9 +91,9 @@ The tasks that need to run on a schedule -- sweeping expired keys, writing a sna
 
 ### Why inline commands are supported
 
-A bare `PING\r\n`, with no multibulk framing at all, parses as a command here. That's what makes `telnet localhost 6379` and `nc` work as a demo with nothing installed beyond what a shell already has -- point either one at the port and type a command by hand.
+A bare `PING\r\n`, with no multibulk framing at all, parses as a command here, and now gets a real `+PONG` back like any other reply. That's what makes `telnet localhost 6379` and `nc` work as a demo with nothing installed beyond what a shell already has -- point either one at the port, type a command, and get an answer in the same session.
 
-It isn't free. Real Redis ships a companion load-generation CLI alongside `redis-cli`, and its default run leans on that same unframed `PING` to get started. Rejecting inline input would have stopped that tool cold on its first request with a clean protocol error -- a legible failure. Accepting it instead means that same first request gets no reply at all: this server answers nothing, to anyone, so the tool hangs waiting for a response that never comes -- a far less legible failure, and a caveat worth knowing before trusting its output at face value.
+Real Redis ships a companion load-generation CLI alongside `redis-cli`, and its default run leans on that same unframed `PING` to get started; accepting inline input here is what lets that tool's first request succeed instead of failing on a framing it never sends.
 
 ### Why the periodic tasks belong in server.py
 
@@ -89,3 +102,32 @@ The four periodic tasks driven off the `select()` timeout -- expiry sweep, snaps
 ### Why commands is a package
 
 The command layer covers twenty-six commands across the string, list, and server/connection groups, each with its own arity check, type check, option parsing, and effect return. A single `commands.py` holding all of that would be a god object, so the command layer is split by type into its own package instead, with `registry.py` handling registration and dispatch.
+
+### Why the kind tag is declared at the handler
+
+A command's `read`/`write`/`other` tag is set through the same decorator that registers it, in `commands/registry.py`, rather than listed in a separate table somewhere. A table is a second place that can disagree with the handler it describes -- a rate limiter or a replication decision reads whichever one it was pointed at, and a command mistagged in the table looks correct at every other call site. Declaring the tag where the command is registered means the declaration and the handler are the same statement, so the two can't drift apart; an enum on top of that turns a typo in the tag into an error at the line that has it, instead of a value that silently matches nothing.
+
+### Why a reply and its effect are different facts
+
+A handler here returns reply bytes and nothing else. What a client sees is not always the whole of what a later feature needs to know happened -- a read that finds an expired key still has to produce a deletion somewhere, with no write command anywhere in sight, and a replica needs that deletion even though no client asked for one. Building a second return value now for a fact that has no consumer yet -- nothing here stores anything, and nothing here replicates -- would be code with no test able to exercise it honestly. The reply and the effect stay one value until the feature that introduces the store needs both.
+
+### Why the write path exists before any reply is large
+
+Three commands exist and none of them touches a keyspace, but a reply can already be as large as `ECHO`'s own argument, and a socket can already refuse to take a large write in one call. Measured against a version of this server whose only write path was a bare `socket.send()` with nothing behind it to catch what the kernel wouldn't take: 531,664 of 2,000,000 replies arrived whole, and the rest were cut short mid-frame with nothing to say so. A write path that survives a partial write isn't an optimization added later -- it's the difference between a reply and a silently truncated one, and it ships in the same commit as the first reply rather than waiting for a request large enough to make the gap obvious.
+
+### Why write interest turns off the moment the buffer empties
+
+`event_loop.py` asks the selector whether a connection is writable only while that connection's write buffer is non-empty, and clears the request the instant a flush empties it. An idle, healthy socket is writable on nearly every pass, so a write request left registered against an empty buffer would have the selector reporting that connection ready again and again with nothing queued to send -- the loop would spend its time asking the kernel about a socket that has nothing to say. The selector's own mask is also the only place this fact is kept: a separate flag on `Connection` would be a second copy that can disagree with the selector, in either direction, with nothing around to notice when it does.
+
+### Why an unknown command gets an error, not silence
+
+`-ERR unknown command '<name>'` costs one write and leaves the connection open. Silence costs nothing to produce and is worse to receive: a client that gets nothing back cannot tell a slow server from one that will never answer, and has no way to distinguish "still working on it" from "doesn't understand this at all" -- it can only wait, or guess. An error reply lets a client's own retry and timeout logic run the way it was built to, on a connection that never had to be dropped over a single bad request.
+
+### Why one exception boundary covers a whole connection
+
+Every step of handling a connection's traffic -- reading, parsing, dispatching, writing -- runs inside the same `try`/`except` in `server.py`, reached from both the readable and the writable callback, rather than one boundary per callback. Two boundaries are two places to write a slightly different close path, and the failure that produces is invisible until a client happens to hit the one that's wrong: a bug that closes its connection cleanly when it surfaces on a read, and takes the whole process down when the same bug surfaces on a write. A single-threaded server has exactly one thread to lose, which is what makes this boundary mandatory rather than a defensive habit -- every other connection's traffic stops the moment an unhandled exception reaches the top of that thread.
+
+### Two deliberate differences from real Redis
+
+- An unknown command answers `ERR unknown command '<name>'`. Real Redis appends the first few arguments it received to that message; this server never does, so the message stays short and the argument list plays no part in it.
+- `HELLO` with an argument other than `2` answers `NOPROTO unsupported protocol version`, including when the argument isn't a number at all. Real Redis gives a non-numeric argument a different error describing a parse failure specifically; this server answers every non-`2` argument the same way, numeric or not, so there is exactly one rule to remember rather than one rule plus an exception.

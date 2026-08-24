@@ -1,6 +1,7 @@
 """The Connection class: owns the socket, the read and write buffers, the role, and the only outbound API."""
 
 import enum
+import itertools
 import socket
 
 import resp
@@ -27,6 +28,9 @@ class Role(enum.StrEnum):
     LEADER_LINK = "leader_link"
 
 
+_NEXT_ID = itertools.count(1)
+
+
 class Connection:
     def __init__(
         self,
@@ -37,6 +41,8 @@ class Connection:
         self._sock = sock
         # the only way to name a connection in a log line or an error message
         self.addr = addr
+        # a counter, since descriptors are reused and fileno() would give two connections the same id
+        self.id = next(_NEXT_ID)
         # bytearray because a consumed prefix is deleted (del buf[:n]) rather than the buffer being re-allocated.
         self.read_buffer = bytearray()
         self.write_buffer = bytearray()
@@ -79,6 +85,21 @@ class Connection:
     def queue(self, data: bytes) -> None:
         # the only outbound API. the socket is private, so a search for a raw socket write anywhere outside this module finds every bypass.
         self.write_buffer.extend(data)
+
+    def flush(self) -> bool:
+        # true means the peer is still connected, not that the buffer emptied: a short write is the normal outcome this path exists for
+        while self.write_buffer:
+            try:
+                # the bytearray goes to send() directly: a live memoryview of it would make the del below raise BufferError
+                sent = self._sock.send(self.write_buffer)
+            except BlockingIOError:
+                return True
+            except OSError:
+                return False
+            if not sent:
+                return True
+            del self.write_buffer[:sent]
+        return True
 
     def close(self) -> None:
         if self.closed:

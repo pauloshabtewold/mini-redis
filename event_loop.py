@@ -42,6 +42,16 @@ class EventLoop:
     def unregister(self, conn: Connection) -> None:
         self._selector.unregister(conn)
 
+    def set_write_interest(self, conn: Connection, wanted: bool) -> None:
+        # the selector's mask is the single source of truth: a second copy on Connection would disagree silently in both directions, stranding replies in a buffer nothing drains or leaving a connection permanently writable.
+        events = self._selector.get_key(conn).events
+        if wanted:
+            new_events = events | selectors.EVENT_WRITE
+        else:
+            new_events = events & ~selectors.EVENT_WRITE
+        if new_events != events:
+            self._selector.modify(conn, new_events, conn)
+
     def run_once(self) -> None:
         # the timeout is what lets the periodic tasks run on an idle server, with an unbounded select() they would only ever run when client traffic happened to arrive.
         events = self._selector.select(self._timeout)
@@ -55,7 +65,7 @@ class EventLoop:
             if mask & selectors.EVENT_READ and not conn.closed:
                 self._on_readable(conn)
             if mask & selectors.EVENT_WRITE and not conn.closed:
-                # no code registers write interest, so this arm is unreached
+                # reached once set_write_interest registers EVENT_WRITE, which it does only while the write buffer is non-empty
                 self._on_writable(conn)
 
     def close(self) -> None:

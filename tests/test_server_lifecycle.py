@@ -1,5 +1,6 @@
 import contextlib
 import pathlib
+import selectors
 import socket
 import subprocess
 import sys
@@ -57,15 +58,12 @@ def test_accept_tracks_one_connection(server_and_client):
     assert len(server._connections) == 1
 
 
-def test_parsed_command_gets_no_reply_and_keeps_the_connection(server_and_client):
+def test_parsed_command_gets_its_reply_on_the_same_connection(server_and_client):
     server, client = server_and_client
     client.sendall(b"*1\r\n$4\r\nPING\r\n")
     pump(server)
-    assert len(server._connections) == 1
-    conn = next(iter(server._connections))
-    # the dispatcher and the write drain arrive together; nothing is queued before they exist
-    assert conn.write_buffer == bytearray()
-    assert conn.read_buffer == bytearray()
+    client.settimeout(2)
+    assert client.recv(64) == b"+PONG\r\n"
 
 
 def test_bulk_body_containing_crlf_survives_a_real_socket(server_and_client):
@@ -135,17 +133,19 @@ def test_client_disconnect_is_reaped():
         assert server._connections == set()
 
 
-def test_write_interest_is_unreachable_and_says_so():
+def test_write_interest_is_serviced_by_the_drain():
     with listening() as (server, connect, _listener):
         connect()
         pump(server)
         conn = next(iter(server._connections))
-        with pytest.raises(RuntimeError, match="no drain to service it"):
-            server._on_writable(conn)
+        conn.queue(b"+OK\r\n")
+        server._loop.set_write_interest(conn, True)
+        server._on_writable(conn)
+        assert conn.write_buffer == bytearray()
+        assert server._loop._selector.get_key(conn).events == selectors.EVENT_READ
 
 
-# delivers a real SIGTERM from inside run()'s own setup, which is the only place the window
-# between installing the handler and raising the stop flag can be reached at all
+# delivers a real SIGTERM from inside _open_listener(), the one point where the flag and the handlers are both live but the loop has not started, so a stop recorded there is only honoured if run() checks the flag rather than assuming it starts true
 _STOP_DURING_STARTUP = """
 import os, signal, sys
 sys.path.insert(0, %r)
