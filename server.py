@@ -106,6 +106,12 @@ class Server:
         # idempotent, because the protocol-error path closes twice: _flush closes on a failed send and the caller closes again, and a second unregister raises from inside _guard's own recovery -- the one exception that escapes the boundary and takes the process with it
         if conn.closed:
             return
+        try:
+            # a queued reply is owed to the client and conn.close() discards it, so take whatever the kernel will still accept. this cannot block, and failing changes nothing since the connection is going either way
+            conn.flush()
+        except Exception:
+            # _close is reached from _guard's own recovery, where a raise is the one exception that escapes the boundary and takes the process with it
+            pass
         # unregister before closing: fileno() is -1 once the socket is closed, and the selector then finds the registration only by scanning its whole map for a matching object.
         self._loop.unregister(conn)
         conn.close()

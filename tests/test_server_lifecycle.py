@@ -173,6 +173,25 @@ def test_protocol_error_survives_a_peer_that_cannot_be_written_to():
         server._loop.close()
 
 
+def test_close_flushes_a_still_queued_reply_to_the_peer():
+    # a queued reply is owed to the client; _close discards it only if it skips the flush
+    server = Server(0)
+    sock, peer = socket.socketpair()
+    sock.setblocking(False)
+    conn = Connection(sock, ("stub", 0))
+    server._loop.register(conn)
+    server._connections.add(conn)
+
+    conn.queue(b"+OK\r\n")
+    try:
+        server._close(conn)
+        peer.settimeout(2)
+        assert peer.recv(64) == b"+OK\r\n"
+    finally:
+        peer.close()
+        server._loop.close()
+
+
 def test_client_disconnect_is_reaped():
     with listening() as (server, connect, _listener):
         client = connect()
