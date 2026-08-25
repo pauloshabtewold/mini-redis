@@ -36,6 +36,7 @@ class Server:
             self._on_accept, self._on_readable, self._on_writable, SELECT_TIMEOUT_SECONDS
         )
         self._running = False
+        self._ran = False
 
     def _open_listener(self) -> socket.socket:
         listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -131,6 +132,10 @@ class Server:
         self._running = False
 
     def run(self) -> None:
+        # the selector is built in __init__ and closed on the way out, so a second run fails four frames down in selectors with an error naming kqueue rather than the reuse
+        if self._ran:
+            raise RuntimeError("this Server has already run; construct a new one")
+        self._ran = True
         # raised before the handlers exist, because a signal delivered between installing them and this line would be cleared by the handler and then overwritten here.
         self._running = True
         signal.signal(signal.SIGINT, self._request_stop)

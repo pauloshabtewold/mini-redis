@@ -260,6 +260,16 @@ def test_a_close_that_raises_during_shutdown_still_releases_the_listener():
     assert server._loop._selector.get_map() is None, "the selector must be closed even though a close raised"
 
 
+def test_running_one_server_twice_names_the_reuse():
+    # the selector is closed on the way out, so without this the second run dies four frames down in selectors naming kqueue
+    server = Server(0)
+    _stop_the_loop_from_inside(server)
+    server.run()
+    with pytest.raises(RuntimeError) as exc_info:
+        server.run()
+    assert "already run" in str(exc_info.value), str(exc_info.value)
+
+
 def test_client_disconnect_is_reaped():
     with listening() as (server, connect, _listener):
         client = connect()
