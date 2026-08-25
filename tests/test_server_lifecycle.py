@@ -7,6 +7,7 @@ import sys
 
 import pytest
 
+from connection import Connection
 from server import Server
 from tests.int_ceiling import NO_CEILING_REASON, NO_CONVERSION_CEILING, OVERSIZED_DIGIT_RUN
 
@@ -121,6 +122,44 @@ def test_oversized_length_header_does_not_take_the_server_down():
         bystander.sendall(b"*1\r\n$4\r\nPING\r\n")
         pump(server)
         assert len(server._connections) == 1, "the bystander must survive"
+
+
+def test_protocol_error_survives_a_peer_that_cannot_be_written_to():
+    # the two conditions have to land in the same pass -- the parse fails AND the error
+    # reply cannot be sent -- which is what makes _flush close the connection before the
+    # caller does. A socketpair makes that deterministic: data already queued stays
+    # readable after the peer closes, while the next send() raises EPIPE. Over TCP the
+    # same pairing comes from a peer that resets after sending a malformed command.
+    server = Server(0)
+    doomed_sock, gone_peer = socket.socketpair()
+    gone_peer.sendall(b"*1\r\n+PING\r\n")
+    gone_peer.close()
+    doomed_sock.setblocking(False)
+    doomed = Connection(doomed_sock, ("stub", 0))
+    server._loop.register(doomed)
+    server._connections.add(doomed)
+
+    bystander_sock, bystander_peer = socket.socketpair()
+    bystander_sock.setblocking(False)
+    bystander = Connection(bystander_sock, ("stub", 1))
+    server._loop.register(bystander)
+    server._connections.add(bystander)
+
+    try:
+        # the assertion is that this returns at all: the failure mode is a ValueError
+        # raised by _guard's own recovery, which reaches the top of the only thread there is
+        server._on_readable(doomed)
+        assert server._connections == {bystander}, "only the sender should be dropped"
+
+        bystander_peer.sendall(b"*1\r\n$4\r\nPING\r\n")
+        server._on_readable(bystander)
+        bystander_peer.settimeout(2)
+        assert bystander_peer.recv(64) == b"+PONG\r\n", "the bystander must still be served"
+    finally:
+        for conn in list(server._connections):
+            server._close(conn)
+        bystander_peer.close()
+        server._loop.close()
 
 
 def test_client_disconnect_is_reaped():

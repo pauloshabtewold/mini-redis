@@ -103,6 +103,9 @@ class Server:
         self._loop.set_write_interest(conn, bool(conn.write_buffer))
 
     def _close(self, conn: Connection) -> None:
+        # idempotent, because the protocol-error path closes twice: _flush closes on a failed send and the caller closes again, and a second unregister raises from inside _guard's own recovery -- the one exception that escapes the boundary and takes the process with it
+        if conn.closed:
+            return
         # unregister before closing: fileno() is -1 once the socket is closed, and the selector then finds the registration only by scanning its whole map for a matching object.
         self._loop.unregister(conn)
         conn.close()
