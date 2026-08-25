@@ -23,7 +23,7 @@ pip install -e '.[dev]'
 
 The virtual environment is not optional on a current Python: `pip install` run against a system interpreter either writes into it or refuses outright with `externally-managed-environment`. Activating it is also what puts `python` and `pip` on `PATH`.
 
-The single quotes around `.[dev]` are required: unquoted, `[dev]` is a glob pattern in zsh (the default macOS shell), so the shell expands it before pip ever sees it and the install silently does nothing.
+The single quotes around `.[dev]` are required: unquoted, `[dev]` is a glob pattern in zsh (the default macOS shell). No file matches it, so zsh abandons the line with `no matches found: .[dev]`, pip never runs at all, and nothing is installed -- the error names the glob rather than the install, which is what makes it easy to read past.
 
 This installs the `dev` extra: `pytest` and the `redis` client (`>=5,<9`).
 
@@ -127,7 +127,8 @@ Three commands exist and none of them touches a keyspace, but a reply can alread
 
 Every step of handling a connection's traffic -- reading, parsing, dispatching, writing -- runs inside the same `try`/`except` in `server.py`, reached from both the readable and the writable callback, rather than one boundary per callback. Two boundaries are two places to write a slightly different close path, and the failure that produces is invisible until a client happens to hit the one that's wrong: a bug that closes its connection cleanly when it surfaces on a read, and takes the whole process down when the same bug surfaces on a write. A single-threaded server has exactly one thread to lose, which is what makes this boundary mandatory rather than a defensive habit -- every other connection's traffic stops the moment an unhandled exception reaches the top of that thread.
 
-### Two deliberate differences from real Redis
+### Three deliberate differences from real Redis
 
 - An unknown command answers `ERR unknown command '<name>'`. Real Redis appends the first few arguments it received to that message; this server never does, so the message stays short and the argument list plays no part in it.
 - `HELLO` with an argument other than `2` answers `NOPROTO unsupported protocol version`, including when the argument isn't a number at all. Real Redis gives a non-numeric argument a different error describing a parse failure specifically; this server answers every non-`2` argument the same way, numeric or not, so there is exactly one rule to remember rather than one rule plus an exception.
+- `HELLO` takes the protocol version and nothing else. Real Redis also accepts `AUTH <username> <password>` and `SETNAME <name>` after it, so `HELLO 2 AUTH u p` answers `WRONGPASS` there and `ERR wrong number of arguments for 'hello' command` here. Neither option has anything to act on yet -- there is no authentication in this server, and no connection name to set -- and a client library that opens with `HELLO 2 AUTH ...` gets an arity error rather than an authentication one.
