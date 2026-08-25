@@ -96,7 +96,7 @@ def test_consumed_never_exceeds_the_buffer_and_argv_is_always_bytes():
             outcome, out = _parse(buf)
             if outcome:
                 continue
-            argv, consumed = out
+            argv, consumed, _needed = out
             assert 0 <= consumed <= len(wire), (bytes(wire)[:80], consumed)
             assert argv is None or consumed > 0, (bytes(wire)[:80], argv)
             if argv is not None:
@@ -151,7 +151,7 @@ def test_a_buffer_of_complete_units_drains_to_empty():
         units = [rnd.choice(UNITS) for _ in range(rnd.randint(1, 5))]
         buf = bytearray(b"".join(units))
         for _ in range(len(units) + 4):
-            _argv, consumed = resp.parse_command(buf)
+            _argv, consumed, _needed = resp.parse_command(buf)
             if consumed == 0:
                 break
             del buf[:consumed]
@@ -169,4 +169,4 @@ def test_every_encoded_command_parses_back_byte_identically():
                          for _ in range(rnd.randint(1, 4))])
     for argv_in in payloads:
         wire = resp.encode_array([resp.encode_bulk_string(a) for a in argv_in])
-        assert resp.parse_command(wire) == (argv_in, len(wire)), (argv_in, wire[:80])
+        assert resp.parse_command(wire) == (argv_in, len(wire), 0), (argv_in, wire[:80])

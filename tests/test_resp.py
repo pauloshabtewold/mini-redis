@@ -9,7 +9,7 @@ def _feed_one_byte_at_a_time(wire, expected_argv):
     last_index = len(wire) - 1
     for index, byte in enumerate(wire):
         buf.append(byte)
-        argv, consumed = resp.parse_command(buf)
+        argv, consumed, _ = resp.parse_command(buf)
         if index == last_index:
             assert argv == expected_argv, argv
             assert consumed == len(wire), (consumed, len(wire))
@@ -24,7 +24,7 @@ def _feed_one_byte_at_a_time(wire, expected_argv):
 
 
 def test_literal_wire_multibulk_ping():
-    assert resp.parse_command(b"*1\r\n$4\r\nPING\r\n") == ([b"PING"], 14)
+    assert resp.parse_command(b"*1\r\n$4\r\nPING\r\n") == ([b"PING"], 14, 0)
 
 
 def test_response_encoders_match_literal_wire_bytes():
@@ -40,7 +40,7 @@ def test_response_encoders_match_literal_wire_bytes():
 def test_multi_argument_command_round_trips_through_encoder():
     argv_in = [b"SET", b"k", b"v"]
     wire = resp.encode_array([resp.encode_bulk_string(a) for a in argv_in])
-    argv_out, consumed = resp.parse_command(wire)
+    argv_out, consumed, _ = resp.parse_command(wire)
     assert argv_out == argv_in
     assert consumed == len(wire)
 
@@ -61,7 +61,7 @@ def test_bulk_body_containing_crlf_is_one_value():
     body = b"*2\r\n$3\r\nfoo\r\n"
     wire = b"*1\r\n$%d\r\n" % len(body) + body + b"\r\n"
 
-    argv, consumed = resp.parse_command(wire)
+    argv, consumed, _ = resp.parse_command(wire)
 
     assert argv == [body], argv
     assert consumed == len(wire), (consumed, len(wire))
@@ -85,15 +85,21 @@ def test_multi_argument_command_split_one_byte_at_a_time():
 
 
 def test_blank_inline_line_and_empty_multibulk_consume_with_no_command():
-    assert resp.parse_command(b"\r\n") == (None, 2)
-    assert resp.parse_command(b"*0\r\n") == (None, 4)
+    assert resp.parse_command(b"\r\n") == (None, 2, 0)
+    assert resp.parse_command(b"*0\r\n") == (None, 4, 0)
+
+
+def test_negative_multibulk_count_consumes_header_with_no_command():
+    # real Redis treats any non-positive count as a no-op rather than a grammar violation, so a leading "-" must not raise
+    assert resp.parse_command(b"*-1\r\n") == (None, 5, 0)
+    assert resp.parse_command(b"*-5\r\n") == (None, 5, 0)
 
 
 def test_trailing_bytes_after_command_left_buffered():
     wire = b"*1\r\n$4\r\nPING\r\n"
     extra = b"extra"
 
-    argv, consumed = resp.parse_command(wire + extra)
+    argv, consumed, _ = resp.parse_command(wire + extra)
 
     assert argv == [b"PING"]
     assert consumed == len(wire)
@@ -110,7 +116,7 @@ def test_multiple_commands_in_one_buffer():
 
     commands = []
     while True:
-        argv, consumed = resp.parse_command(buf)
+        argv, consumed, _ = resp.parse_command(buf)
         if consumed == 0:
             break
         del buf[:consumed]
@@ -128,14 +134,14 @@ def test_bulk_body_binary_safe_full_byte_range():
     body = bytes(range(256))
     wire = b"*1\r\n$%d\r\n" % len(body) + body + b"\r\n"
 
-    argv, consumed = resp.parse_command(wire)
+    argv, consumed, _ = resp.parse_command(wire)
 
     assert argv == [body]
     assert consumed == len(wire)
 
 
 def test_empty_bulk_string():
-    assert resp.parse_command(b"*1\r\n$0\r\n\r\n") == ([b""], 10)
+    assert resp.parse_command(b"*1\r\n$0\r\n\r\n") == ([b""], 10, 0)
     assert resp.encode_bulk_string(b"") == b"$0\r\n\r\n"
 
 
@@ -143,13 +149,13 @@ def test_every_buffer_type_parses_and_always_yields_bytes():
     # memoryview has no .find(), so the parser normalises it first; nothing else in the suite exercises that branch
     wire = b"*1\r\n$1\r\nx\r\n"
     for buf in (wire, bytearray(wire), memoryview(wire)):
-        argv, consumed = resp.parse_command(buf)
+        argv, consumed, _ = resp.parse_command(buf)
         assert argv == [b"x"] and consumed == len(wire), (type(buf), argv, consumed)
         assert type(argv[0]) is bytes, type(argv[0])
 
 
 def test_parsed_argv_elements_are_bytes():
-    argv, _ = resp.parse_command(b"*2\r\n$3\r\nfoo\r\n$3\r\nbar\r\n")
+    argv, _, _ = resp.parse_command(b"*2\r\n$3\r\nfoo\r\n$3\r\nbar\r\n")
     assert type(argv[0]) is bytes, type(argv[0])
     assert type(argv[1]) is bytes, type(argv[1])
 
@@ -158,8 +164,36 @@ def test_parsed_argv_elements_are_bytes():
 
 
 def test_inline_command_without_framing():
-    assert resp.parse_command(b"PING\r\n") == ([b"PING"], 6)
-    assert resp.parse_command(b"SET k v\n") == ([b"SET", b"k", b"v"], 8)
+    assert resp.parse_command(b"PING\r\n") == ([b"PING"], 6, 0)
+    assert resp.parse_command(b"SET k v\n") == ([b"SET", b"k", b"v"], 8, 0)
+
+
+INLINE_QUOTING_CASES = [
+    pytest.param(b'ECHO "a b"\r\n', [b"ECHO", b"a b"], 12, id="double quotes keep an embedded space"),
+    pytest.param(b"ECHO 'a b'\r\n", [b"ECHO", b"a b"], 12, id="single quotes keep an embedded space"),
+    pytest.param(b'ECHO "a\\x41b"\r\n', [b"ECHO", b"aAb"], 15, id="hex escape in double quotes"),
+    pytest.param(b'ECHO "a\\nb"\r\n', [b"ECHO", b"a\nb"], 13, id="newline escape in double quotes"),
+    pytest.param(b'ECHO "a\\tb"\r\n', [b"ECHO", b"a\tb"], 13, id="tab escape in double quotes"),
+    pytest.param(b"ECHO 'a\\'b'\r\n", [b"ECHO", b"a'b"], 13, id="escaped quote in single quotes"),
+]
+
+
+@pytest.mark.parametrize("wire, expected_argv, expected_consumed", INLINE_QUOTING_CASES)
+def test_inline_quoting_table(wire, expected_argv, expected_consumed):
+    assert resp.parse_command(wire) == (expected_argv, expected_consumed, 0)
+
+
+INLINE_UNBALANCED_QUOTE_CASES = [
+    pytest.param(b'ECHO "abc\r\n', id="missing closing quote"),
+    pytest.param(b'ECHO "abc"def\r\n', id="trailing bytes after a closing quote"),
+]
+
+
+@pytest.mark.parametrize("wire", INLINE_UNBALANCED_QUOTE_CASES)
+def test_inline_unbalanced_quote_is_rejected(wire):
+    with pytest.raises(resp.ProtocolError) as exc_info:
+        resp.parse_command(wire)
+    assert exc_info.value.message == resp.UNBALANCED_QUOTES
 
 
 # protocol errors
@@ -174,6 +208,21 @@ def test_non_dollar_element_inside_multibulk_is_rejected():
         with pytest.raises(resp.ProtocolError) as exc_info:
             resp.parse_command(wire)
         assert exc_info.value.message == message, (wire, exc_info.value.message)
+
+
+def test_control_bytes_in_error_frame_are_sanitized_but_printable_bytes_still_render():
+    # got is interpolated straight into the RESP error frame; a raw \r or \n there would split one frame into two on the wire, the way an unsanitized name once did in registry.dispatch
+    for wire in (b"*1\r\n\r", b"*1\r\n\n"):
+        with pytest.raises(resp.ProtocolError) as exc_info:
+            resp.parse_command(wire)
+        frame = resp.encode_error(exc_info.value.message)
+        assert frame.count(b"\r\n") == 1, (wire, frame)
+        body = frame[1:-2]
+        assert b"\r" not in body and b"\n" not in body, (wire, frame)
+
+    with pytest.raises(resp.ProtocolError) as exc_info:
+        resp.parse_command(b"*1\r\n+OK\r\n")
+    assert exc_info.value.message == b"ERR Protocol error: expected '$', got '+'"
 
 
 def test_non_numeric_length_and_count_are_rejected():

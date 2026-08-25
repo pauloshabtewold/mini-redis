@@ -88,9 +88,36 @@ def test_take_commands_consumes_input_that_yields_no_command(pair):
     assert conn.read_buffer == bytearray()
 
 
+def test_take_commands_does_not_reparse_a_large_bulk_from_byte_zero(pair, monkeypatch):
+    # a growing buffer re-parsed from byte zero on every readable event turns one large
+    # command into a quadratic number of parses; _parse_needed exists to make this O(1)
+    conn, _peer = pair
+    calls = 0
+    real_parse_command = resp.parse_command
+
+    def counting_parse_command(buf):
+        nonlocal calls
+        calls += 1
+        return real_parse_command(buf)
+
+    monkeypatch.setattr(resp, "parse_command", counting_parse_command)
+
+    body = b"a" * 200_000
+    wire = b"*1\r\n$%d\r\n" % len(body) + body + b"\r\n"
+
+    chunk_size = 500
+    commands = []
+    for start in range(0, len(wire), chunk_size):
+        conn.read_buffer.extend(wire[start:start + chunk_size])
+        commands.extend(conn.take_commands())
+
+    assert commands == [[body]]
+    assert calls <= 3, calls
+
+
 def test_take_commands_propagates_protocol_error(pair):
     conn, peer = pair
-    peer.sendall(b"*-1\r\n")
+    peer.sendall(b"*abc\r\n")
     conn.receive()
     with pytest.raises(resp.ProtocolError):
         conn.take_commands()

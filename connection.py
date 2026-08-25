@@ -46,6 +46,8 @@ class Connection:
         # bytearray because a consumed prefix is deleted (del buf[:n]) rather than the buffer being re-allocated.
         self.read_buffer = bytearray()
         self.write_buffer = bytearray()
+        # the buffer length the last incomplete parse said it needs, so a partial command is not re-parsed from byte zero on every readable event
+        self._parse_needed = 0
         self.closed = False
         self.role = role
         # filled and interpreted only by their owning module
@@ -73,9 +75,14 @@ class Connection:
     def take_commands(self) -> list[list[bytes]]:
         commands = []
         while True:
-            argv, consumed = resp.parse_command(self.read_buffer)
-            if consumed == 0:
+            if len(self.read_buffer) < self._parse_needed:
+                # nothing between here and that length can change the parse's answer, so re-running it is pure cost
                 break
+            argv, consumed, needed = resp.parse_command(self.read_buffer)
+            if consumed == 0:
+                self._parse_needed = needed
+                break
+            self._parse_needed = 0
             # progress is driven by `consumed`, not by `argv`
             del self.read_buffer[:consumed]
             if argv is not None:

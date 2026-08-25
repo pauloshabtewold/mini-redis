@@ -11,8 +11,6 @@ from tests.int_ceiling import (
 REJECTED_HEADERS = [
     pytest.param(b"*1\r\n$-1\r\n", b"ERR Protocol error: invalid bulk length", id="bulk -1"),
     pytest.param(b"*1\r\n$-2\r\n", b"ERR Protocol error: invalid bulk length", id="bulk -2"),
-    pytest.param(b"*-1\r\n", b"ERR Protocol error: invalid multibulk length", id="multibulk -1"),
-    pytest.param(b"*-5\r\n", b"ERR Protocol error: invalid multibulk length", id="multibulk -5"),
     # a digit run longer than the interpreter converts: isdigit() passes it and int() raises, so an
     # unguarded parser dies here rather than rejecting. Skipped rather than silently dropped where
     # the ceiling is disabled, since the shape has no witness there at all
@@ -44,8 +42,10 @@ def test_oversized_digit_run_raises_protocol_error_not_value_error():
     if NO_CONVERSION_CEILING:
         # nothing isdigit() admits can make int() raise here, so the contract is not that the
         # header is refused but that it is still incomplete -- waiting, never crashing
-        assert resp.parse_command(b"*" + b"9" * 5000 + b"\r\n") == (None, 0)
-        assert resp.parse_command(b"*1\r\n$" + b"9" * 5000 + b"\r\n") == (None, 0)
+        huge_multibulk = b"*" + b"9" * 5000 + b"\r\n"
+        huge_bulk = b"*1\r\n$" + b"9" * 5000 + b"\r\n"
+        assert resp.parse_command(huge_multibulk) == (None, 0, len(huge_multibulk) + 1)
+        assert resp.parse_command(huge_bulk) == (None, 0, len(huge_bulk) + int(b"9" * 5000) + 2)
         return
     with pytest.raises(ValueError):
         int(OVERSIZED_DIGIT_RUN)              # the raw conversion the parser must never let escape

@@ -86,6 +86,17 @@ def test_command_split_across_writes_is_reassembled(server_and_client):
     assert len(server._connections) == 1
 
 
+def test_negative_multibulk_count_is_consumed_and_the_connection_stays_open(server_and_client):
+    # the old header parser raised on a leading "-" and the caught ProtocolError closed the
+    # connection before PING was ever reached; real Redis instead treats it as a no-op
+    server, client = server_and_client
+    client.sendall(b"*-1\r\n*1\r\n$4\r\nPING\r\n")
+    pump(server)
+    client.settimeout(2)
+    assert client.recv(64) == b"+PONG\r\n"
+    assert len(server._connections) == 1
+
+
 def test_protocol_error_closes_only_the_sending_connection():
     with listening() as (server, connect, _listener):
         good = connect()
@@ -93,7 +104,7 @@ def test_protocol_error_closes_only_the_sending_connection():
         pump(server)
         assert len(server._connections) == 2
 
-        bad.sendall(b"*-1\r\n")
+        bad.sendall(b"*abc\r\n")
         pump(server)
 
         assert len(server._connections) == 1
