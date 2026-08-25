@@ -54,8 +54,14 @@ class Server:
         # one accept per readable event, so the level-triggered readiness re-reports a remaining backlog on the next select() return.
         sock.setblocking(False)
         conn = Connection(sock, addr, role=Role.CLIENT)
-        # register before tracking, so a connection is never in the set while unregistered, which would raise from the selector partway through shutdown
-        self._loop.register(conn)
+        try:
+            # register before tracking, so a connection is never in the set while unregistered, which would raise from the selector partway through shutdown
+            self._loop.register(conn)
+        except Exception:
+            # this callback is outside _guard, which takes a connection and closes it -- here there is no tracked connection yet, so the socket has to be closed on the spot or nothing ever will, and letting the raise out of run_once costs every other client
+            logger.exception("dropping %s, which could not be registered", addr)
+            conn.close()
+            return
         self._connections.add(conn)
 
     def _on_readable(self, conn: Connection) -> None:
@@ -72,7 +78,11 @@ class Server:
         except (BlockingIOError, InterruptedError):
             return
         except Exception:
-            logger.exception("closing %s after an unhandled exception", conn.addr)
+            try:
+                logger.exception("closing %s after an unhandled exception", conn.addr)
+            except Exception:
+                # the close below is the part that matters, and a logging subsystem that fails must not be what stops it running
+                pass
             self._close(conn)
 
     def _read_and_dispatch(self, conn: Connection) -> None:
@@ -132,9 +142,17 @@ class Server:
                 self._loop.run_once()
         finally:
             for conn in list(self._connections):
-                self._close(conn)
-            listener.close()
-            self._loop.close()
+                try:
+                    self._close(conn)
+                except Exception:
+                    # this sweep runs after the loop has exited, where _guard no longer applies, so one connection that cannot be closed would otherwise strand the listener, the selector, and every connection after it in iteration order
+                    logger.exception("closing %s during shutdown failed", conn.addr)
+                    self._connections.discard(conn)
+            try:
+                listener.close()
+            finally:
+                # nested so neither close can be skipped by the other one failing
+                self._loop.close()
 
 
 def main(argv=None) -> None:

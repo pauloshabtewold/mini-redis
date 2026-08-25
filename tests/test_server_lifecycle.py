@@ -192,6 +192,74 @@ def test_close_flushes_a_still_queued_reply_to_the_peer():
         server._loop.close()
 
 
+def test_a_failed_registration_costs_one_connection_not_the_server(monkeypatch):
+    # _on_accept runs outside _guard, so an unguarded raise here unwinds run_once and takes every other client with it
+    with listening() as (server, connect, _listener):
+        bystander = connect()
+        pump(server)
+        assert len(server._connections) == 1
+
+        real_register = server._loop.register
+        calls = {"n": 0}
+
+        def register_failing_once(conn):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                raise KeyError("stale registration for this descriptor")
+            return real_register(conn)
+
+        monkeypatch.setattr(server._loop, "register", register_failing_once)
+        doomed = connect()
+        pump(server)
+
+        assert len(server._connections) == 1, "the failed accept must not be tracked"
+        monkeypatch.undo()
+        survivor = connect()
+        pump(server)
+        assert len(server._connections) == 2, "the server must still accept after a failed registration"
+
+        bystander.sendall(b"*1\r\n$4\r\nPING\r\n")
+        pump(server)
+        bystander.settimeout(2)
+        assert bystander.recv(64) == b"+PONG\r\n", "the bystander must still be served"
+        doomed.close()
+        survivor.close()
+
+
+def _stop_the_loop_from_inside(server):
+    # run() sets _running itself, so a flag set before the call is overwritten; the only way out is from within the loop
+    real_run_once = server._loop.run_once
+
+    def run_once_then_stop():
+        server._running = False
+        return real_run_once()
+
+    server._loop.run_once = run_once_then_stop
+
+
+def test_a_close_that_raises_during_shutdown_still_releases_the_listener():
+    # the shutdown sweep runs after the loop has exited, where _guard no longer applies, so one bad close must not strand the listener or the selector
+    server = Server(0)
+    sock, peer = socket.socketpair()
+    sock.setblocking(False)
+    conn = Connection(sock, ("stub", 0))
+    server._loop.register(conn)
+    server._connections.add(conn)
+
+    def unregister_raising(_conn):
+        raise KeyError("not registered")
+
+    server._loop.unregister = unregister_raising
+    _stop_the_loop_from_inside(server)
+    try:
+        server.run()
+    finally:
+        peer.close()
+        sock.close()
+
+    assert server._loop._selector.get_map() is None, "the selector must be closed even though a close raised"
+
+
 def test_client_disconnect_is_reaped():
     with listening() as (server, connect, _listener):
         client = connect()
