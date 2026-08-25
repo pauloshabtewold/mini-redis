@@ -4,7 +4,7 @@ CPython refuses string-to-integer conversion past a ceiling (the CVE-2020-10735
 mitigation, 4300 digits by default). Both `-X int_max_str_digits` and
 `sys.set_int_max_str_digits` move that ceiling in either direction, and `0` removes it
 entirely -- so a digit run hard-coded at 4301 is an assertion about one interpreter
-configuration, not about the parser. Three test modules need this run; it is owned here.
+configuration, not about the parser. Four test modules need this run; it is owned here.
 """
 
 import sys
