@@ -212,12 +212,18 @@ def test_inline_token_ends_on_every_sdssplitargs_separator(sep):
     [
         (b"ECHO\x00x\n", [b"ECHO"]),
         (b"a b\x00c\n", [b"a", b"b"]),
-        (b"\x00PING\n", [b""]),
     ],
 )
 def test_a_nul_ends_the_inline_line_rather_than_the_token(line, expected):
     argv, _consumed, _needed = resp.parse_command(line)
     assert argv == expected, (line, argv)
+
+
+def test_a_line_beginning_with_a_nul_yields_no_command_at_all():
+    # sdssplitargs guards its token loop with `if (*p)`, so a token starting at the terminator is
+    # never built and the vector comes back empty -- not holding one empty field
+    assert resp._split_inline(b"\x00PING") == []
+    assert resp.parse_command(b"\x00PING\n") == (None, 6, 0)
 
 
 # real Redis reads both length fields with string2ll, which takes "0" alone but refuses a padded one
@@ -294,3 +300,27 @@ def test_bulk_body_not_terminated_by_crlf_is_rejected():
     with pytest.raises(resp.ProtocolError) as exc_info:
         resp.parse_command(b"*1\r\n$3\r\nfooXX\r\n")
     assert exc_info.value.message == b"ERR Protocol error: unterminated bulk string"
+
+
+@pytest.mark.parametrize(
+    "wire, expected",
+    [
+        (b'ECHO "a\\qb"\n', [b"ECHO", b"aqb"]),
+        (b'ECHO "a\\\\b"\n', [b"ECHO", b"a\\b"]),
+        (b'ECHO "a\\bb"\n', [b"ECHO", b"a\bb"]),
+        (b'ECHO "a\\ab"\n', [b"ECHO", b"a\ab"]),
+        (b'ECHO "a\\rb"\n', [b"ECHO", b"a\rb"]),
+    ],
+)
+def test_an_escape_the_grammar_does_not_name_keeps_its_own_byte(wire, expected):
+    # sdssplitargs falls through to the character itself rather than dropping the escape
+    argv, _consumed, _needed = resp.parse_command(wire)
+    assert argv == expected, (wire, argv)
+
+
+@pytest.mark.parametrize("wire", [b"ECHO 'abc\n", b"ECHO 'abc'def\n"])
+def test_an_unbalanced_single_quote_is_rejected_too(wire):
+    # the double-quote arm has always been pinned and the single-quote arm never was
+    with pytest.raises(resp.ProtocolError) as exc_info:
+        resp.parse_command(wire)
+    assert exc_info.value.message == resp.UNBALANCED_QUOTES

@@ -129,7 +129,9 @@ def _split_inline(line: bytes) -> list[bytes]:
     while True:
         while line[index:index + 1].isspace():
             index += 1
-        if index >= len(line):
+        if index >= len(line) or line[index:index + 1] == b"\x00":
+            # sdssplitargs guards its token loop with `if (*p)`, so a token that would start at the
+            # terminator is never built -- the vector comes back empty rather than holding an empty field
             return fields
 
         field = bytearray()
