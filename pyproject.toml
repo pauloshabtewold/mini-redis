@@ -5,7 +5,8 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "mini-redis"
 version = "0.1.0"
-description = "A Redis clone from scratch: RESP2 wire protocol, single-threaded event loop, string and list types, TTL expiry, snapshot persistence, rate limiting, and leader-follower replication."
+description = "A Redis clone from scratch: RESP2 wire protocol on a single-threaded event loop, built in stages toward string and list types, TTL expiry, snapshot persistence, rate limiting and leader-follower replication."
+readme = "README.md"
 requires-python = ">=3.11"
 license = "MIT"
 license-files = ["LICENSE"]

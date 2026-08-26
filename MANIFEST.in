@@ -1,0 +1,3 @@
+# setuptools' default sdist glob is test*/test*.py, which picks up the test modules and silently
+# leaves behind the package marker and the non-test-prefixed helper both of them import
+recursive-include tests *.py
