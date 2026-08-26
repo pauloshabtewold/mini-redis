@@ -53,7 +53,7 @@ class EventLoop:
             self._selector.modify(conn, new_events, conn)
 
     def run_once(self) -> None:
-        # the timeout is what lets the periodic tasks run on an idle server, with an unbounded select() they would only ever run when client traffic happened to arrive.
+        # bounded so that periodic work, once server.py has any, runs on an idle server too: an unbounded select() would tie it to whenever client traffic happened to arrive.
         events = self._selector.select(self._timeout)
         for key, mask in events:
             data = key.data
