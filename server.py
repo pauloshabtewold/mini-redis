@@ -79,7 +79,7 @@ class Server:
         except (BlockingIOError, InterruptedError):
             return
         except Exception:
-            # not wrapped: measured, logging.Handler routes an emit failure through handleError, which prints and returns, so this call does not raise even against a closed stream
+            # not wrapped: measured, handleError swallows the OSError family, so a full disk or a gone pipe cannot raise here. a closed stream raises ValueError straight through it, which nothing here can produce -- no handler is configured and nothing closes stderr
             logger.exception("closing %s after an unhandled exception", conn.addr)
             self._close(conn)
 
@@ -125,7 +125,7 @@ class Server:
         self._running = False
 
     def run(self) -> None:
-        # the selector is built in __init__ and closed on the way out, so a second run fails four frames down in selectors with an error naming kqueue rather than the reuse
+        # the selector is built in __init__ and closed on the way out, so a second run fails inside selectors with an error naming kqueue rather than the reuse
         if self._ran:
             raise RuntimeError("this Server has already run; construct a new one")
         self._ran = True
