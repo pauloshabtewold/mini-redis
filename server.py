@@ -124,33 +124,47 @@ class Server:
     def _request_stop(self, signum, frame) -> None:
         self._running = False
 
-    def run(self) -> None:
-        # the selector is built in __init__ and closed on the way out, so a second run fails inside selectors with an error naming kqueue rather than the reuse
-        if self._ran:
-            raise RuntimeError("this Server has already run; construct a new one")
-        self._ran = True
-        # raised before the handlers exist, because a signal delivered between installing them and this line would be cleared by the handler and then overwritten here.
-        self._running = True
-        signal.signal(signal.SIGINT, self._request_stop)
-        signal.signal(signal.SIGTERM, self._request_stop)
-        listener = self._open_listener()
-        self._loop.register_listener(listener)
+    def _shutdown(self, listener: socket.socket) -> None:
         try:
-            while self._running:
-                self._loop.run_once()
-        finally:
             for conn in list(self._connections):
                 try:
                     self._close(conn)
                 except (KeyError, ValueError, OSError):
-                    # the same three the selector raises from _on_accept's register. this sweep runs after the loop has exited, where _guard no longer applies, so one connection that cannot be closed would otherwise strand the listener, the selector, and every connection after it in iteration order
+                    # the same three the selector raises from _on_accept's register. this sweep runs after the loop has exited, where _guard no longer applies, so one connection that cannot be closed would otherwise strand every connection after it in iteration order
                     logger.exception("closing %s during shutdown failed", conn.addr)
                     self._connections.discard(conn)
+        finally:
+            # the sweep is nested so that anything escaping it -- a type outside the tuple above -- still cannot cost the port and the selector
             try:
                 listener.close()
             finally:
                 # nested so neither close can be skipped by the other one failing
                 self._loop.close()
+
+    def run(self) -> None:
+        # the selector is built in __init__ and closed on the way out, so a second run fails inside selectors with an error naming kqueue rather than the reuse
+        if self._ran:
+            raise RuntimeError("this Server has already run; construct a new one")
+        # raised before the handlers exist, because a signal delivered between installing them and this line would be cleared by the handler and then overwritten here.
+        self._running = True
+        # restored on the way out: run() is also called in-process, and a handler left pointing at a discarded Server swallows every later signal in that process
+        restore = [
+            (signal.SIGINT, signal.signal(signal.SIGINT, self._request_stop)),
+            (signal.SIGTERM, signal.signal(signal.SIGTERM, self._request_stop)),
+        ]
+        try:
+            listener = self._open_listener()
+            # set once the listener is open, because what a second run must not reuse is the selector, and nothing has touched it yet -- a failed bind leaves this instance usable
+            self._ran = True
+            self._loop.register_listener(listener)
+            try:
+                while self._running:
+                    self._loop.run_once()
+            finally:
+                self._shutdown(listener)
+        finally:
+            for signum, handler in restore:
+                signal.signal(signum, handler)
 
 
 def main(argv=None) -> None:

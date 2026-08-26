@@ -1,6 +1,7 @@
 import contextlib
 import pathlib
 import selectors
+import signal
 import socket
 import subprocess
 import sys
@@ -313,9 +314,8 @@ print("returned")
 
 
 def test_a_stop_signal_delivered_during_startup_is_not_lost():
-    # a subprocess with a deadline, for two reasons: the failure is a run loop that never
-    # returns, which in-process would hang the suite rather than fail it -- and run() installs
-    # SIGINT and SIGTERM handlers it never restores, which would outlive this test
+    # a subprocess with a deadline, because the failure is a run loop that never returns, which
+    # in-process would hang the suite rather than fail it
     probe = subprocess.run(
         [sys.executable, "-c", _STOP_DURING_STARTUP % str(REPO_ROOT)],
         capture_output=True, text=True, timeout=15,
@@ -328,3 +328,45 @@ def test_accept_with_nothing_pending_adds_no_connection():
     with listening() as (server, _connect, listener):
         server._on_accept(listener)
         assert server._connections == set()
+
+
+def test_run_gives_the_signal_handlers_back():
+    # run() is called in-process here, so a handler left pointing at a discarded Server would
+    # swallow every later signal in the pytest process -- Ctrl-C included
+    before = (signal.getsignal(signal.SIGINT), signal.getsignal(signal.SIGTERM))
+    probe = socket.socket()
+    probe.bind(("127.0.0.1", 0))
+    port = probe.getsockname()[1]
+    probe.close()
+    server = Server(port)
+
+    def stop(signum, frame):
+        server._running = False
+
+    previous_alarm = signal.signal(signal.SIGALRM, stop)
+    signal.setitimer(signal.ITIMER_REAL, 0.2)
+    try:
+        server.run()
+    finally:
+        signal.setitimer(signal.ITIMER_REAL, 0)
+        signal.signal(signal.SIGALRM, previous_alarm)
+
+    assert (signal.getsignal(signal.SIGINT), signal.getsignal(signal.SIGTERM)) == before
+
+
+def test_a_failed_bind_leaves_the_server_usable():
+    # _ran marks the selector as spent, and a bind that never reached the selector spends nothing
+    squatter = socket.socket()
+    squatter.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    squatter.bind(("127.0.0.1", 0))
+    squatter.listen(1)
+    port = squatter.getsockname()[1]
+    server = Server(port)
+    before = (signal.getsignal(signal.SIGINT), signal.getsignal(signal.SIGTERM))
+    try:
+        with pytest.raises(OSError):
+            server.run()
+        assert server._ran is False
+        assert (signal.getsignal(signal.SIGINT), signal.getsignal(signal.SIGTERM)) == before
+    finally:
+        squatter.close()
