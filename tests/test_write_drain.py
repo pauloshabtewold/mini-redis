@@ -87,3 +87,15 @@ def test_write_interest_is_deregistered_the_moment_it_empties(make_connection):
     assert conn.write_buffer == bytearray()
     events = server._loop._selector.get_key(conn).events
     assert not events & selectors.EVENT_WRITE
+
+
+def test_a_send_that_reports_zero_leaves_the_buffer_untouched(make_connection):
+    # not a documented outcome for a non-blocking socket -- the documented refusal is
+    # BlockingIOError. treating it as progress would spin the loop; treating it as a disconnect
+    # would close a connection on an undefined case
+    _server, conn = make_connection([0, 3, 2])
+    conn.queue(b"+OK\r\n")
+    assert conn.flush() is True
+    assert conn.write_buffer == bytearray(b"+OK\r\n"), "a zero return must not consume anything"
+    assert conn.flush() is True
+    assert conn.write_buffer == bytearray()

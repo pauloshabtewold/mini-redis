@@ -8,6 +8,7 @@ import sys
 
 import pytest
 
+from commands import registry
 from connection import Connection
 from server import Server
 from tests.int_ceiling import NO_CEILING_REASON, NO_CONVERSION_CEILING, OVERSIZED_DIGIT_RUN
@@ -388,4 +389,160 @@ def test_a_close_that_raises_still_leaves_the_set_clean():
         with pytest.raises(OSError):
             server._close(conn)
         assert conn not in server._connections
+        client.close()
+
+
+def _raising_command(name, exc):
+    """Register a handler that raises, and give it back on the way out.
+
+    Nothing in the shipped registry can raise, so the one construct this feature calls mandatory
+    -- the per-connection boundary -- is never entered by any other test in this suite.
+    """
+    original = registry.COMMANDS[name]
+    del registry.COMMANDS[name]
+
+    @registry.command(name, arity=original.arity, kind=original.kind)
+    def explode(conn, argv):
+        raise exc
+
+    return original
+
+
+def test_the_boundary_closes_one_connection_and_leaves_the_others(caplog):
+    original = registry.COMMANDS[b"ECHO"]
+    _raising_command(b"ECHO", ZeroDivisionError("deliberate"))
+    try:
+        with listening() as (server, connect, _listener):
+            victim, bystander = connect(), connect()
+            pump(server)
+            assert len(server._connections) == 2
+
+            victim.sendall(b"*2\r\n$4\r\nECHO\r\n$2\r\nhi\r\n")
+            pump(server)
+            assert len(server._connections) == 1, "the raising connection must be closed"
+
+            bystander.sendall(b"*1\r\n$4\r\nPING\r\n")
+            pump(server)
+            bystander.settimeout(2)
+            assert bystander.recv(64) == b"+PONG\r\n", "the bystander must keep working"
+
+            newcomer = connect()
+            pump(server)
+            newcomer.sendall(b"*1\r\n$4\r\nPING\r\n")
+            pump(server)
+            newcomer.settimeout(2)
+            assert newcomer.recv(64) == b"+PONG\r\n", "a new connection must still be accepted"
+
+            for c in (victim, bystander, newcomer):
+                c.close()
+    finally:
+        registry.COMMANDS[b"ECHO"] = original
+
+    # the boundary logs at ERROR with the traceback. caplog rather than stderr: pytest attaches a
+    # root handler, so logging.lastResort -- which carries it to stderr in the real server -- is
+    # never reached under the suite
+    boundary = [r for r in caplog.records if r.levelname == "ERROR" and r.exc_info]
+    assert boundary, caplog.records
+    assert boundary[0].exc_info[0] is ZeroDivisionError, boundary[0].exc_info
+
+
+def test_the_boundary_also_covers_the_write_side(caplog):
+    # _on_writable routes through the same construct; without it a raise on the drain would take
+    # the process down where the identical bug on the read path only costs one client
+    with listening() as (server, connect, _listener):
+        client = connect()
+        pump(server)
+        conn = next(iter(server._connections))
+        conn.queue(b"+PONG\r\n")
+
+        real_flush = conn.flush
+        calls = []
+
+        def explode_once():
+            # one shot: _close calls flush() again on its way out, and a real flush cannot raise,
+            # so a permanently-raising stub would test the boundary against a socket that cannot exist
+            calls.append(1)
+            if len(calls) == 1:
+                raise RuntimeError("deliberate write-side failure")
+            return real_flush()
+
+        conn.flush = explode_once
+        server._on_writable(conn)
+
+        assert calls, "the write path never reached flush()"
+        assert conn.closed is True
+        assert conn not in server._connections
+        client.close()
+
+    boundary = [r for r in caplog.records if r.levelname == "ERROR" and r.exc_info]
+    assert boundary, caplog.records
+    assert boundary[0].exc_info[0] is RuntimeError, boundary[0].exc_info
+
+
+def test_replies_come_back_in_the_order_the_commands_were_sent():
+    with listening() as (server, connect, _listener):
+        client = connect()
+        client.settimeout(2)
+        pump(server)
+        client.sendall(
+            b"*1\r\n$4\r\nPING\r\n"
+            b"*2\r\n$4\r\nECHO\r\n$1\r\na\r\n"
+            b"*1\r\n$9\r\nNOSUCHCMD\r\n"
+            b"*1\r\n$4\r\nECHO\r\n"
+            b"*2\r\n$4\r\nECHO\r\n$1\r\nz\r\n"
+        )
+        pump(server)
+        want = (
+            b"+PONG\r\n"
+            b"$1\r\na\r\n"
+            b"-ERR unknown command 'NOSUCHCMD'\r\n"
+            b"-ERR wrong number of arguments for 'echo' command\r\n"
+            b"$1\r\nz\r\n"
+        )
+        got = b""
+        while len(got) < len(want):
+            chunk = client.recv(65536)
+            if not chunk:
+                break
+            got += chunk
+        assert got == want
+        client.close()
+
+
+def test_connection_ids_are_unique_across_descriptor_reuse():
+    # descriptors are reused, so an id taken from fileno() would give two clients the same one
+    ids, fds = [], []
+    with listening() as (server, connect, _listener):
+        for _ in range(4):
+            client = connect()
+            pump(server)
+            conn = next(iter(server._connections))
+            ids.append(conn.id)
+            fds.append(conn.fileno())
+            client.close()
+            pump(server)
+    assert len(set(ids)) == len(ids), ids
+    assert ids == sorted(ids), ids
+    assert all(i > 0 for i in ids), ids
+
+
+def test_a_connection_closed_by_the_read_pass_is_not_reached_by_the_write_pass():
+    # one select() return can carry read and write readiness for the same descriptor. this pins the
+    # outcome, not the mechanism: deleting event_loop's two `not conn.closed` guards does NOT fail
+    # this, because _flush and receive() each refuse a closed connection on their own. the loop's
+    # guards are a second line of defence, and that is worth knowing before anyone removes one
+    with listening() as (server, connect, _listener):
+        client = connect()
+        pump(server)
+        conn = next(iter(server._connections))
+        conn.queue(b"+PONG\r\n")
+        server._loop.set_write_interest(conn, True)
+
+        server._close(conn)
+        assert conn.closed is True
+
+        # whatever order the ready list carries them in, neither callback may touch it now
+        server._on_writable(conn)
+        server._on_readable(conn)
+        assert conn.closed is True
         client.close()
