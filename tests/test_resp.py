@@ -196,6 +196,23 @@ def test_inline_unbalanced_quote_is_rejected(wire):
     assert exc_info.value.message == resp.UNBALANCED_QUOTES
 
 
+# sdssplitargs ends an unquoted token on exactly ' ', \n, \r, \t and \0. isspace() is the wrong
+# instrument: it admits \v and \f, which real Redis keeps inside a token, and rejects \0, which real
+# Redis splits on. \n is absent below because it ends the line before the splitter is reached
+@pytest.mark.parametrize("sep", [b" ", b"\r", b"\t", b"\x00"])
+def test_inline_token_ends_on_every_sdssplitargs_separator(sep):
+    argv, _consumed, _needed = resp.parse_command(b"ECHO" + sep + b"x\n")
+    assert argv == [b"ECHO", b"x"], (sep, argv)
+
+
+@pytest.mark.parametrize("inner", [b"\x0b", b"\x0c"])
+def test_vertical_tab_and_form_feed_stay_inside_an_inline_token(inner):
+    # measured against redis-server 7.2.7: PING\x0bX is one unknown command there, not PING with an
+    # argument, because sdssplitargs's terminator switch does not name them
+    argv, _consumed, _needed = resp.parse_command(b"ECHO" + inner + b"x\n")
+    assert argv == [b"ECHO" + inner + b"x"], (inner, argv)
+
+
 # protocol errors
 
 

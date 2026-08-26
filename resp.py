@@ -17,6 +17,10 @@ _INLINE_ESCAPES = {
 
 _HEX_DIGITS = frozenset(b"0123456789abcdefABCDEF")
 
+# what ends an unquoted inline token, from sdssplitargs's own switch. not isspace(): that set carries
+# \v and \f, which real Redis keeps inside a token, and omits \0, which real Redis splits on
+_INLINE_SEPARATORS = frozenset(b" \n\r\t\0")
+
 
 class ProtocolError(Exception):
     """A RESP2 grammar violation. message is the error's RESP body,
@@ -158,7 +162,7 @@ def _split_inline(line: bytes) -> list[bytes]:
                     raise ProtocolError(UNBALANCED_QUOTES)
                 else:
                     field += char
-            elif not char or char.isspace():
+            elif not char or char[0] in _INLINE_SEPARATORS:
                 done = True
             elif char == b'"':
                 in_double = True
