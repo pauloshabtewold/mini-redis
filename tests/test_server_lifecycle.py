@@ -86,15 +86,16 @@ def test_command_split_across_writes_is_reassembled(server_and_client):
     assert len(server._connections) == 1
 
 
-def test_negative_multibulk_count_is_consumed_and_the_connection_stays_open(server_and_client):
-    # the old header parser raised on a leading "-" and the caught ProtocolError closed the
-    # connection before PING was ever reached; real Redis instead treats it as a no-op
+def test_negative_multibulk_count_is_refused_before_the_command_after_it(server_and_client):
+    # the error arrives and the connection goes, so the PING behind it is never dispatched. real
+    # Redis consumes the header and answers that PING instead -- refusing it is deliberate
     server, client = server_and_client
     client.sendall(b"*-1\r\n*1\r\n$4\r\nPING\r\n")
     pump(server)
     client.settimeout(2)
-    assert client.recv(64) == b"+PONG\r\n"
-    assert len(server._connections) == 1
+    assert client.recv(64) == b"-ERR Protocol error: invalid multibulk length\r\n"
+    assert client.recv(64) == b""
+    assert len(server._connections) == 0
 
 
 def test_protocol_error_closes_only_the_sending_connection():

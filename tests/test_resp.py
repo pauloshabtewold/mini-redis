@@ -89,10 +89,10 @@ def test_blank_inline_line_and_empty_multibulk_consume_with_no_command():
     assert resp.parse_command(b"*0\r\n") == (None, 4, 0)
 
 
-def test_negative_multibulk_count_consumes_header_with_no_command():
-    # real Redis treats any non-positive count as a no-op rather than a grammar violation, so a leading "-" must not raise
-    assert resp.parse_command(b"*-1\r\n") == (None, 5, 0)
-    assert resp.parse_command(b"*-5\r\n") == (None, 5, 0)
+def test_zero_multibulk_count_consumes_header_with_no_command():
+    # zero is RESP's empty array and is consumed. the negative counts beside it are refused instead,
+    # pinned in tests/test_resp_limits.py -- the two live apart because only one is a rejection
+    assert resp.parse_command(b"*0\r\n") == (None, 4, 0)
 
 
 def test_trailing_bytes_after_command_left_buffered():

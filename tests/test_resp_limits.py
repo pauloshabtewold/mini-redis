@@ -11,6 +11,10 @@ from tests.int_ceiling import (
 REJECTED_HEADERS = [
     pytest.param(b"*1\r\n$-1\r\n", b"ERR Protocol error: invalid bulk length", id="bulk -1"),
     pytest.param(b"*1\r\n$-2\r\n", b"ERR Protocol error: invalid bulk length", id="bulk -2"),
+    # real Redis consumes a negative count silently and this server refuses it. these two rows are
+    # that divergence rather than a description of it -- deleting them deletes its only guard
+    pytest.param(b"*-1\r\n", b"ERR Protocol error: invalid multibulk length", id="multibulk -1"),
+    pytest.param(b"*-5\r\n", b"ERR Protocol error: invalid multibulk length", id="multibulk -5"),
     # a digit run longer than the interpreter converts: isdigit() passes it and int() raises, so an
     # unguarded parser dies here rather than rejecting. Skipped rather than silently dropped where
     # the ceiling is disabled, since the shape has no witness there at all

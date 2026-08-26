@@ -59,22 +59,17 @@ def _parse_length(field: bytes | bytearray, error_message: bytes) -> int:
         raise ProtocolError(error_message) from None
 
 
-def _parse_count(field: bytes | bytearray) -> int:
-    # a multibulk count keeps its sign, because real Redis consumes any count <= 0 and replies nothing rather than treating a negative one as a grammar violation
-    error_message = b"ERR Protocol error: invalid multibulk length"
-    if field[0:1] == b"-":
-        return -_parse_length(field[1:], error_message)
-    return _parse_length(field, error_message)
-
-
 def _parse_multibulk(buf: bytes | bytearray) -> tuple[list[bytes] | None, int, int]:
     header_end = buf.find(CRLF)
     if header_end == -1:
         return (None, 0, 0)
-    count = _parse_count(buf[1:header_end])
+    # a negative count is refused here, where real Redis consumes any count <= 0 silently and answers nothing -- a deliberate divergence, and the reason this call is not special-cased around the sign
+    count = _parse_length(
+        buf[1:header_end], b"ERR Protocol error: invalid multibulk length"
+    )
     pos = header_end + 2
-    if count <= 0:
-        # zero is RESP's empty array and a negative count is real Redis's silent no-op; both consume the header and produce no command
+    if count == 0:
+        # RESP's empty array: the header is consumed and no command comes out of it
         return (None, pos, 0)
 
     # every element is located before any of them is copied: an incomplete command that has already built an argv for the elements it passed is what makes a re-parse cost more than a scan
