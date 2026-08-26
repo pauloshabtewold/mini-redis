@@ -1,6 +1,6 @@
 # mini-redis
 
-mini-redis is a Redis clone built from scratch in Python: a single-threaded event loop speaking the RESP2 wire protocol over TCP, with string and list data types, TTL expiry, snapshot persistence, per-connection rate limiting, and leader-follower replication.
+mini-redis is a Redis clone built from scratch in Python, around a single-threaded event loop speaking the RESP2 wire protocol over TCP. It is being built in stages toward string and list data types, TTL expiry, snapshot persistence, per-connection rate limiting, and leader-follower replication; Status below is what answers today, and it is three commands.
 
 ## Status
 
@@ -26,6 +26,14 @@ The virtual environment is not optional on a current Python: `pip install` run a
 The single quotes around `.[dev]` are required: unquoted, `[dev]` is a glob pattern in zsh (the default macOS shell). No file matches it, so zsh abandons the line with `no matches found: .[dev]`, pip never runs at all, and nothing is installed -- the error names the glob rather than the install, which is what makes it easy to read past.
 
 This installs the `dev` extra: `pytest` and the `redis` client (`>=5,<9`).
+
+Construct that client with `protocol=2`, or it will not talk to this server at all:
+
+```
+r = redis.Redis(host="127.0.0.1", port=6379, protocol=2)
+```
+
+`redis-py` defaults to RESP3 and opens a connection by sending `HELLO 3`. This server speaks RESP2 only and answers `-NOPROTO`, so with the default constructor every call raises `ResponseError: NOPROTO unsupported protocol version` -- including `ping()`, which makes a refused handshake look like a broken command.
 
 ## Running the server
 
@@ -127,9 +135,10 @@ Three commands exist and none of them touches a keyspace, but a reply can alread
 
 Every step of handling a connection's traffic -- reading, parsing, dispatching, writing -- runs inside the same `try`/`except` in `server.py`, reached from both the readable and the writable callback, rather than one boundary per callback. Two boundaries are two places to write a slightly different close path, and the failure that produces is invisible until a client happens to hit the one that's wrong: a bug that closes its connection cleanly when it surfaces on a read, and takes the whole process down when the same bug surfaces on a write. A single-threaded server has exactly one thread to lose, which is what makes this boundary mandatory rather than a defensive habit -- every other connection's traffic stops the moment an unhandled exception reaches the top of that thread.
 
-### Four deliberate differences from real Redis
+### Five deliberate differences from real Redis
 
 - An unknown command answers `ERR unknown command '<name>'`. Real Redis appends the first few arguments it received to that message; this server never does, so the message stays short and the argument list plays no part in it.
 - `HELLO` with an argument other than `2` answers `NOPROTO unsupported protocol version`, whatever that argument is. Real Redis has two rules here that this server collapses into one: a non-numeric argument gets a different error naming a parse failure specifically, and `3` isn't an error there at all -- it's RESP3, a second protocol version a real server accepts, switching that connection to a different reply grammar. This server speaks RESP2 and nothing else, so `HELLO 3` is refused with the same message as `HELLO banana`, and there is one rule to remember rather than one rule plus two exceptions.
 - `HELLO` takes the protocol version and nothing else. Real Redis also accepts `AUTH <username> <password>` and `SETNAME <name>` after it, so `HELLO 2 AUTH u p` answers `WRONGPASS` there and `ERR wrong number of arguments for 'hello' command` here. Neither option has anything to act on yet -- there is no authentication in this server, and no connection name to set -- and a client library that opens with `HELLO 2 AUTH ...` gets an arity error rather than an authentication one.
+- Commands that parsed successfully ahead of a malformed one in the same write lose their replies. `PING`, `PING`, then `ECHO "unterminated` sent as one write answers only `ERR Protocol error: unbalanced quotes in request` here, where real Redis answers both `PONG`s first and then the error. The parser reports the whole buffer's first failure rather than returning what it had already read, and the connection closes immediately either way, so the loss is bounded by whatever that one connection had in flight. Sent as separate writes, every command is answered normally on both servers. Changing this belongs with the pipelining work rather than here.
 - A declared length is never refused for being too large. Real Redis rejects a bulk length above `proto-max-bulk-len`, 512 MB by default, the moment it reads the header; this server accepts any length it can convert and then waits for a body that may never arrive. This is the wire-facing half of the missing request cap described under Status, and it is the one entry on this list that is a deferred feature rather than a preference -- the cap ships with the flag that configures it.
