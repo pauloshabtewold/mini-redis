@@ -118,8 +118,9 @@ class Server:
         conn.flush()
         # unregister before closing: fileno() is -1 once the socket is closed, and the selector then finds the registration only by scanning its whole map for a matching object.
         self._loop.unregister(conn)
-        conn.close()
+        # discarded before the close rather than after it: close() sets the flag first, so a raise from the socket would leave this connection in the set with every later _close returning at the guard above
         self._connections.discard(conn)
+        conn.close()
 
     def _request_stop(self, signum, frame) -> None:
         self._running = False

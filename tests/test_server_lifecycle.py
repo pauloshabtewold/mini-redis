@@ -370,3 +370,22 @@ def test_a_failed_bind_leaves_the_server_usable():
         assert (signal.getsignal(signal.SIGINT), signal.getsignal(signal.SIGTERM)) == before
     finally:
         squatter.close()
+
+
+def test_a_close_that_raises_still_leaves_the_set_clean():
+    # Connection.close() sets its flag before it touches the socket, so a raise there would strand
+    # the connection in _connections with every later _close returning at the idempotence guard
+    with listening() as (server, connect, _listener):
+        client = connect()
+        pump(server)
+        conn = next(iter(server._connections))
+
+        def explode():
+            conn.closed = True
+            raise OSError(9, "Bad file descriptor")
+
+        conn.close = explode
+        with pytest.raises(OSError):
+            server._close(conn)
+        assert conn not in server._connections
+        client.close()
