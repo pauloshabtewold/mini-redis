@@ -17,9 +17,9 @@ _INLINE_ESCAPES = {
 
 _HEX_DIGITS = frozenset(b"0123456789abcdefABCDEF")
 
-# what ends an unquoted inline token, from sdssplitargs's own switch. not isspace(): that set carries
-# \v and \f, which real Redis keeps inside a token, and omits \0, which real Redis splits on
-_INLINE_SEPARATORS = frozenset(b" \n\r\t\0")
+# what separates two unquoted inline tokens. not isspace(): that set carries \v and \f, which real
+# Redis keeps inside a token. \0 is not here either -- it ends the line rather than a token, below
+_INLINE_SEPARATORS = frozenset({b" ", b"\n", b"\r", b"\t"})
 
 
 class ProtocolError(Exception):
@@ -55,6 +55,10 @@ def parse_command(
 def _parse_length(field: bytes | bytearray, error_message: bytes) -> int:
     # isdigit() is False for a leading "-" as well as for any non-digit content, so "negative" and "not a decimal integer" collapse into the one check the shared error message already implies.
     if not field.isdigit():
+        raise ProtocolError(error_message)
+    # real Redis reads both fields with string2ll, which takes "0" only as the whole field and otherwise
+    # wants a first digit of 1 to 9, so a padded count or length is a framing error there and here
+    if len(field) > 1 and field[0:1] == b"0":
         raise ProtocolError(error_message)
     try:
         return int(field)
@@ -132,6 +136,7 @@ def _split_inline(line: bytes) -> list[bytes]:
         in_double = False
         in_single = False
         done = False
+        at_end = False
         while not done:
             char = line[index:index + 1]
             if in_double:
@@ -162,7 +167,12 @@ def _split_inline(line: bytes) -> list[bytes]:
                     raise ProtocolError(UNBALANCED_QUOTES)
                 else:
                     field += char
-            elif not char or char[0] in _INLINE_SEPARATORS:
+            elif not char or char == b"\x00":
+                # sdssplitargs's case '\0' is the C string terminator: it ends this token, and the outer
+                # while(*p) then ends the line. it is not a separator the scan steps over and continues past
+                done = True
+                at_end = True
+            elif char in _INLINE_SEPARATORS:
                 done = True
             elif char == b'"':
                 in_double = True
@@ -174,6 +184,8 @@ def _split_inline(line: bytes) -> list[bytes]:
                 index += 1
 
         fields.append(bytes(field))
+        if at_end:
+            return fields
 
 
 def _parse_inline(buf: bytes | bytearray) -> tuple[list[bytes] | None, int, int]:

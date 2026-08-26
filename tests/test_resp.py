@@ -196,13 +196,50 @@ def test_inline_unbalanced_quote_is_rejected(wire):
     assert exc_info.value.message == resp.UNBALANCED_QUOTES
 
 
-# sdssplitargs ends an unquoted token on exactly ' ', \n, \r, \t and \0. isspace() is the wrong
-# instrument: it admits \v and \f, which real Redis keeps inside a token, and rejects \0, which real
-# Redis splits on. \n is absent below because it ends the line before the splitter is reached
-@pytest.mark.parametrize("sep", [b" ", b"\r", b"\t", b"\x00"])
+# sdssplitargs separates unquoted tokens on ' ', \n, \r and \t. isspace() is the wrong instrument:
+# it admits \v and \f, which real Redis keeps inside a token. \n is absent below because it ends the
+# line before the splitter is reached
+@pytest.mark.parametrize("sep", [b" ", b"\r", b"\t"])
 def test_inline_token_ends_on_every_sdssplitargs_separator(sep):
     argv, _consumed, _needed = resp.parse_command(b"ECHO" + sep + b"x\n")
     assert argv == [b"ECHO", b"x"], (sep, argv)
+
+
+# sdssplitargs's case '\0' is the C string terminator, not a separator: it ends the token, and the
+# enclosing while(*p) then ends the line, so nothing after the NUL is read
+@pytest.mark.parametrize(
+    "line, expected",
+    [
+        (b"ECHO\x00x\n", [b"ECHO"]),
+        (b"a b\x00c\n", [b"a", b"b"]),
+        (b"\x00PING\n", [b""]),
+    ],
+)
+def test_a_nul_ends_the_inline_line_rather_than_the_token(line, expected):
+    argv, _consumed, _needed = resp.parse_command(line)
+    assert argv == expected, (line, argv)
+
+
+# real Redis reads both length fields with string2ll, which takes "0" alone but refuses a padded one
+@pytest.mark.parametrize(
+    "wire, message",
+    [
+        (b"*007\r\n", b"ERR Protocol error: invalid multibulk length"),
+        (b"*01\r\n", b"ERR Protocol error: invalid multibulk length"),
+        (b"*00\r\n", b"ERR Protocol error: invalid multibulk length"),
+        (b"*1\r\n$004\r\n", b"ERR Protocol error: invalid bulk length"),
+    ],
+)
+def test_a_length_field_with_a_leading_zero_is_refused(wire, message):
+    with pytest.raises(resp.ProtocolError) as exc_info:
+        resp.parse_command(wire)
+    assert exc_info.value.message == message, wire
+
+
+def test_a_bare_zero_length_still_parses():
+    # the empty bulk string depends on it, so the leading-zero rule must not reach a single "0"
+    assert resp.parse_command(b"*1\r\n$0\r\n\r\n") == ([b""], 10, 0)
+    assert resp.parse_command(b"*0\r\n") == (None, 4, 0)
 
 
 @pytest.mark.parametrize("inner", [b"\x0b", b"\x0c"])
