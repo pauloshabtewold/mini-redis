@@ -58,8 +58,8 @@ class Server:
         try:
             # register before tracking, so a connection is never in the set while unregistered, which would raise from the selector partway through shutdown
             self._loop.register(conn)
-        except Exception:
-            # this callback is outside _guard, which takes a connection and closes it -- here there is no tracked connection yet, so the socket has to be closed on the spot or nothing ever will, and letting the raise out of run_once costs every other client
+        except (KeyError, ValueError, OSError):
+            # measured: the selector raises KeyError for a descriptor already registered and ValueError for a closed one, and the kqueue backend's own control call raises OSError. this callback is outside _guard, which takes a connection and closes it -- here nothing tracks this socket yet, so it is closed on the spot or never, and letting the raise out of run_once costs every other client
             logger.exception("dropping %s, which could not be registered", addr)
             conn.close()
             return
@@ -79,11 +79,8 @@ class Server:
         except (BlockingIOError, InterruptedError):
             return
         except Exception:
-            try:
-                logger.exception("closing %s after an unhandled exception", conn.addr)
-            except Exception:
-                # the close below is the part that matters, and a logging subsystem that fails must not be what stops it running
-                pass
+            # not wrapped: measured, logging.Handler routes an emit failure through handleError, which prints and returns, so this call does not raise even against a closed stream
+            logger.exception("closing %s after an unhandled exception", conn.addr)
             self._close(conn)
 
     def _read_and_dispatch(self, conn: Connection) -> None:
@@ -117,12 +114,8 @@ class Server:
         # idempotent, because the protocol-error path closes twice: _flush closes on a failed send and the caller closes again, and a second unregister raises from inside _guard's own recovery -- the one exception that escapes the boundary and takes the process with it
         if conn.closed:
             return
-        try:
-            # a queued reply is owed to the client and conn.close() discards it, so take whatever the kernel will still accept. this cannot block, and failing changes nothing since the connection is going either way
-            conn.flush()
-        except Exception:
-            # _close is reached from _guard's own recovery, where a raise is the one exception that escapes the boundary and takes the process with it
-            pass
+        # a queued reply is owed to the client and conn.close() discards it, so take whatever the kernel will still accept. not wrapped: measured, flush() catches BlockingIOError and OSError below this point and returns False rather than raising, even on a socket whose peer is gone
+        conn.flush()
         # unregister before closing: fileno() is -1 once the socket is closed, and the selector then finds the registration only by scanning its whole map for a matching object.
         self._loop.unregister(conn)
         conn.close()
@@ -149,8 +142,8 @@ class Server:
             for conn in list(self._connections):
                 try:
                     self._close(conn)
-                except Exception:
-                    # this sweep runs after the loop has exited, where _guard no longer applies, so one connection that cannot be closed would otherwise strand the listener, the selector, and every connection after it in iteration order
+                except (KeyError, ValueError, OSError):
+                    # the same three the selector raises from _on_accept's register. this sweep runs after the loop has exited, where _guard no longer applies, so one connection that cannot be closed would otherwise strand the listener, the selector, and every connection after it in iteration order
                     logger.exception("closing %s during shutdown failed", conn.addr)
                     self._connections.discard(conn)
             try:
