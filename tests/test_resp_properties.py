@@ -22,9 +22,13 @@ SEED = 20260821
 ROUNDS = 4000
 
 # fragments chosen so that random concatenation lands on framing boundaries far more often
-# than random bytes would -- headers, terminators, half-terminators and their near-misses
+# than random bytes would -- headers, terminators, half-terminators and their near-misses.
+# the quote and escape bytes are here because nothing else in the alphabet opens a quoted
+# field, and the zero-prefixed headers because nothing else lands on a length that is padded
+# rather than malformed: without either, those refusals are unreachable from this corpus
 FRAGMENTS = [b"*", b"$", b"\r", b"\n", b"\r\n", b"0", b"1", b"2", b"9", b"-", b"+",
-             b"a", b" ", b"\t", b"\x00", b"\xff", b"PING", b"12", b"$3", b"*2"]
+             b"a", b" ", b"\t", b"\x00", b"\xff", b"PING", b"12", b"$3", b"*2",
+             b'"', b"'", b"\\", b"*0", b"$0"]
 
 # complete commands and complete no-op headers: a buffer made only of these must drain to empty
 UNITS = [b"*1\r\n$4\r\nPING\r\n", b"PING\r\n", b"SET k v\n", b"*0\r\n", b"\r\n", b"\n",

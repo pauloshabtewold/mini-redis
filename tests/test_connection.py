@@ -17,6 +17,18 @@ def _deliver(conn, peer, payload):
         conn.receive()
 
 
+class RecordingSocket:
+    # a socket carries no attribute of its own, so the size receive() asks the kernel for is
+    # observable only through a wrapper standing in front of it
+    def __init__(self, sock, asked):
+        self._sock = sock
+        self._asked = asked
+
+    def recv(self, bufsize):
+        self._asked.append(bufsize)
+        return self._sock.recv(bufsize)
+
+
 @pytest.fixture
 def pair():
     # real sockets, not mocks: receive() branches on errno behaviour no fake reproduces faithfully
@@ -41,6 +53,17 @@ def test_receive_on_empty_socket_reports_connected_without_reading(pair):
     assert conn.read_buffer == bytearray()
 
 
+def test_one_readable_event_reads_at_most_sixty_four_kibibytes(pair):
+    # one recv() per readable event, so this size is what the loop allocates for every connection
+    # it services in a pass -- a megabyte here is a megabyte of churn per client per poll
+    conn, peer = pair
+    asked = []
+    conn._sock = RecordingSocket(conn._sock, asked)
+    peer.sendall(b"PING\r\n")
+    assert conn.receive() is True
+    assert asked == [65536], asked
+
+
 def test_receive_reports_disconnect_when_peer_closes(pair):
     conn, peer = pair
     peer.close()
@@ -58,9 +81,18 @@ def test_default_role_is_client(pair):
     assert conn.role is Role.CLIENT
 
 
+def test_every_role_is_a_distinct_value():
+    # StrEnum makes a duplicated value an alias rather than an error, so a FOLLOWER that collides
+    # with CLIENT reads as an ordinary client everywhere and nothing raises at the collision
+    assert len(list(Role)) == 3
+    assert len({role.value for role in Role}) == 3
+
+
 def test_fileno_is_the_underlying_descriptor(pair):
+    # the selector registers the Connection itself and watches whatever number this returns, so
+    # any other descriptor has it waiting on readiness that belongs to something else entirely
     conn, _peer = pair
-    assert conn.fileno() >= 0
+    assert conn.fileno() == conn._sock.fileno()
 
 
 def test_take_commands_drains_a_pipelined_buffer(pair):
@@ -71,12 +103,17 @@ def test_take_commands_drains_a_pipelined_buffer(pair):
     assert conn.read_buffer == bytearray()
 
 
-def test_take_commands_leaves_a_partial_command_buffered(pair):
+def test_take_commands_yields_nothing_until_a_partial_command_completes(pair):
+    # the contract is that a partial command produces no command and loses no argument, not that
+    # its bytes stay in the buffer: a completed element is consumed as it arrives, by design
     conn, peer = pair
     peer.sendall(b"*2\r\n$3\r\nfoo\r\n$3\r\nba")
     conn.receive()
     assert conn.take_commands() == []
-    assert bytes(conn.read_buffer) == b"*2\r\n$3\r\nfoo\r\n$3\r\nba"
+    peer.sendall(b"r\r\n")
+    conn.receive()
+    assert conn.take_commands() == [[b"foo", b"bar"]]
+    assert conn.read_buffer == bytearray()
 
 
 def test_take_commands_consumes_input_that_yields_no_command(pair):
@@ -145,3 +182,47 @@ def test_close_is_idempotent(pair):
     assert conn.closed is True
     conn.close()                       # the read path and the shutdown path both call this
     assert conn.closed is True
+
+
+def test_take_commands_locates_each_multibulk_element_once(pair, monkeypatch):
+    # a whole-command re-parse locates element k by re-walking elements 1..k-1, so one command
+    # delivered in fragments costs a length parse per element per element rather than one each
+    conn, _peer = pair
+    calls = 0
+    real_parse_length = resp._parse_length
+
+    def counting_parse_length(field, error_message):
+        nonlocal calls
+        calls += 1
+        return real_parse_length(field, error_message)
+
+    monkeypatch.setattr(resp, "_parse_length", counting_parse_length)
+
+    count = 400
+    wire = b"*%d\r\n" % count
+    for index in range(count):
+        argument = b"arg%d" % index
+        wire += b"$%d\r\n%s\r\n" % (len(argument), argument)
+
+    commands = []
+    for start in range(len(wire)):
+        conn.read_buffer.extend(wire[start:start + 1])
+        commands.extend(conn.take_commands())
+
+    assert len(commands) == 1 and len(commands[0]) == count
+    # one header plus one per element; re-walking would make this quadratic in count
+    assert calls <= 4 * count, calls
+
+
+def test_an_incomplete_inline_command_is_held_until_its_newline_arrives(pair):
+    # the inline path reports no bound -- a partial line says nothing about when a newline comes --
+    # so the short-circuit must not strand it: a client typing at a terminal sits here between keys
+    conn, peer = pair
+    peer.sendall(b"PIN")
+    conn.receive()
+    assert conn.take_commands() == []
+    assert conn._parse_needed == 0, "a partial inline line bounds nothing"
+    peer.sendall(b"G\r\n")
+    conn.receive()
+    assert conn.take_commands() == [[b"PING"]]
+    assert conn.read_buffer == bytearray()

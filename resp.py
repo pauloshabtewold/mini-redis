@@ -21,6 +21,10 @@ _HEX_DIGITS = frozenset(b"0123456789abcdefABCDEF")
 # Redis keeps inside a token. \0 is not here either -- it ends the line rather than a token, below
 _INLINE_SEPARATORS = frozenset({b" ", b"\n", b"\r", b"\t"})
 
+# real Redis reads a multibulk count with string2ll and refuses anything above INT_MAX outright.
+# a bulk length has its own, configurable ceiling, which is a later feature's flag rather than this
+MAX_MULTIBULK_COUNT = 2**31 - 1
+
 
 class ProtocolError(Exception):
     """A RESP2 grammar violation. message is the error's RESP body,
@@ -40,9 +44,21 @@ def parse_command(
 
     Returns (argv, consumed, needed). `needed` is the total buffer length at
     which another attempt can make progress, or 0 when no bound is known; it is
-    meaningful only when `consumed` is 0. Without it a caller re-parses a
-    partially delivered command from byte zero on every readable event, which is
-    quadratic in the number of events it takes to deliver one.
+    meaningful only when `consumed` is 0. Progress means an argv or an error:
+    the hint can only ever bound completion, so it never runs past the first
+    byte that could carry a protocol error, and a caller that waits longer than
+    it says turns malformed input into a hang.
+
+    Only the multibulk path produces a non-zero hint, and only from a bulk
+    element, where a declared length lets it skip the whole body rather than
+    re-scanning it per byte. The inline path has no return site that can carry
+    one: a line is complete or it is not, and nothing about a partial line
+    bounds when a newline will arrive.
+
+    Connection drives parse_multibulk_header and parse_bulk_element directly
+    rather than calling this for a multibulk, so that locating N elements costs
+    N steps rather than N per element. This is the whole-command form, over
+    those same two primitives.
     """
     # memoryview has neither .find() nor .split(), so normalize once so the rest of this module can scan and slice buf uniformly.
     if isinstance(buf, memoryview):
@@ -67,49 +83,78 @@ def _parse_length(field: bytes | bytearray, error_message: bytes) -> int:
         raise ProtocolError(error_message) from None
 
 
-def _parse_multibulk(buf: bytes | bytearray) -> tuple[list[bytes] | None, int, int]:
+def parse_multibulk_header(
+    buf: bytes | bytearray | memoryview,
+) -> tuple[int, int, int]:
+    """Parse `*N\\r\\n` off the front of buf, returning (count, consumed, needed).
+
+    Split from the elements so a caller can consume the header and then each
+    element as it arrives, keeping its own running argv. A caller that instead
+    re-parses the whole command on every readable event pays for locating each
+    element once per element, which is quadratic in the count.
+    """
     header_end = buf.find(CRLF)
     if header_end == -1:
+        return (0, 0, 0)
+    # a negative count is refused here, where real Redis consumes a syntactically valid count of zero or less silently and answers nothing -- a deliberate divergence, and the reason this call is not special-cased around the sign. "syntactically valid" is the whole rule: string2ll refuses -0 there as it does here, so the two agree on -0 and on 0 and part only on -1 and below
+    invalid_count = b"ERR Protocol error: invalid multibulk length"
+    count = _parse_length(buf[1:header_end], invalid_count)
+    if count > MAX_MULTIBULK_COUNT:
+        # refused at the header, as the reference does, rather than read one command later as an element
+        raise ProtocolError(invalid_count)
+    return (count, header_end + 2, 0)
+
+
+def parse_bulk_element(
+    buf: bytes | bytearray | memoryview,
+) -> tuple[bytes | None, int, int]:
+    """Parse one `$N\\r\\n<body>\\r\\n` element off the front of buf.
+
+    Returns (body, consumed, needed) on the same contract as parse_command.
+    """
+    if not len(buf):
+        # the type byte alone decides between an element and a protocol error, so one byte is progress
+        return (None, 0, 1)
+    if buf[0:1] != b"$":
+        # the byte is the client's and this message goes on the wire, so a raw \r or \n in it would split one error frame into two exactly as an unsanitized command name would in registry.dispatch
+        got = bytes(buf[0:1]).replace(b"\r", b" ").replace(b"\n", b" ")
+        raise ProtocolError(b"ERR Protocol error: expected '$', got '%s'" % got)
+    header_end = buf.find(CRLF, 1)
+    if header_end == -1:
         return (None, 0, 0)
-    # a negative count is refused here, where real Redis consumes any count <= 0 silently and answers nothing -- a deliberate divergence, and the reason this call is not special-cased around the sign
-    count = _parse_length(
-        buf[1:header_end], b"ERR Protocol error: invalid multibulk length"
+    length = _parse_length(
+        buf[1:header_end], b"ERR Protocol error: invalid bulk length"
     )
-    pos = header_end + 2
+    # a bulk body may legally contain \r\n, and searching for it truncates the value, so the end is computed from the declared length
+    body_start = header_end + 2
+    body_end = body_start + length
+    if len(buf) < body_end + 2:
+        return (None, 0, body_end + 2)
+    if buf[body_end:body_end + 2] != CRLF:
+        raise ProtocolError(b"ERR Protocol error: unterminated bulk string")
+    return (bytes(buf[body_start:body_end]), body_end + 2, 0)
+
+
+def _parse_multibulk(buf: bytes | bytearray) -> tuple[list[bytes] | None, int, int]:
+    # the whole-command form, over the same two primitives Connection drives one step at a time, so there is one grammar here rather than two that can disagree
+    count, consumed, needed = parse_multibulk_header(buf)
+    if consumed == 0:
+        return (None, 0, needed)
     if count == 0:
         # RESP's empty array: the header is consumed and no command comes out of it
-        return (None, pos, 0)
+        return (None, consumed, 0)
 
-    # every element is located before any of them is copied: an incomplete command that has already built an argv for the elements it passed is what makes a re-parse cost more than a scan
-    bodies = []
+    argv = []
+    pos = consumed
     for _ in range(count):
-        if pos >= len(buf):
-            return (None, 0, pos + 1)
-        if buf[pos:pos + 1] != b"$":
-            # the byte is the client's and this message goes on the wire, so a raw \r or \n in it would split one error frame into two exactly as an unsanitized command name would in registry.dispatch
-            got = bytes(buf[pos:pos + 1]).replace(b"\r", b" ").replace(b"\n", b" ")
-            raise ProtocolError(
-                b"ERR Protocol error: expected '$', got '%s'" % got
-            )
+        body, used, needed = parse_bulk_element(buf[pos:])
+        if used == 0:
+            # needed is relative to the element; 0 stays 0, which means no bound is known
+            return (None, 0, pos + needed if needed else 0)
+        argv.append(body)
+        pos += used
 
-        header_end = buf.find(CRLF, pos + 1)
-        if header_end == -1:
-            return (None, 0, 0)
-        length = _parse_length(
-            buf[pos + 1:header_end], b"ERR Protocol error: invalid bulk length"
-        )
-        # a bulk body may legally contain \r\n, and searching for it truncates the value, so the end is computed from the declared length
-        body_start = header_end + 2
-        body_end = body_start + length
-        if len(buf) < body_end + 2:
-            return (None, 0, body_end + 2)
-        if buf[body_end:body_end + 2] != CRLF:
-            raise ProtocolError(b"ERR Protocol error: unterminated bulk string")
-
-        bodies.append((body_start, body_end))
-        pos = body_end + 2
-
-    return ([bytes(buf[start:end]) for start, end in bodies], pos, 0)
+    return (argv, pos, 0)
 
 
 def _is_hex_escape(line: bytes, index: int) -> bool:
@@ -122,6 +167,14 @@ def _is_hex_escape(line: bytes, index: int) -> bool:
     )
 
 
+def _terminated(line: bytes, index: int) -> bool:
+    # sdssplitargs scans a NUL-terminated string, so running off the end and meeting a NUL are the
+    # same fact in every state below -- including inside quotes, where the terminator is what makes
+    # them unbalanced, and after a closing quote, where it is what makes the field well formed
+    char = line[index:index + 1]
+    return not char or char == b"\x00"
+
+
 def _split_inline(line: bytes) -> list[bytes]:
     # real Redis's sdssplitargs rather than bytes.split(): a quoted field is one argument however many spaces it holds, and an unbalanced quote is a protocol error rather than a token
     fields = []
@@ -129,7 +182,7 @@ def _split_inline(line: bytes) -> list[bytes]:
     while True:
         while line[index:index + 1].isspace():
             index += 1
-        if index >= len(line) or line[index:index + 1] == b"\x00":
+        if _terminated(line, index):
             # sdssplitargs guards its token loop with `if (*p)`, so a token that would start at the
             # terminator is never built -- the vector comes back empty rather than holding an empty field
             return fields
@@ -145,15 +198,15 @@ def _split_inline(line: bytes) -> list[bytes]:
                 if char == b"\\" and _is_hex_escape(line, index):
                     field.append(int(line[index + 2:index + 4], 16))
                     index += 3
-                elif char == b"\\" and line[index + 1:index + 2]:
+                elif char == b"\\" and not _terminated(line, index + 1):
                     index += 1
                     field += _INLINE_ESCAPES.get(line[index], line[index:index + 1])
                 elif char == b'"':
                     # a closing quote ends the argument, so anything but a separator after it is a field this grammar cannot represent
-                    if line[index + 1:index + 2] and not line[index + 1:index + 2].isspace():
+                    if not _terminated(line, index + 1) and not line[index + 1:index + 2].isspace():
                         raise ProtocolError(UNBALANCED_QUOTES)
                     done = True
-                elif not char:
+                elif _terminated(line, index):
                     raise ProtocolError(UNBALANCED_QUOTES)
                 else:
                     field += char
@@ -162,14 +215,14 @@ def _split_inline(line: bytes) -> list[bytes]:
                     index += 1
                     field += b"'"
                 elif char == b"'":
-                    if line[index + 1:index + 2] and not line[index + 1:index + 2].isspace():
+                    if not _terminated(line, index + 1) and not line[index + 1:index + 2].isspace():
                         raise ProtocolError(UNBALANCED_QUOTES)
                     done = True
-                elif not char:
+                elif _terminated(line, index):
                     raise ProtocolError(UNBALANCED_QUOTES)
                 else:
                     field += char
-            elif not char or char == b"\x00":
+            elif _terminated(line, index):
                 # sdssplitargs's case '\0' is the C string terminator: it ends this token, and the outer
                 # while(*p) then ends the line. it is not a separator the scan steps over and continues past
                 done = True

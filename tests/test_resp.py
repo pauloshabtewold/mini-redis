@@ -324,3 +324,51 @@ def test_an_unbalanced_single_quote_is_rejected_too(wire):
     with pytest.raises(resp.ProtocolError) as exc_info:
         resp.parse_command(wire)
     assert exc_info.value.message == resp.UNBALANCED_QUOTES
+
+
+@pytest.mark.parametrize(
+    "wire, expected",
+    [
+        # the terminator ends the line inside a quote too, which leaves that quote unbalanced
+        (b'ECHO "a\x00b"\n', None),
+        (b"ECHO 'a\x00b'\n", None),
+        (b'ECHO "a\\\x00b"\n', None),
+        # and satisfies the follower test after a closing quote, which real Redis accepts
+        (b'ECHO "a"\x00\n', [b"ECHO", b"a"]),
+        (b"ECHO 'a'\x00\n", [b"ECHO", b"a"]),
+        # the unquoted arm, which is the only one the rule originally shipped for
+        (b"ECHO a\x00b\n", [b"ECHO", b"a"]),
+        (b"ECHO \x00\n", [b"ECHO"]),
+    ],
+)
+def test_a_nul_terminates_the_inline_line_in_every_quoting_state(wire, expected):
+    # sdssplitargs scans a C string, so `\0` is its terminator in all four states, not just the
+    # unquoted one: `!*p` inside either quote, and the falsy guard in the closing-quote follower
+    if expected is None:
+        with pytest.raises(resp.ProtocolError) as exc_info:
+            resp.parse_command(wire)
+        assert exc_info.value.message == resp.UNBALANCED_QUOTES
+        return
+    argv, _consumed, _needed = resp.parse_command(wire)
+    assert argv == expected, (wire, argv)
+
+
+@pytest.mark.parametrize(
+    "count, refused",
+    [
+        (2**31 - 1, False),
+        (2**31, True),
+        (2**63, True),
+    ],
+)
+def test_a_multibulk_count_above_the_reference_ceiling_is_refused_at_the_header(count, refused):
+    # refused where the count is read, as real Redis does, rather than accepted and then read as
+    # elements -- which turns the next command in the same buffer into this one's first element
+    wire = b"*%d\r\n" % count
+    if refused:
+        with pytest.raises(resp.ProtocolError) as exc_info:
+            resp.parse_command(wire)
+        assert exc_info.value.message == b"ERR Protocol error: invalid multibulk length"
+        return
+    argv, consumed, needed = resp.parse_command(wire)
+    assert (argv, consumed) == (None, 0) and needed > 0
