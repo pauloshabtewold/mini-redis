@@ -91,11 +91,10 @@ def test_write_interest_is_deregistered_the_moment_it_empties(make_connection):
 
 def test_a_send_that_reports_zero_leaves_the_buffer_untouched(make_connection):
     # not a documented outcome for a non-blocking socket -- the documented refusal is
-    # BlockingIOError. treating it as progress would spin the loop; treating it as a disconnect
-    # would close a connection on an undefined case
+    # BlockingIOError -- so both readings close something. progress leaves write interest set
+    # against a buffer nothing drains, which spins the loop at 100% CPU and stops every client;
+    # a disconnect costs the one connection that produced an outcome the standard forbids
     _server, conn = make_connection([0, 3, 2])
     conn.queue(b"+OK\r\n")
-    assert conn.flush() is True
+    assert conn.flush() is False, "a zero return must not be reported as progress"
     assert conn.write_buffer == bytearray(b"+OK\r\n"), "a zero return must not consume anything"
-    assert conn.flush() is True
-    assert conn.write_buffer == bytearray()

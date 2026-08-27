@@ -134,7 +134,8 @@ class Connection:
             except OSError:
                 return False
             if not sent:
-                return True
+                # POSIX forbids a zero return for a stream socket with bytes to send, and no real socket state produces one. treated as a dead peer rather than as progress: progress leaves write interest registered against a buffer nothing drains, and that spins a single-threaded loop at 100% CPU for every client, where a close costs only this one
+                return False
             del self.write_buffer[:sent]
         return True
 
