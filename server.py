@@ -169,6 +169,9 @@ class Server:
             # set once the listener is open, because what a second run must not reuse is the selector, and nothing has touched it yet -- a failed bind leaves this instance usable
             self._ran = True
             self._loop.register_listener(listener)
+            # the bound address, not self.port: --port 0 asks the kernel to choose, and this is the only way to learn what it chose. printed rather than logged because it is not a diagnostic -- a foreground server that says nothing on success is indistinguishable from one that died, and the documented way to check this one is alive is a round trip on a port another Redis may already own, which answers either way
+            host, port = listener.getsockname()[:2]
+            print(f"listening on {host}:{port}", flush=True)
             try:
                 while self._running:
                     self._loop.run_once()

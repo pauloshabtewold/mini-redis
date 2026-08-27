@@ -25,12 +25,12 @@ The virtual environment is not optional on a current Python: `pip install` run a
 
 The single quotes around `.[dev]` are required: unquoted, `[dev]` is a glob pattern in zsh (the default macOS shell). No file matches it, so zsh abandons the line with `no matches found: .[dev]`, pip never runs at all, and nothing is installed -- the error names the glob rather than the install, which is what makes it easy to read past.
 
-This installs the `dev` extra: `pytest` and the `redis` client (`>=5,<9`).
+This installs the `dev` extra: `pytest` and the `redis` client (`>=5,<9`). Nothing in this repository imports that client -- it is here so you can point it at the server yourself, and every claim below about how it behaves was checked by hand rather than by a test, so treat those as observations about one client version rather than as anything CI would catch if it changed.
 
 Construct that client with `protocol=2`, or it will not talk to this server at all:
 
 ```
-r = redis.Redis(host="127.0.0.1", port=6379, protocol=2)
+r = redis.Redis(host="127.0.0.1", port=7000, protocol=2)   # whatever --port you started it on
 ```
 
 `redis-py` defaults to RESP3 and opens a connection by sending `HELLO 3`. This server speaks RESP2 only and answers `-NOPROTO`, so with the default constructor every call raises `ResponseError: NOPROTO unsupported protocol version` -- including `ping()`, which makes a refused handshake look like a broken command.
@@ -43,12 +43,14 @@ Constructed with `protocol=2` the client sends no `HELLO` at all, and the first 
 python3 server.py [--port PORT]
 ```
 
-`--port` defaults to `6379`, the same default `redis-cli` uses, so `redis-cli` run with no arguments reaches a locally running instance:
+`--port` defaults to `6379`, the same default `redis-cli` uses, so `redis-cli` run with no arguments reaches it:
 
 ```
 $ redis-cli PING
 PONG
 ```
+
+On a machine that already runs Redis -- which is most machines anyone tries this on -- that default is taken, and the bind fails with `OSError: [Errno 48] Address already in use`. Pass `--port` and it goes away. The reason to care beyond the inconvenience is that the check above cannot tell the two servers apart: `redis-cli PING` answers `PONG` from whichever process owns the port, so if this one is not running you get a healthy-looking `PONG`, a working `DBSIZE`, and the impression that this clone has a keyspace it does not have. On a successful bind the server prints the address it actually bound -- `listening on 127.0.0.1:6379` -- and that line, not the `PONG`, is what tells you it is this server answering. With `--port 0` the kernel picks the port and that line is the only place the number appears.
 
 Anything other than `PING`, `ECHO` or `HELLO` gets `-ERR unknown command`, rendered by `redis-cli` without the leading `-`; the connection stays open either way, so a client can keep sending after one request gets rejected.
 
@@ -111,7 +113,7 @@ The four periodic tasks driven off the `select()` timeout -- expiry sweep, snaps
 
 ### Why commands is a package
 
-The command layer covers twenty-six commands across the string, list, and server/connection groups, each with its own arity check, type check, option parsing, and effect return. A single `commands.py` holding all of that would be a god object, so the command layer is split by type into its own package instead, with `registry.py` handling registration and dispatch.
+The command layer is planned to cover twenty-one commands across the string, list, and server/connection groups -- three of them answer today -- each with its own arity check, type check, option parsing, and effect return. A single `commands.py` holding all of that would be a god object, so the command layer is split by type into its own package instead, with `registry.py` handling registration and dispatch.
 
 ### Why the kind tag is declared at the handler
 

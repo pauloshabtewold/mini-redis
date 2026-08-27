@@ -11,7 +11,7 @@ import pytest
 
 from commands import registry
 from connection import Connection
-from server import Server, build_arg_parser
+from server import DEFAULT_PORT, Server, build_arg_parser
 from tests.int_ceiling import NO_CEILING_REASON, NO_CONVERSION_CEILING, OVERSIZED_DIGIT_RUN
 
 REPO_ROOT = pathlib.Path(__file__).resolve().parent.parent
@@ -322,6 +322,39 @@ def test_write_interest_is_serviced_by_the_drain():
 
 
 # delivers a real SIGTERM from inside _open_listener(), the one point where the flag and the handlers are both live but the loop has not started, so a stop recorded there is only honoured if run() checks the flag rather than assuming it starts true
+_ANNOUNCE_ON_BIND = """
+import socket, sys, threading
+sys.path.insert(0, %r)
+from server import Server
+
+bound = threading.Event()
+chosen = []
+
+
+class Announcing(Server):
+    def _open_listener(self):
+        listener = super()._open_listener()
+        chosen.append(listener.getsockname()[1])
+        bound.set()
+        return listener
+
+
+server = Announcing(0)
+
+
+def connect_then_stop():
+    bound.wait(5)
+    with socket.create_connection(("127.0.0.1", chosen[0]), timeout=5):
+        pass
+    print("connected", chosen[0], flush=True)
+    server._running = False
+
+
+threading.Thread(target=connect_then_stop, daemon=True).start()
+server.run()
+"""
+
+
 _STOP_DURING_STARTUP = """
 import os, signal, sys
 sys.path.insert(0, %r)
@@ -347,7 +380,8 @@ def test_a_stop_signal_delivered_during_startup_is_not_lost():
         [sys.executable, "-c", _STOP_DURING_STARTUP % str(REPO_ROOT)],
         capture_output=True, text=True, timeout=15,
     )
-    assert probe.stdout.strip() == "returned", (probe.returncode, probe.stdout, probe.stderr)
+    # the last line, not the whole stream: a successful bind announces itself first
+    assert probe.stdout.split()[-1:] == ["returned"], (probe.returncode, probe.stdout, probe.stderr)
 
 
 def test_accept_with_nothing_pending_adds_no_connection():
@@ -757,3 +791,24 @@ def test_a_descriptor_that_will_not_close_is_logged_rather_than_raised(caplog):
 
     assert conn not in server._connections
     assert [r.message for r in caplog.records if "descriptor" in r.message], caplog.records
+
+
+def test_a_successful_bind_announces_the_address_it_actually_bound():
+    # a foreground server that says nothing on success cannot be told apart from one that died,
+    # and the documented way to check this one is alive -- a round trip on the default port --
+    # answers just as happily from another Redis that already owns it. --port 0 is the sharper
+    # case: only the kernel knows the port, so the process is the only thing that can report it
+    probe = subprocess.run(
+        [sys.executable, "-c", _ANNOUNCE_ON_BIND % str(REPO_ROOT)],
+        capture_output=True, text=True, timeout=15,
+    )
+    lines = probe.stdout.splitlines()
+    announced = [line for line in lines if line.startswith("listening on ")]
+    connected = [line for line in lines if line.startswith("connected ")]
+    assert announced and connected, (probe.returncode, probe.stdout, probe.stderr)
+
+    host, _, port = announced[0].removeprefix("listening on ").partition(":")
+    assert host == "127.0.0.1", announced[0]
+    assert port.isdigit() and int(port) not in (0, DEFAULT_PORT), announced[0]
+    # the announced port is the one a client actually reached, not self.port, which was 0
+    assert connected[0].split()[-1] == port, (announced[0], connected[0])
