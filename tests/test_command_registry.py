@@ -13,3 +13,11 @@ EXPECTED = {
 def test_every_registered_command_carries_its_expected_kind():
     actual = {(name, entry.kind) for name, entry in commands.registry.COMMANDS.items()}
     assert actual == set(EXPECTED.items())
+
+
+def test_every_kind_is_a_distinct_value():
+    # StrEnum makes a duplicated value an alias rather than an error, and the map above compares
+    # tags that would then be equal: a WRITE tagged "read" is a write the rate limiter exempts,
+    # with every tag in this file still matching
+    assert len(list(Kind)) == 3
+    assert len({kind.value for kind in Kind}) == 3

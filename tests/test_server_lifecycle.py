@@ -1,4 +1,5 @@
 import contextlib
+import logging
 import pathlib
 import selectors
 import signal
@@ -10,7 +11,7 @@ import pytest
 
 from commands import registry
 from connection import Connection
-from server import Server
+from server import Server, build_arg_parser
 from tests.int_ceiling import NO_CEILING_REASON, NO_CONVERSION_CEILING, OVERSIZED_DIGIT_RUN
 
 REPO_ROOT = pathlib.Path(__file__).resolve().parent.parent
@@ -70,19 +71,30 @@ def test_parsed_command_gets_its_reply_on_the_same_connection(server_and_client)
 
 
 def test_bulk_body_containing_crlf_survives_a_real_socket(server_and_client):
+    # the body is framing bytes, so a parser scanning for CRLF instead of honouring the declared
+    # length truncates it; ECHO carries the whole body back out, where a drained buffer alone
+    # would say nothing about what came out of it
     server, client = server_and_client
     body = b"*2\r\n$3\r\nfoo\r\n"
-    client.sendall(b"*1\r\n$%d\r\n" % len(body) + body + b"\r\n")
+    client.sendall(b"*2\r\n$4\r\nECHO\r\n$%d\r\n" % len(body) + body + b"\r\n")
     pump(server)
+    client.settimeout(2)
+    assert client.recv(64) == b"$%d\r\n" % len(body) + body + b"\r\n"
     conn = next(iter(server._connections))
     assert conn.read_buffer == bytearray()
 
 
 def test_command_split_across_writes_is_reassembled(server_and_client):
+    # one byte per write, so every element boundary lands mid-parse. the echoed argument is what
+    # proves an argv was reassembled: an empty buffer is also what a byte still in the kernel looks
+    # like, and what a parser inventing an argv out of nothing would leave behind
     server, client = server_and_client
-    for byte in b"*1\r\n$4\r\nECHO\r\n":
+    for byte in b"*2\r\n$4\r\nECHO\r\n$2\r\nhi\r\n":
         client.sendall(bytes([byte]))
         pump(server, times=1)
+    pump(server)
+    client.settimeout(2)
+    assert client.recv(64) == b"$2\r\nhi\r\n"
     conn = next(iter(server._connections))
     assert conn.read_buffer == bytearray()
     assert len(server._connections) == 1
@@ -136,6 +148,9 @@ def test_oversized_length_header_does_not_take_the_server_down():
         bystander.sendall(b"*1\r\n$4\r\nPING\r\n")
         pump(server)
         assert len(server._connections) == 1, "the bystander must survive"
+        # surviving in the set is not being served: a reply is what says the loop still dispatches
+        bystander.settimeout(2)
+        assert bystander.recv(64) == b"+PONG\r\n", "the bystander must still be answered"
 
 
 def test_protocol_error_survives_a_peer_that_cannot_be_written_to():
@@ -195,7 +210,7 @@ def test_close_flushes_a_still_queued_reply_to_the_peer():
         server._loop.close()
 
 
-def test_a_failed_registration_costs_one_connection_not_the_server(monkeypatch):
+def test_a_failed_registration_costs_one_connection_not_the_server(monkeypatch, caplog):
     # _on_accept runs outside _guard, so an unguarded raise here unwinds run_once and takes every other client with it
     with listening() as (server, connect, _listener):
         bystander = connect()
@@ -228,6 +243,12 @@ def test_a_failed_registration_costs_one_connection_not_the_server(monkeypatch):
         doomed.close()
         survivor.close()
 
+    # _on_accept is outside the boundary and has no connection left to answer on, so the log line
+    # is the only trace that a client was turned away at the door
+    refused = [r for r in caplog.records if r.levelname == "ERROR" and r.exc_info]
+    assert refused, caplog.records
+    assert refused[0].exc_info[0] is KeyError, refused[0].exc_info
+
 
 def _stop_the_loop_from_inside(server):
     # run() sets _running itself, so a flag set before the call is overwritten; the only way out is from within the loop
@@ -240,7 +261,7 @@ def _stop_the_loop_from_inside(server):
     server._loop.run_once = run_once_then_stop
 
 
-def test_a_close_that_raises_during_shutdown_still_releases_the_listener():
+def test_a_close_that_raises_during_shutdown_still_releases_the_listener(caplog):
     # the shutdown sweep runs after the loop has exited, where _guard no longer applies, so one bad close must not strand the listener or the selector
     server = Server(0)
     sock, peer = socket.socketpair()
@@ -261,6 +282,11 @@ def test_a_close_that_raises_during_shutdown_still_releases_the_listener():
         sock.close()
 
     assert server._loop._selector.get_map() is None, "the selector must be closed even though a close raised"
+    # the sweep runs with the loop gone and no client left to answer to, so the log line is the
+    # only record that a connection was abandoned rather than closed
+    abandoned = [r for r in caplog.records if r.levelname == "ERROR" and r.exc_info]
+    assert abandoned, caplog.records
+    assert abandoned[0].exc_info[0] is KeyError, abandoned[0].exc_info
 
 
 def test_running_one_server_twice_names_the_reuse():
@@ -327,8 +353,63 @@ def test_a_stop_signal_delivered_during_startup_is_not_lost():
 def test_accept_with_nothing_pending_adds_no_connection():
     # the listener is non-blocking, so accept() with an empty backlog raises BlockingIOError, which is the OSError branch: a real readiness-then-gone race, no mock needed
     with listening() as (server, _connect, listener):
+        # asserted before the call, not after: a blocking listener waits in accept() for a peer
+        # that is never coming, which hangs the suite instead of failing it
+        assert listener.getblocking() is False
         server._on_accept(listener)
         assert server._connections == set()
+
+
+def test_the_listener_is_bound_to_loopback_only():
+    # the replication sync command is unauthenticated, so a wildcard bind offers it to the whole
+    # network -- and every other test here connects over 127.0.0.1 either way, so nothing else
+    # here can tell the two binds apart
+    with listening() as (_server, _connect, listener):
+        assert listener.getsockname()[0] == "127.0.0.1"
+
+
+def test_the_listener_takes_the_port_back_from_a_lingering_close():
+    # without SO_REUSEADDR a restart inside the TIME_WAIT window cannot rebind the port it just
+    # released, and the server that was stopped a second ago refuses to come back for a minute
+    with listening() as (_server, _connect, listener):
+        assert listener.getsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR) != 0
+
+
+def test_the_listener_asks_for_the_largest_backlog_the_kernel_allows(monkeypatch):
+    # a full accept queue drops SYNs rather than refusing them, so a burst of clients waits out its
+    # own retransmit timer instead of failing. the depth cannot be read back off the socket, which
+    # leaves the call itself as the only place to see it
+    server = Server(0)
+    backlogs = []
+    real_listen = socket.socket.listen
+
+    def recording_listen(sock, backlog):
+        backlogs.append(backlog)
+        return real_listen(sock, backlog)
+
+    monkeypatch.setattr(socket.socket, "listen", recording_listen)
+    listener = server._open_listener()
+    try:
+        assert backlogs == [socket.SOMAXCONN]
+    finally:
+        listener.close()
+        server._loop.close()
+
+
+def test_the_default_port_is_the_one_every_client_assumes():
+    # a client given no port connects to 6379, so this default is part of the wire contract
+    assert build_arg_parser().parse_args([]).port == 6379
+
+
+def test_the_loop_is_built_with_a_bounded_select_timeout():
+    # the value the loop is constructed with rather than a measured wall clock, which goes red on a
+    # loaded machine for reasons that have nothing to do with the timeout: this bounds how long a
+    # stop signal waits to be noticed and floors every periodic interval this design will have
+    server = Server(0)
+    try:
+        assert server._loop._timeout == 0.1
+    finally:
+        server._loop.close()
 
 
 def test_run_gives_the_signal_handlers_back():
@@ -364,6 +445,9 @@ def test_a_failed_bind_leaves_the_server_usable():
     port = squatter.getsockname()[1]
     server = Server(port)
     before = (signal.getsignal(signal.SIGINT), signal.getsignal(signal.SIGTERM))
+    # the loop is stopped from inside as well: this test is about the bind failing, and a bind that
+    # succeeds instead leaves run() in select() forever rather than reporting the surprise
+    _stop_the_loop_from_inside(server)
     try:
         with pytest.raises(OSError):
             server.run()
@@ -546,3 +630,130 @@ def test_a_connection_closed_by_the_read_pass_is_not_reached_by_the_write_pass()
         server._on_readable(conn)
         assert conn.closed is True
         client.close()
+
+
+def test_a_recovery_that_also_fails_costs_one_connection_not_the_process():
+    # _guard's whole purpose is that one connection's failure is not every connection's. its own
+    # recovery calls _close, whose three statements can each raise, and a raise there reaches the
+    # top of the only thread this server has
+    server = Server(0)
+    sock, peer = socket.socketpair()
+    sock.setblocking(False)
+    conn = Connection(sock, ("stub", 0))
+    server._loop.register(conn)
+    server._connections.add(conn)
+
+    def step_raising(_conn):
+        raise RuntimeError("the primary failure")
+
+    def flush_raising():
+        raise RuntimeError("and the recovery failed too")
+
+    conn.flush = flush_raising
+    try:
+        server._guard(conn, step_raising)          # must not propagate
+    finally:
+        peer.close()
+
+    assert conn not in server._connections, "the connection must not stay tracked"
+    assert conn.closed is True, "the descriptor must be taken back"
+    assert sock.fileno() == -1
+    server._loop.close()
+
+
+def test_a_shutdown_close_raising_outside_the_selector_tuple_still_closes_every_socket():
+    # the sweep's nesting protects the port and the selector; nothing protected the descriptors,
+    # and a type outside the old (KeyError, ValueError, OSError) abandoned every connection after
+    # the first in iteration order
+    server = Server(0)
+    pairs = [socket.socketpair() for _ in range(4)]
+    conns = []
+    for sock, _peer in pairs:
+        sock.setblocking(False)
+        conn = Connection(sock, ("stub", 0))
+        server._loop.register(conn)
+        server._connections.add(conn)
+        conns.append(conn)
+
+    def unregister_raising(_conn):
+        raise RuntimeError("outside the tuple the sweep used to name")
+
+    server._loop.unregister = unregister_raising
+    _stop_the_loop_from_inside(server)
+    try:
+        server.run()
+    finally:
+        for _sock, peer in pairs:
+            peer.close()
+
+    assert server._connections == set(), "every connection must leave the set"
+    assert [c.closed for c in conns] == [True] * 4, "every descriptor must be released"
+    assert server._loop._selector.get_map() is None
+
+
+def test_every_signal_handler_is_restored_even_if_an_earlier_restore_raises():
+    # a flat restore loop ends at the first raise, leaving every handler after it bound to a
+    # Server that is being discarded -- which is the leak the restore exists to prevent. the
+    # property is order-independent: whichever restore raises, the other is still attempted
+    def mark_int(_signum, _frame):
+        pass
+
+    def mark_term(_signum, _frame):
+        pass
+
+    previous = [signal.signal(signal.SIGINT, mark_int), signal.signal(signal.SIGTERM, mark_term)]
+    real_signal = signal.signal
+    calls = 0
+    attempted = []
+
+    def signal_raising_on_the_first_restore(signum, handler):
+        nonlocal calls
+        calls += 1
+        if calls > 2:                              # run() installs two handlers before restoring any
+            attempted.append(signum)
+            if len(attempted) == 1:
+                raise RuntimeError("a signal arrived during the restore")
+        return real_signal(signum, handler)
+
+    server = Server(0)
+    _stop_the_loop_from_inside(server)
+    try:
+        signal.signal = signal_raising_on_the_first_restore
+        with pytest.raises(RuntimeError):
+            server.run()
+    finally:
+        signal.signal = real_signal
+        signal.signal(signal.SIGINT, previous[0])
+        signal.signal(signal.SIGTERM, previous[1])
+
+    assert set(attempted) == {signal.SIGINT, signal.SIGTERM}, attempted
+
+
+def test_a_descriptor_that_will_not_close_is_logged_rather_than_raised(caplog):
+    # the innermost step of the last resort: _close has already failed, and conn.close() is all that
+    # is left between this connection and a leaked descriptor. a raise here has nothing behind it
+    server = Server(0)
+    sock, peer = socket.socketpair()
+    sock.setblocking(False)
+    conn = Connection(sock, ("stub", 0))
+    server._loop.register(conn)
+    server._connections.add(conn)
+
+    def unregister_raising(_conn):
+        raise RuntimeError("forces _close to fail")
+
+    def close_raising():
+        raise OSError("and the descriptor will not come back")
+
+    server._loop.unregister = unregister_raising
+    conn.close = close_raising
+    try:
+        with caplog.at_level(logging.ERROR):
+            server._abandon(conn)              # must not propagate
+    finally:
+        peer.close()
+        sock.close()
+        server._loop.close()
+
+    assert conn not in server._connections
+    assert [r.message for r in caplog.records if "descriptor" in r.message], caplog.records

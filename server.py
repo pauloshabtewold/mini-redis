@@ -1,6 +1,7 @@
 """Entry point: CLI flags, signal handling, and the event loop's three callback bodies. Nothing is scheduled to run periodically."""
 
 import argparse
+import contextlib
 import logging
 import signal
 import socket
@@ -81,7 +82,21 @@ class Server:
         except Exception:
             # not wrapped: measured, handleError swallows the OSError family, so a full disk or a gone pipe cannot raise here. a closed stream raises ValueError straight through it, which nothing here can produce -- no handler is configured and nothing closes stderr
             logger.exception("closing %s after an unhandled exception", conn.addr)
+            self._abandon(conn)
+
+    def _abandon(self, conn: Connection) -> None:
+        # the one place a close that itself fails is handled, reached from the boundary above and from the shutdown sweep, so a failing close ends the same way wherever it is noticed. every statement in _close can raise, and a raise from the boundary's own recovery reaches the top of the only thread this server has
+        try:
             self._close(conn)
+        except Exception:
+            logger.exception("closing %s failed; abandoning it", conn.addr)
+            # the connection cannot be tracked any more, so drop it and take the descriptor back
+            self._connections.discard(conn)
+            try:
+                conn.close()
+            except OSError:
+                # close() reaches nothing but the socket, so this is the only family it can raise
+                logger.exception("releasing %s's descriptor failed", conn.addr)
 
     def _read_and_dispatch(self, conn: Connection) -> None:
         if not conn.receive():
@@ -128,14 +143,10 @@ class Server:
     def _shutdown(self, listener: socket.socket) -> None:
         try:
             for conn in list(self._connections):
-                try:
-                    self._close(conn)
-                except (KeyError, ValueError, OSError):
-                    # the same three the selector raises from _on_accept's register. this sweep runs after the loop has exited, where _guard no longer applies, so one connection that cannot be closed would otherwise strand every connection after it in iteration order
-                    logger.exception("closing %s during shutdown failed", conn.addr)
-                    self._connections.discard(conn)
+                # _abandon rather than _close: this sweep runs after the loop has exited, where _guard no longer applies, so one connection that cannot be closed would otherwise strand every connection after it in iteration order with its descriptor still open
+                self._abandon(conn)
         finally:
-            # the sweep is nested so that anything escaping it -- a type outside the tuple above -- still cannot cost the port and the selector
+            # the sweep is still nested, so anything escaping it that _abandon does not answer for cannot cost the port and the selector
             try:
                 listener.close()
             finally:
@@ -164,8 +175,10 @@ class Server:
             finally:
                 self._shutdown(listener)
         finally:
-            for signum, handler in restore:
-                signal.signal(signum, handler)
+            # unwound rather than looped: a signal delivered during one restore raises out of a flat loop's body, and every handler after it stays bound to a discarded Server -- the exact leak the restore exists to prevent. ExitStack runs all of them and still re-raises the first, with no except clause of its own
+            with contextlib.ExitStack() as stack:
+                for signum, handler in restore:
+                    stack.callback(signal.signal, signum, handler)
 
 
 def main(argv=None) -> None:
