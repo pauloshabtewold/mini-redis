@@ -6,14 +6,16 @@ over TCP, with **zero runtime dependencies**.
 ## Status
 
 Early. The server accepts connections, parses RESP2 correctly — multibulk arrays and
-inline commands, well-formed or not — and answers three commands: `PING`, `ECHO`, `HELLO`.
+inline commands, well-formed or not — and answers fifteen commands: `PING`, `ECHO`,
+`HELLO`, `SET`, `GET`, `DEL`, `EXISTS`, `TYPE`, `EXPIRE`, `PEXPIRE`, `PEXPIREAT`, `TTL`,
+`PTTL`, `INCR`, `DECR`. Keys expire lazily, on lookup — there is no active sweep yet, so
+an expired key nobody has asked about stays in memory until something does.
 
-**There is no keyspace yet, so this is not usable as a key-value store.** `SET` returns the
-same unknown-command error a typo would. Six modules are declared and empty: `store.py`,
-`persistence.py`, `ratelimit.py`, `replication.py`, and `commands/string.py`,
-`commands/list.py`.
-
-What does work is the part underneath: framing, buffering, and connection lifecycle.
+**Nothing bounds how much memory a client can use.** There is no cap on key count or
+value size, no cap on total keyspace size, and no eviction policy to fall back on if
+there were — a client with nothing but `SET` can grow the process until the host runs
+out of memory. Four modules are still declared and empty: `persistence.py`,
+`ratelimit.py`, `replication.py`, `commands/list.py`.
 
 ## Quickstart
 
@@ -27,6 +29,10 @@ python3 -m venv .venv && .venv/bin/pip install -e '.[dev]'
 ```
 $ redis-cli -p 7000 PING
 PONG
+$ redis-cli -p 7000 SET foo bar
+OK
+$ redis-cli -p 7000 GET foo
+bar
 ```
 
 If you run on the default 6379 and a real Redis is already there, the bind fails with
@@ -54,6 +60,11 @@ the whole per-connection path; anything other than a retryable error closes that
 and leaves the server and every other connection running. An unknown command answers with
 an error rather than a disconnect, so a client's own capability probes fail harmlessly.
 
+**One lookup answers every existence question.** `SET`'s `NX`/`XX` conditions, `INCR` and
+`DECR`'s read-modify-write, every type check, and a plain `GET` all go through
+`Store.lookup()` — never a raw dict test. A key past its deadline is deleted the moment
+that lookup finds it, so no handler can see a key its own logic already considers gone.
+
 ## Layout
 
 ```
@@ -61,9 +72,10 @@ server.py       entry point, listener, signal handling, dispatch
 event_loop.py   selectors readiness dispatch (on_readable / on_writable / on_accept)
 connection.py   per-connection socket, read/write buffers, lifecycle
 resp.py         RESP2 parser and serializer
-commands/       registry.py + server.py have code; string.py and list.py do not
+store.py        keyspace, expiry index, pending-effects queue
+commands/       registry.py, server.py and string.py have code; list.py does not
 tests/          pytest suite, run in CI against Python 3.11 and 3.13
 ```
 
-[Design notes](docs/DESIGN.md) cover why each of these is shaped the way it is, and twelve
+[Design notes](docs/DESIGN.md) cover why each of these is shaped the way it is, and thirteen
 deliberate differences from real Redis.

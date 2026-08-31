@@ -1,6 +1,6 @@
 """Connection and server commands: PING, ECHO, HELLO, DBSIZE, KEYS, FLUSHALL, INFO, CONFIG."""
 
-from commands.registry import Kind, command, wrong_arity
+from commands.registry import Kind, Reply, command, wrong_arity
 import resp
 
 # kept as a constant rather than read from installed metadata, so the reply does not depend on the project being installed
@@ -11,28 +11,28 @@ REPLICATION_ROLE = b"master"
 
 
 @command(b"PING", arity=-1, kind=Kind.OTHER)
-def ping(conn, argv: list[bytes]) -> bytes:
+def ping(store, conn, argv: list[bytes]) -> Reply:
     # the arity integer expresses a minimum only, not a range, so the two-token upper bound is checked here
     if len(argv) > 2:
-        return wrong_arity(b"PING")
+        return wrong_arity(b"PING"), []
     if len(argv) == 1:
-        return resp.encode_simple_string(b"PONG")
-    return resp.encode_bulk_string(argv[1])
+        return resp.encode_simple_string(b"PONG"), []
+    return resp.encode_bulk_string(argv[1]), []
 
 
 @command(b"ECHO", arity=2, kind=Kind.OTHER)
-def echo(conn, argv: list[bytes]) -> bytes:
-    return resp.encode_bulk_string(argv[1])
+def echo(store, conn, argv: list[bytes]) -> Reply:
+    return resp.encode_bulk_string(argv[1]), []
 
 
 @command(b"HELLO", arity=-1, kind=Kind.OTHER)
-def hello(conn, argv: list[bytes]) -> bytes:
+def hello(store, conn, argv: list[bytes]) -> Reply:
     # same minimum-only arity as ping, hence the explicit upper bound here too
     if len(argv) > 2:
-        return wrong_arity(b"HELLO")
+        return wrong_arity(b"HELLO"), []
     if len(argv) == 2 and argv[1] != b"2":
         # every argument other than b"2" answers NOPROTO, integer or not -- diverges from real Redis's own parse error, deliberately
-        return resp.encode_error(b"NOPROTO unsupported protocol version")
+        return resp.encode_error(b"NOPROTO unsupported protocol version"), []
     # RESP2 has no map type, so this is a flat array of alternating field/value pairs -- what a real server returns on RESP2
     return resp.encode_array([
         resp.encode_bulk_string(b"server"),
@@ -50,4 +50,4 @@ def hello(conn, argv: list[bytes]) -> bytes:
         resp.encode_bulk_string(REPLICATION_ROLE),
         resp.encode_bulk_string(b"modules"),
         resp.encode_array([]),
-    ])
+    ]), []

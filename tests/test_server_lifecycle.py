@@ -6,9 +6,12 @@ import signal
 import socket
 import subprocess
 import sys
+import time
 
 import pytest
 
+import commands
+import store as store_module
 from commands import registry
 from connection import Connection
 from server import DEFAULT_PORT, Server, build_arg_parser
@@ -520,7 +523,7 @@ def _raising_command(name, exc):
     del registry.COMMANDS[name]
 
     @registry.command(name, arity=original.arity, kind=original.kind)
-    def explode(conn, argv):
+    def explode(store, conn, argv):
         raise exc
 
     return original
@@ -812,3 +815,62 @@ def test_a_successful_bind_announces_the_address_it_actually_bound():
     assert port.isdigit() and int(port) not in (0, DEFAULT_PORT), announced[0]
     # the announced port is the one a client actually reached, not self.port, which was 0
     assert connected[0].split()[-1] == port, (announced[0], connected[0])
+
+
+def test_the_effect_queue_is_drained_once_per_dispatched_command():
+    # a batch delivered in one readable event is what a per-batch drain and a per-command
+    # drain cannot be told apart on -- either placement empties the queue exactly once for
+    # that event. dispatch() is wrapped as well as take_effects(), the two counts are
+    # compared after every run_once(), and the run must contain at least one event that
+    # carried more than one command, or it could not have told the two placements apart
+    drains, dispatches, per_event = [], [], []
+    original_take = store_module.Store.take_effects
+    original_dispatch = commands.dispatch
+    store_module.Store.take_effects = lambda self: (drains.append(1), original_take(self))[1]
+
+    def counting_dispatch(store, conn, argv):
+        dispatches.append(1)
+        return original_dispatch(store, conn, argv)
+
+    commands.dispatch = counting_dispatch
+    try:
+        with listening() as (server, connect, _listener):
+            client = connect()
+            pump(server)
+            client.sendall(b"*1\r\n$4\r\nPING\r\n" * 3)
+            deadline = time.monotonic() + 5
+            while len(dispatches) < 3 and time.monotonic() < deadline:
+                before = (len(dispatches), len(drains))
+                server._loop.run_once()
+                per_event.append((len(dispatches) - before[0], len(drains) - before[1]))
+                assert len(drains) == len(dispatches), (len(drains), len(dispatches), per_event)
+            assert len(dispatches) == 3, (dispatches, per_event)
+            assert max(d for d, _ in per_event) >= 2, (
+                "the three commands never shared a readable event, so this run could not "
+                "have distinguished a per-batch drain from a per-command one", per_event)
+    finally:
+        store_module.Store.take_effects = original_take
+        commands.dispatch = original_dispatch
+
+
+def test_one_readable_event_dispatches_every_buffered_command():
+    # written as an invariant over every readable event rather than a count of events, so
+    # TCP's freedom to split a 14 KiB write across segments cannot make this flaky
+    N = 1000
+    with listening() as (server, connect, _listener):
+        client = connect()
+        pump(server)
+        conn = next(iter(server._connections))
+        client.setblocking(False)
+        client.sendall(b"*1\r\n$4\r\nPING\r\n" * N)
+        replies = b""
+        deadline = time.monotonic() + 20
+        while len(replies) < N * 7 and time.monotonic() < deadline:
+            server._loop.run_once()
+            left = conn.take_commands()
+            assert left == [], "%d commands were parsed and left undispatched" % len(left)
+            try:
+                replies += client.recv(1 << 20)
+            except BlockingIOError:
+                pass
+        assert replies == b"+PONG\r\n" * N, (len(replies), N * 7)

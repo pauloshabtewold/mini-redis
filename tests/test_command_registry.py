@@ -7,6 +7,18 @@ EXPECTED = {
     b"PING": Kind.OTHER,
     b"ECHO": Kind.OTHER,
     b"HELLO": Kind.OTHER,
+    b"SET": Kind.WRITE,
+    b"GET": Kind.READ,
+    b"DEL": Kind.WRITE,
+    b"EXISTS": Kind.READ,
+    b"TYPE": Kind.READ,
+    b"EXPIRE": Kind.WRITE,
+    b"PEXPIRE": Kind.WRITE,
+    b"PEXPIREAT": Kind.WRITE,
+    b"TTL": Kind.READ,
+    b"PTTL": Kind.READ,
+    b"INCR": Kind.WRITE,
+    b"DECR": Kind.WRITE,
 }
 
 

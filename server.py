@@ -11,6 +11,7 @@ import commands
 import resp
 from connection import Connection, Role
 from event_loop import EventLoop
+from store import Store
 
 DEFAULT_PORT = 6379
 # the replication sync command is unauthenticated and is safe only bound to loopback.
@@ -36,6 +37,11 @@ class Server:
         self._loop = EventLoop(
             self._on_accept, self._on_readable, self._on_writable, SELECT_TIMEOUT_SECONDS
         )
+        # per-process state, constructed here rather than a field on Connection --
+        # event_loop.py imports Connection and nothing else, and a field here would reach
+        # it transitively -- and rather than a module-level singleton, because two servers
+        # in one process would then share a keyspace
+        self._store = Store()
         self._running = False
         self._ran = False
 
@@ -112,7 +118,16 @@ class Server:
             return
         # every command take_commands() returns is dispatched: level-triggered readiness re-reports unread socket bytes, not commands already taken out of the buffer, so a leftover here is never revisited and the client waits forever
         for argv in parsed_commands:
-            conn.queue(commands.dispatch(conn, argv))
+            response, effects = commands.dispatch(self._store, conn, argv)
+            # drained once per command and before the reply is queued: the queue holds
+            # effects the lookups inside THIS command produced, so they precede the
+            # command's own -- an INCR that lazily expired its key must be preceded by the
+            # DEL, or a follower ends with the key absent while this server holds the new
+            # value. both lists are discarded because nothing propagates yet -- that lands
+            # in a later feature -- and the drain still runs because lazy expiry fills the
+            # queue from here on and nothing else would ever empty it
+            self._store.take_effects()
+            conn.queue(response)
         # one flush for the whole batch, not one per command: N replies concatenate into one buffer and N syscalls buy nothing
         self._flush(conn)
 
