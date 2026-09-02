@@ -104,8 +104,18 @@ class Store:
         return effects
 
     def check_invariants(self) -> None:
-        # an explicit raise, never `assert` -- `-O` strips assert statements from the
-        # running process, and this is the only check that _expiry and _data still agree
+        """Raise unless the keyspace and the expiry index still agree.
+
+        Nothing in the running server calls this. Its caller today is the test suite,
+        which runs it after every step of a randomised operation sequence -- that is
+        what it is for, and naming it here saves the next reader working out from the
+        call graph that a check this file describes as the only one of its kind is not
+        actually running anywhere in production.
+
+        It is written as an explicit raise rather than an `assert` anyway, because the
+        day something does call it in the running process, `-O` would strip an assert
+        out from under it without changing a line of this file.
+        """
         orphans = [key for key in self._expiry if key not in self._data]
         if orphans:
             raise AssertionError(

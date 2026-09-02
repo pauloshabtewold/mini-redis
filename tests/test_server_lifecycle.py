@@ -930,3 +930,29 @@ def test_a_client_that_keeps_reading_is_never_closed_by_the_limit(server_and_cli
             break
     assert not conn.closed, "a client that drains as it goes must not trip the limit"
     assert seen == b"+PONG\r\n" * 2000
+
+
+@pytest.mark.parametrize("retryable", [BlockingIOError, InterruptedError])
+def test_a_retryable_error_leaves_the_connection_open_rather_than_closing_it(caplog, retryable):
+    # _guard names these two before the general clause and returns instead of closing.
+    # No path in the shipped server reaches it -- receive() and flush() each absorb
+    # BlockingIOError below this point, and PEP 475 retries EINTR inside the interpreter
+    # -- so nothing here exercised the distinction, and collapsing the two clauses into
+    # one passed the whole suite. What the distinction says is that the boundary sorts
+    # "try again" from "this connection is finished", and a boundary that cannot tell
+    # them apart turns a momentary condition into a dropped client
+    original = _raising_command(b"PING", retryable())
+    try:
+        with listening() as (server, connect, _listener):
+            client = connect()
+            pump(server)
+            conn, = server._connections
+            client.sendall(b"*1\r\n$4\r\nPING\r\n")
+            pump(server)
+            assert not conn.closed, "%s must not cost the connection" % retryable.__name__
+            assert conn in server._connections
+            assert not [r for r in caplog.records if r.levelname == "ERROR"], (
+                "a retryable error must not be logged as an unhandled one")
+    finally:
+        del registry.COMMANDS[b"PING"]
+        registry.COMMANDS[b"PING"] = original
