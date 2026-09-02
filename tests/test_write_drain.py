@@ -223,3 +223,13 @@ def test_a_non_numeric_flag_names_the_flag_rather_than_the_validator(capsys, fla
     message = capsys.readouterr().err
     assert flag in message, message
     assert "_port" not in message and "_output_buffer_limit" not in message, message
+
+
+def test_the_parser_accepts_the_limit_value_its_own_help_text_recommends():
+    # 0 reaches the class default without ever running the type= callback -- argparse
+    # calls it only on a value actually typed -- so every existing check of 0 goes around
+    # the validator rather than through it. Tightening `< 0` to `<= 0` therefore passes
+    # the whole suite while refusing to start for anyone who writes the flag explicitly,
+    # with an error that contradicts itself: "cannot be negative ... not 0"
+    assert build_arg_parser().parse_args(
+        ["--output-buffer-limit", "0"]).output_buffer_limit == 0

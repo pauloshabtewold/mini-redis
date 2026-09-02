@@ -156,7 +156,7 @@ def test_oversized_length_header_does_not_take_the_server_down():
         assert bystander.recv(64) == b"+PONG\r\n", "the bystander must still be answered"
 
 
-def test_protocol_error_survives_a_peer_that_cannot_be_written_to():
+def test_protocol_error_survives_a_peer_that_cannot_be_written_to(caplog):
     # the two conditions have to land in the same pass -- the parse fails AND the error
     # reply cannot be sent -- which is what makes _flush close the connection before the
     # caller does. A socketpair makes that deterministic: data already queued stays
@@ -180,8 +180,19 @@ def test_protocol_error_survives_a_peer_that_cannot_be_written_to():
     try:
         # the assertion is that this returns at all: the failure mode is a ValueError
         # raised by _guard's own recovery, which reaches the top of the only thread there is
-        server._on_readable(doomed)
+        with caplog.at_level(logging.ERROR):
+            server._on_readable(doomed)
         assert server._connections == {bystander}, "only the sender should be dropped"
+        # and that it returns quietly. _close runs twice on this path by design -- _flush
+        # closes on the failed send and the caller closes again -- and the guard that
+        # makes the second call a no-op is invisible to every functional assertion here:
+        # without it the second unregister raises on a descriptor already at -1, _abandon
+        # catches it and finishes correctly, and the end state is identical. What differs
+        # is two ERROR tracebacks logged for a client sending garbage and hanging up,
+        # which is ordinary traffic, not an incident
+        assert not [r for r in caplog.records if r.levelname == "ERROR"], (
+            "an ordinary malformed-then-vanished peer must not log an error: %s"
+            % [r.getMessage() for r in caplog.records])
 
         bystander_peer.sendall(b"*1\r\n$4\r\nPING\r\n")
         server._on_readable(bystander)

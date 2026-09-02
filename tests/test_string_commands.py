@@ -470,3 +470,16 @@ def test_a_thousand_past_dated_writes_leave_nothing_behind(conn):
         commands.dispatch(store, conn, [b"SET", b"g%d" % i, b"v", b"PXAT", b"1"])
     assert store._data == {} and store._expiry == {}
     store.check_invariants()
+
+
+def test_set_with_get_raises_wrongtype_through_dispatch():
+    # SET is type-agnostic and overwrites anything, but GET makes it read the value it is
+    # replacing, and reading a value of the wrong kind is WRONGTYPE. Without the kind on
+    # that lookup the command answers a plausible-looking old value and overwrites the
+    # key -- the corruption the check exists to prevent. Unreachable while only strings
+    # exist; live the day commands/list.py ships, which is when nobody will be looking
+    store = ListKinded()
+    store.write(b"w", b"v", keep_ttl=False)
+    assert commands.dispatch(store, None, [b"SET", b"w", b"new", b"GET"]) == (
+        b"-WRONGTYPE Operation against a key holding the wrong kind of value\r\n", [])
+    assert store.lookup(b"w") == b"v", "the refused command must not have written"
