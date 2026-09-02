@@ -372,3 +372,14 @@ def test_a_multibulk_count_above_the_reference_ceiling_is_refused_at_the_header(
         return
     argv, consumed, needed = resp.parse_command(wire)
     assert (argv, consumed) == (None, 0) and needed > 0
+
+
+@pytest.mark.parametrize("search_from", [-1, -4, -100])
+def test_a_negative_resume_position_does_not_read_as_an_offset_from_the_end(search_from):
+    # bytes.find(sub, start) treats a negative start as an offset from the end, so an
+    # unclamped resume position turns a complete header into "need more data" and parks
+    # the caller forever. no call site can pass one today -- Connection derives it from
+    # max(floor, len - 1) -- but the clamp is the only thing that keeps that true, and
+    # parse_bulk_element carries the same clamp for the same reason
+    assert resp.parse_multibulk_header(b"*3\r\n", search_from) == (3, 4, 0)
+    assert resp.parse_bulk_element(b"$1\r\na\r\n", search_from) == (b"a", 7, 0)

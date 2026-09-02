@@ -106,7 +106,10 @@ def parse_multibulk_header(
     `search_from` resumes a terminator search that already came up empty; see
     parse_command. The count itself is always read from byte 1, whatever it says.
     """
-    header_end = buf.find(CRLF, search_from)
+    # clamped like parse_bulk_element's: bytes.find reads a negative start as an
+    # offset from the end, which turns a complete header into "need more data" and
+    # hangs the caller. no call site can pass one today; the asymmetry is the risk
+    header_end = buf.find(CRLF, max(0, search_from))
     if header_end == -1:
         return (0, 0, 0)
     # a negative count is refused here, where real Redis consumes a syntactically valid count of zero or less silently and answers nothing -- a deliberate divergence, and the reason this call is not special-cased around the sign. "syntactically valid" is the whole rule: string2ll refuses -0 there as it does here, so the two agree on -0 and on 0 and part only on -1 and below
