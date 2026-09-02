@@ -126,6 +126,11 @@ INVALID_EXPIRE_TIME_EXPIRE = b"ERR invalid expire time in 'expire' command"
 INVALID_EXPIRE_TIME_PEXPIRE = b"ERR invalid expire time in 'pexpire' command"
 INCR_DECR_OVERFLOW = b"ERR increment or decrement would overflow"
 
+# EXPIRE's bound on its seconds argument, before the multiply to milliseconds. INT64_MAX
+# // 1000 in both directions: the reference divides with C semantics, which truncate
+# toward zero, so its own negative bound is exactly -this
+MAX_EXPIRE_SECONDS = INT64_MAX // 1000
+
 
 def _apply_expiry(store, key: bytes, deadline_ms: int) -> Reply:
     # the one place EXPIRE, PEXPIRE and PEXPIREAT turn a resolved absolute deadline into
@@ -151,8 +156,11 @@ def expire(store, conn, argv: list[bytes]) -> Reply:
         return resp.encode_error(NOT_AN_INTEGER), []
     # rejected before the multiply, not after: a seconds value outside this range would
     # carry the millisecond figure past where a 64-bit deadline could hold it, even though
-    # Python's own int never overflows and so never raises to catch this on its own
-    if not (INT64_MIN // 1000 <= seconds <= INT64_MAX // 1000):
+    # Python's own int never overflows and so never raises to catch this on its own.
+    # symmetric rather than INT64_MIN // 1000, which floors where the reference truncates
+    # -- one value apart, and on that one value a floor accepts what the reference refuses
+    # and silently deletes the key instead of answering an error
+    if not (-MAX_EXPIRE_SECONDS <= seconds <= MAX_EXPIRE_SECONDS):
         return resp.encode_error(INVALID_EXPIRE_TIME_EXPIRE), []
     deadline = store.now_ms() + seconds * 1000
     if deadline > INT64_MAX:
@@ -185,13 +193,18 @@ def pexpireat(store, conn, argv: list[bytes]) -> Reply:
 
 def _remaining_ms(store, key: bytes) -> int:
     # -2 missing -- through the lookup, so a logically-expired key counts as missing --
-    # -1 present with no deadline, otherwise the exact remaining milliseconds
+    # -1 present with no deadline, otherwise the remaining milliseconds
     if store.lookup(key) is None:
         return -2
     deadline = store.deadline(key)
     if deadline is None:
         return -1
-    return deadline - store.now_ms()
+    # clamped at zero, as the reference clamps, because the clock is read twice: lookup()
+    # read it first and found this deadline still in the future, and the read below can
+    # have crossed it. the two negative values here are a vocabulary -- -1 says "no
+    # deadline" and -2 says "no key" -- so an unclamped remainder would not report a small
+    # number, it would report one of those two facts about a key for which neither is true
+    return max(0, deadline - store.now_ms())
 
 
 @command(b"TTL", arity=2, kind=Kind.READ)

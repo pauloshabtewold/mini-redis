@@ -10,6 +10,7 @@ import commands
 import resp
 from store import Store
 from tests.conftest import FROZEN, FrozenStore, r
+from tests.int_ceiling import NO_CEILING_REASON, NO_CONVERSION_CEILING, OVERSIZED_DIGIT_RUN
 
 
 @pytest.fixture
@@ -198,3 +199,78 @@ def test_expire_family_arity_is_exact_not_a_minimum(store, argv, expected):
     # -3 rejects the trailing option instead of silently ignoring it
     store.write(b"k", b"v", keep_ttl=False)
     assert commands.dispatch(store, None, argv) == (expected, [])
+
+
+@pytest.mark.parametrize(
+    "seconds, expected",
+    [
+        # the reference divides its own bound with C semantics, which truncate toward
+        # zero; Python's // floors, and the two differ on exactly this one value. a
+        # floored bound accepts it, resolves a deadline far in the past, and deletes
+        # the key -- where the reference answers an error and the key survives
+        (b"-9223372036854776", b"-ERR invalid expire time in 'expire' command\r\n"),
+        # one step inside it is still accepted, so the bound rejects the boundary
+        # rather than everything near it. measured against redis-server 7.2.7, which
+        # answers :1 here and the error above
+        (b"-9223372036854775", b":1\r\n"),
+        (b"-9223372036854774", b":1\r\n"),
+        # the positive side never reached this bound: every value large enough to
+        # trouble it is already caught by the millisecond conversion below, which is
+        # why only the negative half of the range moved
+        (b"9223372036854775", b"-ERR invalid expire time in 'expire' command\r\n"),
+        (b"9223372036854776", b"-ERR invalid expire time in 'expire' command\r\n"),
+    ],
+    ids=["below-min", "at-min", "inside-min", "at-max", "above-max"],
+)
+def test_expire_bounds_its_seconds_argument_the_way_the_reference_does(store, seconds, expected):
+    store.write(b"k", b"v", keep_ttl=False)
+    response, _effects = r(store, b"EXPIRE", b"k", seconds)
+    assert response == expected
+
+
+def test_expire_at_the_negative_bound_leaves_the_key_alone(store):
+    # the consequence the bound above exists to prevent, stated as the keyspace fact:
+    # a refused EXPIRE must not have deleted anything on its way to refusing
+    store.write(b"k", b"v", keep_ttl=False)
+    r(store, b"EXPIRE", b"k", b"-9223372036854776")
+    assert store.lookup(b"k") == b"v"
+
+
+@pytest.mark.skipif(NO_CONVERSION_CEILING, reason=NO_CEILING_REASON)
+@pytest.mark.parametrize("argv0", [b"EXPIRE", b"PEXPIRE", b"PEXPIREAT"])
+def test_a_digit_run_past_the_conversion_ceiling_is_refused_not_raised(store, argv0):
+    # parse_int64's length guard is what keeps this off int(), which raises above the
+    # interpreter's conversion ceiling -- an escaping ValueError closes the client's
+    # connection and logs a traceback where the protocol asks for one error reply
+    store.write(b"k", b"v", keep_ttl=False)
+    assert r(store, argv0, b"k", OVERSIZED_DIGIT_RUN) == (
+        b"-ERR value is not an integer or out of range\r\n", [])
+
+
+def test_a_remaining_time_is_never_reported_as_one_of_the_two_negative_facts():
+    # _remaining_ms reads the clock twice -- once inside lookup(), once for the
+    # subtraction -- and a deadline that falls between the two reads makes the
+    # difference negative. -1 and -2 are not small numbers here, they are "this key has
+    # no deadline" and "this key does not exist", and a key that has both would be
+    # answering the client the opposite of the truth. the reference clamps for this
+    # reason; this pins the clamp with a clock that always crosses the deadline
+    class ClockCrossesTheDeadline(Store):
+        def __init__(self):
+            super().__init__()
+            self._reads = 0
+
+        def now_ms(self):
+            # the first read is what lookup() sees, and it must be before the deadline
+            # or the key is expired and gone; every read after it is well past
+            self._reads += 1
+            return FROZEN if self._reads == 1 else FROZEN + 10_000
+
+    store = ClockCrossesTheDeadline()
+    store.write(b"k", b"v", keep_ttl=False)
+    store.expire_at(b"k", FROZEN + 1)
+    assert r(store, b"PTTL", b"k") == (b":0\r\n", [])
+
+    store = ClockCrossesTheDeadline()
+    store.write(b"k", b"v", keep_ttl=False)
+    store.expire_at(b"k", FROZEN + 1)
+    assert r(store, b"TTL", b"k") == (b":0\r\n", [])
