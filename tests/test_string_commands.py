@@ -422,3 +422,51 @@ def test_the_deadline_family_grammar(store, conn, options, expected):
 def test_the_new_options_are_case_insensitive_like_the_old_ones(store, conn, options):
     assert commands.dispatch(store, conn, [b"SET", b"k", b"v"] + options)[0] != (
         b"-ERR syntax error\r\n")
+
+
+def test_keepttl_is_carried_into_the_effect_so_a_replay_keeps_the_deadline_too(conn):
+    # the effect is what a follower replays, and a plain SET's own keep_ttl=False clears
+    # the deadline this command exists to preserve. dropping the token leaves the two
+    # ends disagreeing about when the key dies, with nothing to notice
+    leader = FrozenStore()
+    commands.dispatch(leader, conn, [b"SET", b"k", b"v1", b"EX", b"100"])
+    _response, effects = commands.dispatch(leader, conn, [b"SET", b"k", b"v2", b"KEEPTTL"])
+    assert effects == [[b"SET", b"k", b"v2", b"KEEPTTL"]]
+
+    follower = FrozenStore()
+    commands.dispatch(follower, conn, [b"SET", b"k", b"v1", b"EX", b"100"])
+    for effect in effects:
+        commands.dispatch(follower, conn, effect)
+    assert follower.deadline(b"k") == leader.deadline(b"k") == FROZEN + 100_000
+
+
+@pytest.mark.parametrize("token, argument", [(b"EXAT", b"1"), (b"PXAT", b"1")],
+                         ids=["exat", "pxat"])
+def test_an_absolute_deadline_already_past_deletes_rather_than_scheduling(conn, token, argument):
+    # EXAT and PXAT are the only options that resolve a valid argument to an instant
+    # already gone. Writing that into the expiry index leaves a key only a later lookup
+    # would collect, and with no sweep nothing guarantees one ever comes -- so the key
+    # stays resident forever. EXPIRE's own path deletes on the spot for this reason
+    store = FrozenStore()
+    response, effects = commands.dispatch(store, conn, [b"SET", b"k", b"v", token, argument])
+    assert response == b"+OK\r\n"
+    assert effects == [[b"DEL", b"k"]], "a past deadline propagates as the deletion it is"
+    assert b"k" not in store._data, "the key must not be left resident"
+    assert b"k" not in store._expiry, "and must not be left in the expiry index"
+
+
+def test_a_past_deadline_with_get_still_answers_the_replaced_value(conn):
+    store = FrozenStore()
+    commands.dispatch(store, conn, [b"SET", b"k", b"old"])
+    assert commands.dispatch(store, conn, [b"SET", b"k", b"new", b"PXAT", b"1", b"GET"]) == (
+        b"$3\r\nold\r\n", [[b"DEL", b"k"]])
+    assert b"k" not in store._data
+
+
+def test_a_thousand_past_dated_writes_leave_nothing_behind(conn):
+    # the shape the leak took: every key client-invisible, every key still in memory
+    store = FrozenStore()
+    for i in range(1000):
+        commands.dispatch(store, conn, [b"SET", b"g%d" % i, b"v", b"PXAT", b"1"])
+    assert store._data == {} and store._expiry == {}
+    store.check_invariants()

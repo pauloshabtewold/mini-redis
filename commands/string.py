@@ -112,8 +112,24 @@ def set_(store, conn, argv: list[bytes]) -> Reply:
     # was there, and this is the only place that decides -- a deadline resolved above is
     # re-applied right after, and cannot be combined with KEEPTTL in the first place
     store.write(key, value, keep_ttl=keep_ttl)
-    effects = [[b"SET", key, value]]
+    # KEEPTTL is carried into the effect rather than dropped. Without it a follower
+    # replays a plain SET, whose own keep_ttl=False clears the deadline this command was
+    # written to preserve, and the two ends disagree about when the key dies with nothing
+    # to notice. _incr_by below re-emits its own command name for the same reason
+    effects = [[b"SET", key, value] + ([_KEEPTTL_TOKEN] if keep_ttl else [])]
     if deadline is not None:
+        if deadline <= store.now_ms():
+            # a deadline already past deletes here rather than being written into the
+            # index, for the reason EXPIRE's own path deletes: lazy expiry runs only when
+            # something looks the key up again, and with no sweep nothing guarantees that
+            # ever happens. EXAT and PXAT are the two options that can resolve to a past
+            # instant from a valid argument, so this is the one command that could write
+            # a key nothing would ever collect
+            store.remove(key)
+            # the DEL alone, not a SET/DEL pair: the follower needs the end state, and
+            # store.remove's own comment gives the reason a redundant pair is worse
+            return (resp.encode_bulk_string(previous) if want_old
+                    else resp.encode_simple_string(b"OK")), [[b"DEL", key]]
         store.expire_at(key, deadline)
         # the unconditional form, with NX/XX dropped: the leader already evaluated the
         # condition, and re-evaluating it on a follower would make correctness depend on
