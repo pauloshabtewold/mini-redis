@@ -2,9 +2,28 @@
 
 import socket
 
+import pytest
+
 import commands
 from connection import Connection
 from store import Store
+
+
+def assert_is_a_reply_pair(name, pair):
+    """Raise unless `pair` is the (bytes, list-of-lists-of-bytes) every handler owes.
+
+    A function rather than four asserts inlined below, because the test that proves
+    this check would catch a malformed pair has to run the same code the sweep runs.
+    Written out separately, the two drift and the proof stops being about the check.
+    """
+    assert type(pair) is tuple and len(pair) == 2, (name, pair)
+    response, effects = pair
+    assert type(response) is bytes, (name, response)
+    assert type(effects) is list, (name, effects)
+    for effect in effects:
+        assert type(effect) is list, (name, effect)
+        for element in effect:
+            assert type(element) is bytes, (name, effect, element)
 
 
 def test_every_registered_handler_returns_a_reply_pair():
@@ -22,13 +41,9 @@ def test_every_registered_handler_returns_a_reply_pair():
 
     def drive(store, argv):
         name = argv[0]
-        response, effects = commands.dispatch(store, conn, argv)
-        assert type(response) is bytes, name
-        assert type(effects) is list, name
-        for effect in effects:
-            assert type(effect) is list, (name, effect)
-            for element in effect:
-                assert type(element) is bytes, (name, effect, element)
+        pair = commands.dispatch(store, conn, argv)
+        assert_is_a_reply_pair(name, pair)
+        _response, effects = pair
         driven.add(name)
         if effects:
             wrote_effects.add(name)
@@ -67,22 +82,32 @@ def test_every_registered_handler_returns_a_reply_pair():
     assert write_names <= wrote_effects, sorted(write_names - wrote_effects)
 
 
-def test_a_reply_pair_is_never_none_or_a_nested_tuple():
+def test_the_contract_check_rejects_a_nested_pair_and_a_none_effects_list():
+    """The sweep above is only worth its runtime if its check can fail.
+
+    Both shapes here are mistakes a handler can really make -- returning the pair it
+    got from dispatch as the *response* half of a second pair, and returning None
+    where the effects list belongs. Each is fed to the same assert_is_a_reply_pair
+    the sweep uses, and the test is that it raises. Asserting on the malformed values
+    directly instead would prove only that they are what this file just wrote down.
+    """
     store = Store()
+    sock, peer = socket.socketpair()
+    conn = Connection(sock, ("127.0.0.1", 0))
+    try:
+        nested = (commands.dispatch(store, conn, [b"PING"]), [])
+        with pytest.raises(AssertionError):
+            assert_is_a_reply_pair(b"PING", nested)
 
-    def double_wrapped(store, conn, argv):
-        # the mistake this pins: the handler called here already returns (response,
-        # effects), and this wraps that whole pair as the response half of a second
-        # pair instead of returning it directly
-        return commands.dispatch(store, conn, argv), []
+        with pytest.raises(AssertionError):
+            assert_is_a_reply_pair(b"PING", (b"+PONG\r\n", None))
 
-    response, effects = double_wrapped(store, None, [b"PING"])
-    assert type(response) is not bytes
-    assert type(effects) is list
+        with pytest.raises(AssertionError):
+            assert_is_a_reply_pair(b"PING", (b"+PONG\r\n", [[b"SET", "k"]]))
 
-    def effects_as_none(store, conn, argv):
-        return b"+PONG\r\n", None
-
-    response, effects = effects_as_none(store, None, [b"PING"])
-    assert type(response) is bytes
-    assert type(effects) is not list
+        # and it passes the real thing, so the three above fail for their own reason
+        # rather than because the check rejects everything
+        assert_is_a_reply_pair(b"PING", commands.dispatch(store, conn, [b"PING"]))
+    finally:
+        sock.close()
+        peer.close()
