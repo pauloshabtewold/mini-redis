@@ -39,6 +39,8 @@ def make_connection():
         real.setblocking(False)
         opened.extend((real, peer))
         conn = Connection(ScriptedSocket(real, script), ("stub", 0))
+        # the far end, so a test can feed commands into a connection whose send() is scripted
+        conn._sock.peer = peer
         server._loop.register(conn)
         server._connections.add(conn)
         return server, conn
@@ -145,3 +147,64 @@ def test_a_buffer_exactly_at_the_limit_is_kept(make_connection):
     conn.queue(b"x" * 5000)
     server._flush(conn)
     assert not conn.closed, "the limit is a ceiling to exceed, not to reach"
+
+
+@pytest.mark.parametrize("value", ["-1", "-4096"])
+def test_the_parser_refuses_a_negative_output_buffer_limit(value):
+    # `limit and len(buf) > limit` reads any non-zero value as enabled, and every buffer
+    # length exceeds a negative number -- including zero. left unchecked, --output-buffer-
+    # limit -1 prints a healthy startup line and then closes every connection after its
+    # first reply. -1 is a conventional spelling of "unlimited", so it is the likeliest
+    # value to be typed here by someone reaching for exactly the opposite behaviour
+    with pytest.raises(SystemExit):
+        build_arg_parser().parse_args(["--output-buffer-limit", value])
+
+
+def test_the_server_itself_refuses_a_negative_output_buffer_limit():
+    # the parser is not the only door: tests construct Server directly, and so will
+    # anything embedding it
+    with pytest.raises(ValueError):
+        Server(0, -1)
+
+
+@pytest.mark.parametrize("value", ["-1", "65536", "99999"])
+def test_the_parser_refuses_a_port_outside_the_sixteen_bit_range(value):
+    # argparse's own int() lets these reach bind(), which answers with an OverflowError
+    # traceback where a mistyped port answers with a usage message
+    with pytest.raises(SystemExit):
+        build_arg_parser().parse_args(["--port", value])
+
+
+@pytest.mark.parametrize("value", ["0", "65535", "6379"])
+def test_the_parser_still_accepts_every_legal_port(value):
+    assert build_arg_parser().parse_args(["--port", value]).port == int(value)
+
+
+ECHO_ABCD = b"*2\r\n$4\r\nECHO\r\n$4\r\nabcd\r\n"
+ECHO_REPLY = b"$4\r\nabcd\r\n"
+
+
+def _dispatch_echoes(server, conn, count):
+    # the real read-and-dispatch path over a socket that never accepts a byte, so the
+    # buffer the in-loop check sees is the one the batch actually built. a socketpair
+    # would drain into the kernel and the check would never meet a full buffer at all
+    conn._sock.peer.sendall(ECHO_ABCD * count)
+    server._read_and_dispatch(conn)
+
+
+def test_the_in_loop_limit_keeps_a_buffer_that_lands_exactly_on_it(make_connection):
+    # the limit is consulted in two places and only _flush's boundary was pinned, so
+    # turning the in-loop `>` into `>=` passed the whole suite. a buffer exactly at the
+    # limit is within it: the check is a ceiling to exceed, not to reach
+    server, conn = make_connection([BlockingIOError] * 20)
+    server.output_buffer_limit = 4 * len(ECHO_REPLY)
+    _dispatch_echoes(server, conn, 4)
+    assert not conn.closed, "four replies land exactly on the limit and must be kept"
+    assert len(conn.write_buffer) == server.output_buffer_limit
+
+
+def test_the_in_loop_limit_closes_one_reply_past_it(make_connection):
+    server, conn = make_connection([BlockingIOError] * 20)
+    server.output_buffer_limit = 4 * len(ECHO_REPLY)
+    _dispatch_echoes(server, conn, 5)
+    assert conn.closed, "the fifth reply carries the buffer past the limit"

@@ -26,13 +26,36 @@ DEFAULT_OUTPUT_BUFFER_LIMIT = 0
 logger = logging.getLogger(__name__)
 
 
+def _port(value: str) -> int:
+    # argparse's own type=int lets -1 and 99999 through to bind(), which answers them with
+    # an OverflowError traceback where a mistyped port answers with a usage message. the
+    # range is checked here so all three shapes of bad port fail the same clean way
+    number = int(value)
+    if not 0 <= number <= 65535:
+        raise argparse.ArgumentTypeError("port must be between 0 and 65535, not %d" % number)
+    return number
+
+
+def _output_buffer_limit(value: str) -> int:
+    # a negative limit is the reason this is not plain type=int. `limit and len(buf) > limit`
+    # reads any non-zero value as "enabled", and every buffer length is greater than a
+    # negative number -- including zero, so every connection is closed after its first
+    # reply while the server still logs a healthy startup line. -1 is a conventional
+    # spelling of "unlimited" elsewhere, which makes it the likeliest value to be typed here
+    number = int(value)
+    if number < 0:
+        raise argparse.ArgumentTypeError(
+            "output buffer limit cannot be negative; 0 disables the check, not %d" % number)
+    return number
+
+
 def build_arg_parser() -> argparse.ArgumentParser:
     # separate from main() so the parser can be inspected without running the server.
     parser = argparse.ArgumentParser()
-    parser.add_argument("--port", type=int, default=DEFAULT_PORT)
+    parser.add_argument("--port", type=_port, default=DEFAULT_PORT)
     parser.add_argument(
         "--output-buffer-limit",
-        type=int,
+        type=_output_buffer_limit,
         default=DEFAULT_OUTPUT_BUFFER_LIMIT,
         metavar="BYTES",
         help="close a connection whose queued replies exceed BYTES; 0 disables the "
@@ -46,6 +69,13 @@ class Server:
         self, port: int, output_buffer_limit: int = DEFAULT_OUTPUT_BUFFER_LIMIT
     ) -> None:
         self.port = port
+        # checked here as well as in the parser: Server is constructed directly by tests
+        # and will be by anything embedding this, and a negative limit reaching _flush
+        # closes every connection after its first reply rather than failing at startup
+        if output_buffer_limit < 0:
+            raise ValueError(
+                "output_buffer_limit cannot be negative; 0 disables the check, not %d"
+                % output_buffer_limit)
         # a per-connection ceiling on queued replies, not a process-wide one: what this
         # bounds is one client's ability to make the server hold bytes it has not managed
         # to send, and connections do not share a write buffer to divide between them
@@ -154,7 +184,12 @@ class Server:
                 # drained before it is judged: a client reading normally can outrun any
                 # limit on a long enough pipeline, and closing it for the depth of its
                 # batch rather than for failing to read is not what the limit is for.
-                # _flush closes it if the buffer is still over once the kernel is done
+                # _flush closes it if the buffer is still over once the kernel is done --
+                # which makes this comparison a trigger and not the decision, so its exact
+                # boundary is not observable. mutating it to >= changes only how early the
+                # flush happens, and _flush's own > still decides. mutation testing reports
+                # that as a surviving mutant; it is an equivalent one, noted so the next
+                # reader spends no time on it
                 self._flush(conn)
                 if conn.closed:
                     return
