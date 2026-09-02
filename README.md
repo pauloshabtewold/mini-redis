@@ -14,7 +14,13 @@ an expired key nobody has asked about stays in memory until something does.
 **Nothing bounds how much memory a client can use.** There is no cap on key count or
 value size, no cap on total keyspace size, and no eviction policy to fall back on if
 there were — a client with nothing but `SET` can grow the process until the host runs
-out of memory. Four modules are still declared and empty: `persistence.py`,
+out of memory. The read buffer is uncapped too: an unterminated command grows it for as
+long as a client keeps sending, which at least costs that client a byte per byte. Queued
+replies are the cheap one — one 64 KiB write holds about three thousand `GET`s, every
+reply is buffered whole, and the value they all name was stored once, so a few kilobytes
+of request can commit gigabytes. `--output-buffer-limit BYTES` closes a connection whose
+queued replies exceed it; it defaults to 0, off, which is what real Redis defaults to for
+an ordinary client. Four modules are still declared and empty: `persistence.py`,
 `ratelimit.py`, `replication.py`, `commands/list.py`.
 
 ## Quickstart

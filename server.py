@@ -18,6 +18,9 @@ DEFAULT_PORT = 6379
 LISTEN_HOST = "127.0.0.1"
 # bounds how long a stop signal waits to be noticed, and is the floor of this design's periodic intervals (a 100 ms expiry sweep).
 SELECT_TIMEOUT_SECONDS = 0.1
+# 0 is unlimited, which is what the reference defaults to for an ordinary client. see
+# Server._flush for why exceeding this closes the connection instead of slowing it down.
+DEFAULT_OUTPUT_BUFFER_LIMIT = 0
 
 # logging.lastResort sends an ERROR record to stderr with no configuration
 logger = logging.getLogger(__name__)
@@ -27,12 +30,26 @@ def build_arg_parser() -> argparse.ArgumentParser:
     # separate from main() so the parser can be inspected without running the server.
     parser = argparse.ArgumentParser()
     parser.add_argument("--port", type=int, default=DEFAULT_PORT)
+    parser.add_argument(
+        "--output-buffer-limit",
+        type=int,
+        default=DEFAULT_OUTPUT_BUFFER_LIMIT,
+        metavar="BYTES",
+        help="close a connection whose queued replies exceed BYTES; 0 disables the "
+             "check, which is the reference's own default for an ordinary client",
+    )
     return parser
 
 
 class Server:
-    def __init__(self, port: int) -> None:
+    def __init__(
+        self, port: int, output_buffer_limit: int = DEFAULT_OUTPUT_BUFFER_LIMIT
+    ) -> None:
         self.port = port
+        # a per-connection ceiling on queued replies, not a process-wide one: what this
+        # bounds is one client's ability to make the server hold bytes it has not managed
+        # to send, and connections do not share a write buffer to divide between them
+        self.output_buffer_limit = output_buffer_limit
         self._connections: set[Connection] = set()
         self._loop = EventLoop(
             self._on_accept, self._on_readable, self._on_writable, SELECT_TIMEOUT_SECONDS
@@ -128,6 +145,19 @@ class Server:
             # queue from here on and nothing else would ever empty it
             self._store.take_effects()
             conn.queue(response)
+            # one recv can carry thousands of commands, and queueing every reply before
+            # the first send is what lets a few kilobytes of request commit gigabytes.
+            # the limit has to be consulted here as well as after the batch, or it bounds
+            # only what survives the flush and not the peak that got there
+            if (self.output_buffer_limit
+                    and len(conn.write_buffer) > self.output_buffer_limit):
+                # drained before it is judged: a client reading normally can outrun any
+                # limit on a long enough pipeline, and closing it for the depth of its
+                # batch rather than for failing to read is not what the limit is for.
+                # _flush closes it if the buffer is still over once the kernel is done
+                self._flush(conn)
+                if conn.closed:
+                    return
         # one flush for the whole batch, not one per command: N replies concatenate into one buffer and N syscalls buy nothing
         self._flush(conn)
 
@@ -135,6 +165,21 @@ class Server:
         if conn.closed:
             return
         if not conn.flush():
+            self._close(conn)
+            return
+        # checked after the send, so what it measures is what the kernel would not take
+        # rather than what was queued a moment ago. closing rather than throttling is the
+        # whole design: refusing to read a client that has stopped reading cannot slow it
+        # down, because a client that writes its requests before reading any reply then
+        # blocks in send() waiting for room only its own reading would create, and both
+        # sides wait forever. the reference closes here too. replication will need its own
+        # links exempted from this, on the same reasoning that keeps them off the rate
+        # limiter -- a follower that falls behind is not a client that has stopped reading
+        if self.output_buffer_limit and len(conn.write_buffer) > self.output_buffer_limit:
+            logger.warning(
+                "closing %s: %d bytes of queued replies exceeds the %d byte limit",
+                conn.addr, len(conn.write_buffer), self.output_buffer_limit,
+            )
             self._close(conn)
             return
         # write interest tracks the buffer's emptiness exactly: a connection left permanently writable spins the loop at 100% CPU without dropping a single reply
@@ -201,7 +246,7 @@ class Server:
 
 def main(argv=None) -> None:
     args = build_arg_parser().parse_args(argv)
-    Server(args.port).run()
+    Server(args.port, args.output_buffer_limit).run()
 
 
 if __name__ == "__main__":

@@ -874,3 +874,55 @@ def test_one_readable_event_dispatches_every_buffered_command():
             except BlockingIOError:
                 pass
         assert replies == b"+PONG\r\n" * N, (len(replies), N * 7)
+
+
+def test_one_batch_cannot_queue_past_the_output_buffer_limit(server_and_client):
+    # the limit is consulted inside the dispatch loop as well as after the batch, because
+    # one recv() can carry thousands of commands: checked only after the batch, a client
+    # that stops reading gets the whole batch queued first, and a 4 MiB limit was measured
+    # letting 104 MiB accumulate before it noticed
+    server, client = server_and_client
+    server.output_buffer_limit = 64 * 1024
+    conn, = server._connections
+    value = b"v" * 32768
+    client.sendall(b"*3\r\n$3\r\nSET\r\n$1\r\nk\r\n$%d\r\n" % len(value) + value + b"\r\n")
+    pump(server)
+    assert client.recv(100) == b"+OK\r\n"
+
+    # 200 GETs in one write: ~6.4 MiB of replies against a 64 KiB limit, and the client
+    # never reads, so nothing drains between them
+    client.sendall(b"*2\r\n$3\r\nGET\r\n$1\r\nk\r\n" * 200)
+    pump(server)
+    assert conn.closed, "a batch must not queue past the limit unchecked"
+    assert len(conn.write_buffer) < 40 * len(value), (
+        "queued %d bytes against a %d byte limit -- the in-loop check did not fire"
+        % (len(conn.write_buffer), server.output_buffer_limit)
+    )
+
+
+def test_a_client_that_keeps_reading_is_never_closed_by_the_limit(server_and_client):
+    # the in-loop check flushes before it judges, so the limit measures a client that has
+    # stopped reading and not the depth of a pipeline. closing on depth alone would make a
+    # long pipeline unusable, which is the thing the write path exists to support
+    server, client = server_and_client
+    server.output_buffer_limit = 4096
+    conn, = server._connections
+    client.sendall(b"*1\r\n$4\r\nPING\r\n" * 2000)
+    seen = b""
+    for _ in range(400):
+        pump(server, times=2)
+        client.setblocking(False)
+        try:
+            while True:
+                chunk = client.recv(65536)
+                if not chunk:
+                    break
+                seen += chunk
+        except BlockingIOError:
+            pass
+        finally:
+            client.setblocking(True)
+        if len(seen) >= 2000 * len(b"+PONG\r\n"):
+            break
+    assert not conn.closed, "a client that drains as it goes must not trip the limit"
+    assert seen == b"+PONG\r\n" * 2000
