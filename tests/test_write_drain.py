@@ -208,3 +208,18 @@ def test_the_in_loop_limit_closes_one_reply_past_it(make_connection):
     server.output_buffer_limit = 4 * len(ECHO_REPLY)
     _dispatch_echoes(server, conn, 5)
     assert conn.closed, "the fifth reply carries the buffer past the limit"
+
+
+@pytest.mark.parametrize("flag, value", [
+    ("--port", "abc"), ("--port", ""), ("--port", "1.5"),
+    ("--output-buffer-limit", "abc"), ("--output-buffer-limit", "1e6"),
+])
+def test_a_non_numeric_flag_names_the_flag_rather_than_the_validator(capsys, flag, value):
+    # argparse builds its own message from type='s __name__, which for these is a private
+    # function -- "invalid _port value: 'abc'" puts an internal identifier in front of a
+    # user who typed a bad port
+    with pytest.raises(SystemExit):
+        build_arg_parser().parse_args([flag, value])
+    message = capsys.readouterr().err
+    assert flag in message, message
+    assert "_port" not in message and "_output_buffer_limit" not in message, message

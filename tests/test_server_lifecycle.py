@@ -904,10 +904,13 @@ def test_one_batch_cannot_queue_past_the_output_buffer_limit(server_and_client):
     )
 
 
-def test_a_client_that_keeps_reading_is_never_closed_by_the_limit(server_and_client):
-    # the in-loop check flushes before it judges, so the limit measures a client that has
-    # stopped reading and not the depth of a pipeline. closing on depth alone would make a
-    # long pipeline unusable, which is the thing the write path exists to support
+def test_a_pipeline_whose_replies_keep_draining_is_never_closed_by_the_limit(server_and_client):
+    # the in-loop check flushes before it judges, so depth alone never trips the limit --
+    # two thousand replies the kernel keeps taking pass under a limit that four of them
+    # would exceed if they piled up. what this does NOT say is that a reading client is
+    # safe: this is a hard limit, and a client reading slower than the server produces is
+    # closed like any other, which redis-server 7.2.7 does too under an equivalent
+    # client-output-buffer-limit. the name used to claim otherwise
     server, client = server_and_client
     server.output_buffer_limit = 4096
     conn, = server._connections
@@ -956,3 +959,45 @@ def test_a_retryable_error_leaves_the_connection_open_rather_than_closing_it(cap
     finally:
         del registry.COMMANDS[b"PING"]
         registry.COMMANDS[b"PING"] = original
+
+
+@pytest.mark.parametrize("port", [-1, 65536, 99999])
+def test_the_constructor_refuses_a_port_outside_the_range_like_the_parser_does(port):
+    # the parser validates it; the constructor is the other door, and Server is built
+    # directly by tests and by anything embedding this. left unchecked, the value reaches
+    # bind() and answers with an OverflowError traceback -- the exact failure the parser's
+    # validator exists to prevent, reachable by walking around it
+    with pytest.raises(ValueError):
+        Server(port)
+
+
+def test_abandon_releases_the_selector_registration_as_well_as_the_socket():
+    # _close deregisters before it closes the socket; reaching _abandon's recovery means
+    # it raised before getting there, so the registration is still in the selector keyed
+    # by a descriptor about to be freed. the kernel hands that number to the next accept,
+    # registering it raises "already registered", and _on_accept turns that into a
+    # refused connection for an entirely unrelated, well-behaved client
+    server = Server(0)
+    sock, peer = socket.socketpair()
+    sock.setblocking(False)
+    try:
+        conn = Connection(sock, ("stub", 0))
+        server._loop.register(conn)
+        server._connections.add(conn)
+        fd = conn.fileno()
+        assert fd in server._loop._selector.get_map()
+
+        def flush_raising():
+            raise RuntimeError("forces _close to fail before it deregisters")
+
+        conn.flush = flush_raising
+        server._abandon(conn)
+
+        assert conn.closed and conn not in server._connections
+        assert fd not in server._loop._selector.get_map(), (
+            "the registration outlived the socket and will refuse the next client "
+            "handed this descriptor number")
+    finally:
+        server._loop.close()
+        sock.close()
+        peer.close()

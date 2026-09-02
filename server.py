@@ -30,7 +30,12 @@ def _port(value: str) -> int:
     # argparse's own type=int lets -1 and 99999 through to bind(), which answers them with
     # an OverflowError traceback where a mistyped port answers with a usage message. the
     # range is checked here so all three shapes of bad port fail the same clean way
-    number = int(value)
+    # ValueError is caught rather than left to argparse, which builds its message from
+    # type='s own __name__ and would tell the user "invalid _port value"
+    try:
+        number = int(value)
+    except ValueError:
+        raise argparse.ArgumentTypeError("port must be a number, not %r" % value) from None
     if not 0 <= number <= 65535:
         raise argparse.ArgumentTypeError("port must be between 0 and 65535, not %d" % number)
     return number
@@ -42,7 +47,11 @@ def _output_buffer_limit(value: str) -> int:
     # negative number -- including zero, so every connection is closed after its first
     # reply while the server still logs a healthy startup line. -1 is a conventional
     # spelling of "unlimited" elsewhere, which makes it the likeliest value to be typed here
-    number = int(value)
+    try:
+        number = int(value)
+    except ValueError:
+        raise argparse.ArgumentTypeError(
+            "output buffer limit must be a number of bytes, not %r" % value) from None
     if number < 0:
         raise argparse.ArgumentTypeError(
             "output buffer limit cannot be negative; 0 disables the check, not %d" % number)
@@ -68,10 +77,15 @@ class Server:
     def __init__(
         self, port: int, output_buffer_limit: int = DEFAULT_OUTPUT_BUFFER_LIMIT
     ) -> None:
+        # both checked here as well as in the parser, for the same reason: Server is
+        # constructed directly by tests and will be by anything embedding this, so a
+        # validator that lives only on the CLI is a validator with a door beside it. a
+        # negative limit reaching _flush closes every connection after its first reply
+        # rather than failing at startup, and a port outside the range reaches bind()
+        # and answers with an OverflowError traceback
+        if not 0 <= port <= 65535:
+            raise ValueError("port must be between 0 and 65535, not %d" % port)
         self.port = port
-        # checked here as well as in the parser: Server is constructed directly by tests
-        # and will be by anything embedding this, and a negative limit reaching _flush
-        # closes every connection after its first reply rather than failing at startup
         if output_buffer_limit < 0:
             raise ValueError(
                 "output_buffer_limit cannot be negative; 0 disables the check, not %d"
@@ -145,6 +159,19 @@ class Server:
             logger.exception("closing %s failed; abandoning it", conn.addr)
             # the connection cannot be tracked any more, so drop it and take the descriptor back
             self._connections.discard(conn)
+            try:
+                # _close does this before the socket close; reaching here means it raised
+                # first, so the registration is still in the selector's map keyed by a
+                # descriptor about to be freed. the kernel hands that number to the next
+                # accept, and registering it raises "already registered" -- which
+                # _on_accept catches and turns into a refused, entirely unrelated client
+                self._loop.unregister(conn)
+            except Exception:
+                # broad, unlike _on_accept's named three, because this is the last resort:
+                # _close has already failed once and anything escaping here reaches the top
+                # of the only thread this server has. the registration stays leaked in that
+                # case, which is the lesser of the two outcomes
+                logger.exception("deregistering %s failed", conn.addr)
             try:
                 conn.close()
             except OSError:
