@@ -330,3 +330,95 @@ def test_the_surviving_ttl_option_is_the_one_applied(conn):
         store, conn, [b"SET", b"k", b"v", b"EX", b"abc", b"EX", b"10"])
     assert response == b"+OK\r\n"
     assert store.deadline(b"k") == FROZEN + 10_000
+
+
+# --- the four options SET used to refuse ------------------------------------------------
+
+
+def test_get_returns_the_replaced_value_and_still_writes(store, conn):
+    commands.dispatch(store, conn, [b"SET", b"k", b"old"])
+    assert commands.dispatch(store, conn, [b"SET", b"k", b"new", b"GET"]) == (
+        b"$3\r\nold\r\n", [[b"SET", b"k", b"new"]])
+    assert store.lookup(b"k") == b"new"
+
+
+def test_get_on_a_key_that_was_not_there_answers_nil(store, conn):
+    assert commands.dispatch(store, conn, [b"SET", b"k", b"v", b"GET"]) == (
+        b"$-1\r\n", [[b"SET", b"k", b"v"]])
+
+
+@pytest.mark.parametrize("condition, preset, expected", [
+    # GET reports what was there whether or not the condition let the write happen, which
+    # is the half a reply built only from the write's outcome would get wrong
+    (b"NX", b"old", b"$3\r\nold\r\n"),
+    (b"XX", None, b"$-1\r\n"),
+])
+def test_get_reports_the_old_value_even_when_the_condition_refuses_the_write(
+        store, conn, condition, preset, expected):
+    if preset is not None:
+        commands.dispatch(store, conn, [b"SET", b"k", preset])
+    response, effects = commands.dispatch(
+        store, conn, [b"SET", b"k", b"v", condition, b"GET"])
+    assert (response, effects) == (expected, [])
+    assert store.lookup(b"k") == preset, "the refused write must not have happened"
+
+
+def test_keepttl_keeps_the_deadline_a_plain_set_would_discard(conn):
+    store = FrozenStore()
+    commands.dispatch(store, conn, [b"SET", b"k", b"v", b"EX", b"100"])
+    assert store.deadline(b"k") == FROZEN + 100_000
+    commands.dispatch(store, conn, [b"SET", b"k", b"w", b"KEEPTTL"])
+    assert store.deadline(b"k") == FROZEN + 100_000, "KEEPTTL must not clear the deadline"
+    commands.dispatch(store, conn, [b"SET", b"k", b"x"])
+    assert store.deadline(b"k") is None, "a plain SET must still discard it"
+
+
+@pytest.mark.parametrize("token, argument, expected_deadline", [
+    # EXAT and PXAT are absolute where EX and PX are durations -- the deadline is the
+    # argument itself, not the argument added to now
+    (b"EXAT", b"2000000000", 2_000_000_000_000),
+    (b"PXAT", b"2000000000000", 2_000_000_000_000),
+])
+def test_exat_and_pxat_take_an_absolute_deadline(conn, token, argument, expected_deadline):
+    store = FrozenStore()
+    assert commands.dispatch(store, conn, [b"SET", b"k", b"v", token, argument]) == (
+        b"+OK\r\n", [[b"SET", b"k", b"v"],
+                     [b"PEXPIREAT", b"k", b"%d" % expected_deadline]])
+    assert store.deadline(b"k") == expected_deadline
+
+
+def test_an_absolute_deadline_already_past_is_accepted_and_the_key_reads_as_gone(conn):
+    # the reference bounds the argument at zero, not the resulting deadline, so PXAT 1
+    # is a legal request for a moment that has been and gone
+    store = FrozenStore()
+    assert commands.dispatch(store, conn, [b"SET", b"k", b"v", b"PXAT", b"1"])[0] == b"+OK\r\n"
+    assert store.lookup(b"k") is None
+
+
+@pytest.mark.parametrize("options, expected", [
+    # every member of the deadline family conflicts with every other one
+    ([b"EX", b"10", b"KEEPTTL"], b"-ERR syntax error\r\n"),
+    ([b"KEEPTTL", b"EX", b"10"], b"-ERR syntax error\r\n"),
+    ([b"EXAT", b"1", b"EX", b"10"], b"-ERR syntax error\r\n"),
+    ([b"PX", b"1", b"PXAT", b"1"], b"-ERR syntax error\r\n"),
+    # but a repeat of the same one is ordinary, and GET has nothing to conflict with
+    ([b"KEEPTTL", b"KEEPTTL"], b"+OK\r\n"),
+    ([b"EXAT", b"2000000000", b"EXAT", b"2000000001"], b"+OK\r\n"),
+    ([b"GET", b"GET"], b"$-1\r\n"),
+    # and the argument shapes the family shares
+    ([b"EXAT", b"0"], b"-ERR invalid expire time in 'set' command\r\n"),
+    ([b"EXAT", b"-1"], b"-ERR invalid expire time in 'set' command\r\n"),
+    ([b"EXAT", b"abc"], b"-ERR value is not an integer or out of range\r\n"),
+    ([b"EXAT"], b"-ERR syntax error\r\n"),
+    ([b"EXAT", b"9223372036854775807"], b"-ERR invalid expire time in 'set' command\r\n"),
+], ids=lambda v: v if isinstance(v, bytes) else "-".join(o.decode() for o in v))
+def test_the_deadline_family_grammar(store, conn, options, expected):
+    assert commands.dispatch(store, conn, [b"SET", b"k", b"v"] + options)[0] == expected
+
+
+@pytest.mark.parametrize("options", [
+    [b"get"], [b"keepttl"], [b"exat", b"2000000000"], [b"pxat", b"2000000000000"],
+], ids=["get", "keepttl", "exat", "pxat"])
+def test_the_new_options_are_case_insensitive_like_the_old_ones(store, conn, options):
+    assert commands.dispatch(store, conn, [b"SET", b"k", b"v"] + options)[0] != (
+        b"-ERR syntax error\r\n")

@@ -15,14 +15,25 @@ from store import KIND_STRING
 
 INVALID_EXPIRE_TIME = b"ERR invalid expire time in 'set' command"
 
-# SET's two option families: EX/PX name a TTL, NX/XX name a condition. Within a family, a
-# repeat of the same token is ordinary (last value wins); meeting the OTHER member of the
-# same family is a syntax error the moment it happens -- two independent checks over the
-# token history, not a dict staged and validated once scanning finishes. Staged-and-
-# validated is the natural-looking alternative and it is wrong: it accepts
-# "EX 10 PX 20000 EX 30", which real Redis refuses
-_TTL_TOKENS = (b"EX", b"PX")
+# SET's option families: EX/PX/EXAT/PXAT/KEEPTTL all name what happens to the deadline,
+# NX/XX name a condition, GET stands alone. Within a family, a repeat of the same token is
+# ordinary (last value wins); meeting a DIFFERENT member of the same family is a syntax
+# error the moment it happens -- two independent checks over the token history, not a dict
+# staged and validated once scanning finishes. Staged-and-validated is the natural-looking
+# alternative and it is wrong: it accepts "EX 10 PX 20000 EX 30", which real Redis refuses
+#
+# KEEPTTL sits in the deadline family with the other four but takes no argument, which is
+# why the family is two tuples rather than one: the exclusivity check spans both, the
+# argument handling does not
+_TTL_TOKENS = (b"EX", b"PX", b"EXAT", b"PXAT")
+_KEEPTTL_TOKEN = b"KEEPTTL"
 _CONDITION_TOKENS = (b"NX", b"XX")
+_GET_TOKEN = b"GET"
+
+# how each deadline token turns its argument into absolute Unix milliseconds. EX and PX
+# are durations from now; EXAT and PXAT are already absolute, which is the whole difference
+_TTL_SCALE = {b"EX": 1000, b"PX": 1, b"EXAT": 1000, b"PXAT": 1}
+_TTL_IS_ABSOLUTE = {b"EX": False, b"PX": False, b"EXAT": True, b"PXAT": True}
 
 
 @command(b"SET", arity=-3, kind=Kind.WRITE)
@@ -32,6 +43,7 @@ def set_(store, conn, argv: list[bytes]) -> Reply:
     ttl_kind = None
     ttl_field = None
     condition = None
+    want_old = False
 
     i = 3
     while i < len(argv):
@@ -47,35 +59,59 @@ def set_(store, conn, argv: list[bytes]) -> Reply:
             # check below was already deferred for this reason; the grammar check was not
             ttl_kind, ttl_field = token, argv[i + 1]
             i += 2
+        elif token == _KEEPTTL_TOKEN:
+            # same family as the four above, so meeting one of them here is the same
+            # error -- it just has no argument to carry
+            if ttl_kind is not None and ttl_kind != token:
+                return resp.encode_error(SYNTAX_ERROR), []
+            ttl_kind = token
+            i += 1
         elif token in _CONDITION_TOKENS:
             if condition is not None and condition != token:
                 return resp.encode_error(SYNTAX_ERROR), []
             condition = token
             i += 1
+        elif token == _GET_TOKEN:
+            # a family of one, so a repeat is ordinary and there is nothing to conflict with
+            want_old = True
+            i += 1
         else:
             return resp.encode_error(SYNTAX_ERROR), []
 
     deadline = None
-    if ttl_kind is not None:
+    keep_ttl = ttl_kind == _KEEPTTL_TOKEN
+    if ttl_kind is not None and not keep_ttl:
         ttl_amount = parse_int64(ttl_field)
         if ttl_amount is None:
             return resp.encode_error(NOT_AN_INTEGER), []
-        millis = ttl_amount * 1000 if ttl_kind == b"EX" else ttl_amount
-        deadline = store.now_ms() + millis
+        millis = ttl_amount * _TTL_SCALE[ttl_kind]
+        # an absolute deadline is the argument itself; a duration is measured from now.
+        # the reference bounds the argument at zero either way, which is why EXAT 0 is an
+        # error while PXAT 1 is accepted and expires immediately -- the check is on what
+        # was asked for, not on where it lands
+        deadline = millis if _TTL_IS_ABSOLUTE[ttl_kind] else store.now_ms() + millis
         if ttl_amount <= 0 or not (INT64_MIN <= deadline <= INT64_MAX):
             return resp.encode_error(INVALID_EXPIRE_TIME), []
 
     # the expiry-aware lookup, never a raw dict test: a logically-expired key must not
     # block NX, and the DEL that expiry produces reaches the store's own queue from
-    # inside lookup(), never this handler's effects
-    if condition == b"NX" and store.lookup(key) is not None:
-        return resp.encode_bulk_string(None), []
-    if condition == b"XX" and store.lookup(key) is None:
-        return resp.encode_bulk_string(None), []
+    # inside lookup(), never this handler's effects. read once, before anything is
+    # written, because GET owes the caller the value this command replaced -- and the
+    # kind is passed so GET answers WRONGTYPE on a key SET itself would overwrite happily
+    previous = store.lookup(key, kind=KIND_STRING) if want_old else store.lookup(key)
 
-    # keep_ttl is always False: a plain SET discards whatever TTL was there, and this is
-    # the only place that decides -- an EX/PX resolved above is re-applied right after
-    store.write(key, value, keep_ttl=False)
+    # GET reports what was there whether or not the condition let the write happen, so
+    # its reply is decided here and the condition only decides whether to write
+    refused = (condition == b"NX" and previous is not None) or (
+        condition == b"XX" and previous is None)
+    if refused:
+        return (resp.encode_bulk_string(previous) if want_old
+                else resp.encode_bulk_string(None)), []
+
+    # keep_ttl is False unless KEEPTTL asked otherwise: a plain SET discards whatever TTL
+    # was there, and this is the only place that decides -- a deadline resolved above is
+    # re-applied right after, and cannot be combined with KEEPTTL in the first place
+    store.write(key, value, keep_ttl=keep_ttl)
     effects = [[b"SET", key, value]]
     if deadline is not None:
         store.expire_at(key, deadline)
@@ -84,6 +120,8 @@ def set_(store, conn, argv: list[bytes]) -> Reply:
         # the follower's own notion of existence -- which its expiry rule deliberately
         # makes differ from the leader's
         effects.append([b"PEXPIREAT", key, b"%d" % deadline])
+    if want_old:
+        return resp.encode_bulk_string(previous), effects
     return resp.encode_simple_string(b"OK"), effects
 
 
