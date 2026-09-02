@@ -30,7 +30,7 @@ def set_(store, conn, argv: list[bytes]) -> Reply:
     key, value = argv[1], argv[2]
 
     ttl_kind = None
-    ttl_amount = None
+    ttl_field = None
     condition = None
 
     i = 3
@@ -41,10 +41,11 @@ def set_(store, conn, argv: list[bytes]) -> Reply:
                 return resp.encode_error(SYNTAX_ERROR), []
             if i + 1 >= len(argv):
                 return resp.encode_error(SYNTAX_ERROR), []
-            amount = parse_int64(argv[i + 1])
-            if amount is None:
-                return resp.encode_error(NOT_AN_INTEGER), []
-            ttl_kind, ttl_amount = token, amount
+            # the field is kept, not parsed: a repeat of the same token overrides this
+            # one, and the reference validates only whichever occurrence survives. parsing
+            # here rejects "EX abc EX 10", which the reference answers +OK. the overflow
+            # check below was already deferred for this reason; the grammar check was not
+            ttl_kind, ttl_field = token, argv[i + 1]
             i += 2
         elif token in _CONDITION_TOKENS:
             if condition is not None and condition != token:
@@ -56,6 +57,9 @@ def set_(store, conn, argv: list[bytes]) -> Reply:
 
     deadline = None
     if ttl_kind is not None:
+        ttl_amount = parse_int64(ttl_field)
+        if ttl_amount is None:
+            return resp.encode_error(NOT_AN_INTEGER), []
         millis = ttl_amount * 1000 if ttl_kind == b"EX" else ttl_amount
         deadline = store.now_ms() + millis
         if ttl_amount <= 0 or not (INT64_MIN <= deadline <= INT64_MAX):

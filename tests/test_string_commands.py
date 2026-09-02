@@ -293,3 +293,40 @@ def test_parse_int64_grammar():
         assert parse_int64(field) == value, field
     for field in reject:
         assert parse_int64(field) is None, field
+
+
+@pytest.mark.parametrize(
+    "options, expected",
+    [
+        # a repeat overrides, so only the surviving occurrence is validated -- measured
+        # against redis-server 7.2.7, which answers +OK to all three of these
+        ([b"EX", b"abc", b"EX", b"10"], b"+OK\r\n"),
+        ([b"PX", b"abc", b"PX", b"9999"], b"+OK\r\n"),
+        ([b"EX", b"abc", b"EX", b"xyz", b"EX", b"10"], b"+OK\r\n"),
+        # the last occurrence is the one that has to parse
+        ([b"EX", b"10", b"EX", b"abc"], b"-ERR value is not an integer or out of range\r\n"),
+        ([b"EX", b"abc"], b"-ERR value is not an integer or out of range\r\n"),
+        # meeting the other member of the family is still a syntax error the moment it
+        # happens, and outranks the unparsed field before it -- also measured
+        ([b"EX", b"abc", b"PX", b"10000"], b"-ERR syntax error\r\n"),
+        # and the value that survives is the one that takes effect, not merely accepted
+        ([b"EX", b"9223372036854775807", b"EX", b"10"], b"+OK\r\n"),
+    ],
+    ids=["ex-repeat", "px-repeat", "ex-thrice", "last-is-bad", "single-bad",
+         "cross-family", "overflow-then-valid"],
+)
+def test_set_validates_only_the_ttl_option_that_survives_a_repeat(store, conn, options, expected):
+    # parsing inside the scanning loop rejects a malformed earlier occurrence that a
+    # later one legally overrides. the overflow check was already deferred past the loop
+    # for exactly this reason; the grammar check has to be deferred with it
+    response, _effects = commands.dispatch(store, conn, [b"SET", b"k", b"v"] + options)
+    assert response == expected
+
+
+def test_the_surviving_ttl_option_is_the_one_applied(conn):
+    # +OK alone would pass even if the wrong occurrence won, so this reads the deadline back
+    store = FrozenStore()
+    response, _effects = commands.dispatch(
+        store, conn, [b"SET", b"k", b"v", b"EX", b"abc", b"EX", b"10"])
+    assert response == b"+OK\r\n"
+    assert store.deadline(b"k") == FROZEN + 10_000
