@@ -39,6 +39,7 @@ class ProtocolError(Exception):
 
 def parse_command(
     buf: bytes | bytearray | memoryview,
+    search_from: int = 0,
 ) -> tuple[list[bytes] | None, int, int]:
     """Parse one command off the front of buf.
 
@@ -49,11 +50,19 @@ def parse_command(
     byte that could carry a protocol error, and a caller that waits longer than
     it says turns malformed input into a hang.
 
-    Only the multibulk path produces a non-zero hint, and only from a bulk
-    element, where a declared length lets it skip the whole body rather than
-    re-scanning it per byte. The inline path has no return site that can carry
-    one: a line is complete or it is not, and nothing about a partial line
-    bounds when a newline will arrive.
+    Only a bulk element produces a non-zero hint, and only once its header is
+    located, where a declared length lets it skip the whole body rather than
+    re-scanning it per byte. A header line cannot produce one at all: its own
+    length is declared nowhere, so nothing about a partial line bounds when its
+    terminator will arrive.
+
+    `search_from` is the other half of that, and the reason locating a header is
+    not quadratic. A terminator search that found nothing has proved the whole
+    buffer holds none, so the next attempt resumes there instead of restarting
+    at byte zero -- without it, a caller that re-parses on every readable event
+    rescans every byte it has ever received, once per event. It is a lower bound
+    on where the terminator can be, never on where the command starts: buf is
+    still the front of a command, and every offset returned is absolute.
 
     Connection drives parse_multibulk_header and parse_bulk_element directly
     rather than calling this for a multibulk, so that locating N elements costs
@@ -64,8 +73,8 @@ def parse_command(
     if isinstance(buf, memoryview):
         buf = bytes(buf)
     if buf[0:1] == b"*":
-        return _parse_multibulk(buf)
-    return _parse_inline(buf)
+        return _parse_multibulk(buf, search_from)
+    return _parse_inline(buf, search_from)
 
 
 def _parse_length(field: bytes | bytearray, error_message: bytes) -> int:
@@ -85,6 +94,7 @@ def _parse_length(field: bytes | bytearray, error_message: bytes) -> int:
 
 def parse_multibulk_header(
     buf: bytes | bytearray | memoryview,
+    search_from: int = 0,
 ) -> tuple[int, int, int]:
     """Parse `*N\\r\\n` off the front of buf, returning (count, consumed, needed).
 
@@ -92,8 +102,11 @@ def parse_multibulk_header(
     element as it arrives, keeping its own running argv. A caller that instead
     re-parses the whole command on every readable event pays for locating each
     element once per element, which is quadratic in the count.
+
+    `search_from` resumes a terminator search that already came up empty; see
+    parse_command. The count itself is always read from byte 1, whatever it says.
     """
-    header_end = buf.find(CRLF)
+    header_end = buf.find(CRLF, search_from)
     if header_end == -1:
         return (0, 0, 0)
     # a negative count is refused here, where real Redis consumes a syntactically valid count of zero or less silently and answers nothing -- a deliberate divergence, and the reason this call is not special-cased around the sign. "syntactically valid" is the whole rule: string2ll refuses -0 there as it does here, so the two agree on -0 and on 0 and part only on -1 and below
@@ -107,10 +120,13 @@ def parse_multibulk_header(
 
 def parse_bulk_element(
     buf: bytes | bytearray | memoryview,
+    search_from: int = 1,
 ) -> tuple[bytes | None, int, int]:
     """Parse one `$N\\r\\n<body>\\r\\n` element off the front of buf.
 
     Returns (body, consumed, needed) on the same contract as parse_command.
+    `search_from` defaults to 1 rather than 0 because byte 0 is the `$` this
+    header search must never match past.
     """
     if not len(buf):
         # the type byte alone decides between an element and a protocol error, so one byte is progress
@@ -119,7 +135,8 @@ def parse_bulk_element(
         # the byte is the client's and this message goes on the wire, so a raw \r or \n in it would split one error frame into two exactly as an unsanitized command name would in registry.dispatch
         got = bytes(buf[0:1]).replace(b"\r", b" ").replace(b"\n", b" ")
         raise ProtocolError(b"ERR Protocol error: expected '$', got '%s'" % got)
-    header_end = buf.find(CRLF, 1)
+    # never below 1: byte 0 is the `$`, and a resume position is only ever a floor
+    header_end = buf.find(CRLF, max(1, search_from))
     if header_end == -1:
         return (None, 0, 0)
     length = _parse_length(
@@ -135,9 +152,13 @@ def parse_bulk_element(
     return (bytes(buf[body_start:body_end]), body_end + 2, 0)
 
 
-def _parse_multibulk(buf: bytes | bytearray) -> tuple[list[bytes] | None, int, int]:
+def _parse_multibulk(
+    buf: bytes | bytearray, search_from: int = 0
+) -> tuple[list[bytes] | None, int, int]:
     # the whole-command form, over the same two primitives Connection drives one step at a time, so there is one grammar here rather than two that can disagree
-    count, consumed, needed = parse_multibulk_header(buf)
+    # search_from reaches the header only: every element below is parsed from a fresh
+    # slice whose own header starts at byte zero, so no resume position applies to it
+    count, consumed, needed = parse_multibulk_header(buf, search_from)
     if consumed == 0:
         return (None, 0, needed)
     if count == 0:
@@ -243,8 +264,10 @@ def _split_inline(line: bytes) -> list[bytes]:
             return fields
 
 
-def _parse_inline(buf: bytes | bytearray) -> tuple[list[bytes] | None, int, int]:
-    newline = buf.find(b"\n")
+def _parse_inline(
+    buf: bytes | bytearray, search_from: int = 0
+) -> tuple[list[bytes] | None, int, int]:
+    newline = buf.find(b"\n", search_from)
     if newline == -1:
         return (None, 0, 0)
     line = buf[:newline]

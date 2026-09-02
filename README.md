@@ -48,8 +48,12 @@ The `listening on 127.0.0.1:<port>` line at startup is what tells you this one a
 **Incremental RESP2 parsing.** `resp.py` parses a multibulk array a step at a time — header,
 then one element per call — so a command arriving in fragments is never re-scanned from the
 front. Each step reports what it consumed and the buffer length at which another attempt
-could make progress. A malformed byte is still refused the moment it arrives rather than
-waited out.
+could make progress. A header line can report no such length — its own is declared nowhere —
+so it carries the position its last terminator search reached instead, and the next attempt
+resumes there. Without that, locating a header walks the whole buffer on every readable
+event, which is quadratic in what one connection has sent and, on a single-threaded loop, is
+every other client's problem too. A malformed byte is still refused the moment it arrives
+rather than waited out.
 
 **Partial writes cost nothing.** A reply that can't leave in one `send()` sits in a
 per-connection write buffer until a later writable event drains it. Write interest is

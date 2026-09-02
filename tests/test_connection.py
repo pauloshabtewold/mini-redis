@@ -226,3 +226,76 @@ def test_an_incomplete_inline_command_is_held_until_its_newline_arrives(pair):
     conn.receive()
     assert conn.take_commands() == [[b"PING"]]
     assert conn.read_buffer == bytearray()
+
+
+class ScanCountingBuffer(bytearray):
+    # a bytearray whose find() reports the span it was asked to search, because the cost
+    # this pins is not a call count but how much of the buffer each call walks
+    def __init__(self, *args):
+        super().__init__(*args)
+        self.scanned = 0
+
+    def find(self, *args):
+        start = args[1] if len(args) > 1 else 0
+        self.scanned += max(0, len(self) - start)
+        return super().find(*args)
+
+
+@pytest.mark.parametrize(
+    "opening",
+    [
+        b"",                      # inline: no framing at all
+        b"*",                     # a multibulk count that never ends
+        b"*2\r\n$4\r\nECHO\r\n$",  # a bulk length that never ends
+    ],
+    ids=["inline", "multibulk-count", "bulk-length"],
+)
+def test_a_header_arriving_in_pieces_is_scanned_once_not_once_per_read(opening):
+    # a header line's length is declared nowhere, so _parse_needed can never bound one.
+    # without a resume position the search restarts at byte zero on every readable event,
+    # which is quadratic in what one connection has sent: 300 reads of a 1 KiB chunk walk
+    # ~150x the bytes received, and one connection can hold the whole single-threaded loop
+    sock, peer = socket.socketpair()
+    try:
+        conn = Connection(sock, ("127.0.0.1", 0))
+        conn.read_buffer = ScanCountingBuffer(opening)
+        chunks, chunk = 300, b"1" * 1024
+        for _ in range(chunks):
+            conn.read_buffer.extend(chunk)
+            assert conn.take_commands() == []
+        received = len(conn.read_buffer)
+        assert conn.read_buffer.scanned <= 2 * received, (
+            "scanned %d bytes to receive %d -- the search is restarting at byte zero"
+            % (conn.read_buffer.scanned, received)
+        )
+    finally:
+        sock.close()
+        peer.close()
+
+
+@pytest.mark.parametrize(
+    "first, second, expected",
+    [
+        (b"*1\r", b"\n$4\r\nPING\r\n", [[b"PING"]]),
+        (b"*1\r\n$4\r", b"\nPING\r\n", [[b"PING"]]),
+        (b"*2\r\n$4\r\nECHO\r\n$1\r", b"\nx\r\n", [[b"ECHO", b"x"]]),
+        # the inline path resumes at the end rather than one byte short, because its
+        # terminator is a single \n -- but the \r before it is still part of the line,
+        # so a line split between the two has to come back as one command, not two
+        (b"PING\r", b"\n", [[b"PING"]]),
+        (b"ECHO hi\r", b"\nPING\r\n", [[b"ECHO", b"hi"], [b"PING"]]),
+    ],
+    ids=["multibulk-count", "bulk-length", "second-element", "inline", "inline-then-more"],
+)
+def test_a_header_crlf_split_across_two_reads_is_still_found(pair, first, second, expected):
+    # the resume position has to stop one byte short of the end: a \r already buffered
+    # pairs with a \n that has not arrived, and resuming at the end steps over that pair
+    # and the header is never located -- the connection then hangs with no error anywhere
+    conn, peer = pair
+    peer.sendall(first)
+    conn.receive()
+    assert conn.take_commands() == []
+    peer.sendall(second)
+    conn.receive()
+    assert conn.take_commands() == expected
+    assert conn.read_buffer == bytearray()

@@ -48,6 +48,11 @@ class Connection:
         self.write_buffer = bytearray()
         # the buffer length the last incomplete parse said it needs, so a partial command is not re-parsed from byte zero on every readable event
         self._parse_needed = 0
+        # how far a terminator search has already proved there is no terminator. a header
+        # line's length is declared nowhere, so _parse_needed can never bound one; without
+        # this, locating a header costs a scan of the whole buffer on every readable event,
+        # which is quadratic in the bytes one connection has sent
+        self._scan_from = 0
         # a multibulk whose header has been consumed and whose elements are still arriving. holding
         # the argv here is what keeps locating N elements O(N) rather than O(N) per element
         self._argv: list[bytes] | None = None
@@ -85,11 +90,18 @@ class Connection:
                 # nothing between here and that length can change the parse's answer, so re-running it is pure cost
                 break
             if self._argv is not None:
-                body, consumed, needed = resp.parse_bulk_element(self.read_buffer)
+                body, consumed, needed = resp.parse_bulk_element(
+                    self.read_buffer, self._scan_from
+                )
                 if consumed == 0:
                     self._parse_needed = needed
+                    # a non-zero hint means the header was found and only the body is
+                    # short, so the resume position is spent and would otherwise point
+                    # past this element's own terminator into the next one's
+                    self._scan_from = 0 if needed else self._resume_after_crlf(1)
                     break
                 self._parse_needed = 0
+                self._scan_from = 0
                 del self.read_buffer[:consumed]
                 self._argv.append(body)
                 self._elements_remaining -= 1
@@ -97,27 +109,43 @@ class Connection:
                     commands.append(self._argv)
                     self._argv = None
             elif self.read_buffer[0:1] == b"*":
-                count, consumed, needed = resp.parse_multibulk_header(self.read_buffer)
+                count, consumed, needed = resp.parse_multibulk_header(
+                    self.read_buffer, self._scan_from
+                )
                 if consumed == 0:
                     self._parse_needed = needed
+                    self._scan_from = self._resume_after_crlf(0)
                     break
                 self._parse_needed = 0
+                self._scan_from = 0
                 del self.read_buffer[:consumed]
                 # a count of zero is RESP's empty array: the header is consumed and no command comes out of it
                 if count:
                     self._argv = []
                     self._elements_remaining = count
             else:
-                argv, consumed, needed = resp.parse_command(self.read_buffer)
+                argv, consumed, needed = resp.parse_command(
+                    self.read_buffer, self._scan_from
+                )
                 if consumed == 0:
                     self._parse_needed = needed
+                    # an inline line ends at a single \n, so there is no pair to be split
+                    # across two reads and nothing to step back for
+                    self._scan_from = len(self.read_buffer)
                     break
                 self._parse_needed = 0
+                self._scan_from = 0
                 # progress is driven by `consumed`, not by `argv`
                 del self.read_buffer[:consumed]
                 if argv is not None:
                     commands.append(argv)
         return commands
+
+    def _resume_after_crlf(self, floor: int) -> int:
+        # one byte short of the end, because a \r already in the buffer pairs with a \n
+        # that has not arrived yet: resuming at the end would step over that pair and the
+        # header would never be found. floor keeps the element scan past its own `$`
+        return max(floor, len(self.read_buffer) - 1)
 
     def queue(self, data: bytes) -> None:
         # the only outbound API. the socket is private, so a search for a raw socket write anywhere outside this module finds every bypass.
