@@ -213,8 +213,12 @@ def test_close_flushes_a_still_queued_reply_to_the_peer():
         server._loop.close()
 
 
-def test_a_failed_registration_costs_one_connection_not_the_server(monkeypatch, caplog):
-    # _on_accept runs outside _guard, so an unguarded raise here unwinds run_once and takes every other client with it
+@pytest.mark.parametrize("failure", [KeyError, ValueError, OSError], ids=lambda e: e.__name__)
+def test_a_failed_registration_costs_one_connection_not_the_server(monkeypatch, caplog, failure):
+    # _on_accept runs outside _guard, so an unguarded raise here unwinds run_once and takes every other client with it.
+    # all three of the named exceptions are exercised: the guard's own comment says the selector raises KeyError for a
+    # descriptor already registered and ValueError for a closed one, and the kqueue backend's control call raises
+    # OSError -- with only KeyError driven, narrowing the tuple to (KeyError,) passes the whole suite
     with listening() as (server, connect, _listener):
         bystander = connect()
         pump(server)
@@ -226,7 +230,7 @@ def test_a_failed_registration_costs_one_connection_not_the_server(monkeypatch, 
         def register_failing_once(conn):
             calls["n"] += 1
             if calls["n"] == 1:
-                raise KeyError("stale registration for this descriptor")
+                raise failure("the selector refused this descriptor")
             return real_register(conn)
 
         monkeypatch.setattr(server._loop, "register", register_failing_once)
@@ -250,7 +254,7 @@ def test_a_failed_registration_costs_one_connection_not_the_server(monkeypatch, 
     # is the only trace that a client was turned away at the door
     refused = [r for r in caplog.records if r.levelname == "ERROR" and r.exc_info]
     assert refused, caplog.records
-    assert refused[0].exc_info[0] is KeyError, refused[0].exc_info
+    assert refused[0].exc_info[0] is failure, refused[0].exc_info
 
 
 def _stop_the_loop_from_inside(server):

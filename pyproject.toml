@@ -13,7 +13,7 @@ license-files = ["LICENSE"]
 dependencies = []
 
 [project.optional-dependencies]
-dev = ["pytest", "redis>=5,<9"]
+dev = ["pytest", "pytest-timeout", "redis>=5,<9"]
 profile = ["py-spy"]
 
 [tool.setuptools]
@@ -32,3 +32,9 @@ packages = ["commands"]
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 pythonpath = ["."]
+# a parser off-by-one that waits for one byte more than will ever arrive does not fail a
+# test, it parks it: the reply never ships and the client waits out its own deadline. that
+# turns a one-character regression into a run that hangs until CI's own timeout kills it,
+# with no assertion, traceback or log line naming the cause. this bounds it to a failure.
+# well above the slowest test here, which is the INCR burst at ~6s against its own 120s cap
+timeout = 300

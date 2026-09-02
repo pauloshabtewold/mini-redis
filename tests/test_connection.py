@@ -299,3 +299,59 @@ def test_a_header_crlf_split_across_two_reads_is_still_found(pair, first, second
     conn.receive()
     assert conn.take_commands() == expected
     assert conn.read_buffer == bytearray()
+
+
+def test_a_completed_element_clears_the_resume_position_for_the_next_one(pair):
+    # _scan_from is only non-zero while a header's own terminator search is unfinished.
+    # if that search resolves and the body completes in the same pass, the reset is the
+    # only thing stopping a stale offset from being applied to the NEXT element's buffer,
+    # where it points into the middle of a header that starts at byte zero. the symptom
+    # is a bogus protocol error on a well-formed command, and a dropped connection
+    conn, peer = pair
+    peer.sendall(b"*2\r\n$1")           # element one's header arrives incomplete
+    conn.receive()
+    assert conn.take_commands() == []
+    assert conn._scan_from > 0, "the unfinished header search must have left a position"
+
+    peer.sendall(b"\r\na\r\n")          # its terminator and its body land together
+    conn.receive()
+    assert conn.take_commands() == []
+    assert conn._scan_from == 0, "a completed element must not leave a resume position"
+
+    peer.sendall(b"$1\r\nb\r\n")        # a short header for element two
+    conn.receive()
+    assert conn.take_commands() == [[b"a", b"b"]]
+
+
+class CountingSocket:
+    # a socket refuses attribute assignment, so counting close() takes a wrapper -- the
+    # same shape RecordingSocket above uses to observe what recv() was asked for
+    def __init__(self, sock):
+        self._sock = sock
+        self.closes = 0
+
+    def fileno(self):
+        return self._sock.fileno()
+
+    def close(self):
+        self.closes += 1
+        self._sock.close()
+
+
+def test_close_really_is_idempotent_not_merely_survivable():
+    # socket.close() is itself safe to call twice, so asserting `closed is True` after
+    # two calls passes with the guard deleted. what the guard is for is the descriptor:
+    # ids are counted rather than taken from fileno() precisely because descriptors get
+    # reused, and a second close on a stale Connection would shut a socket it never owned
+    sock, peer = socket.socketpair()
+    try:
+        counting = CountingSocket(sock)
+        conn = Connection(counting, ("127.0.0.1", 0))
+        conn.close()
+        conn.close()
+        assert conn.closed is True
+        assert counting.closes == 1, (
+            "the second close reached the socket: %d calls" % counting.closes)
+    finally:
+        sock.close()
+        peer.close()

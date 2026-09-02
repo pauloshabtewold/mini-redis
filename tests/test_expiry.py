@@ -9,6 +9,7 @@ import pytest
 import commands
 import resp
 from store import Store
+from commands.registry import INT64_MAX
 from tests.conftest import FROZEN, FrozenStore, r
 from tests.int_ceiling import NO_CEILING_REASON, NO_CONVERSION_CEILING, OVERSIZED_DIGIT_RUN
 
@@ -274,3 +275,33 @@ def test_a_remaining_time_is_never_reported_as_one_of_the_two_negative_facts():
     store.write(b"k", b"v", keep_ttl=False)
     store.expire_at(b"k", FROZEN + 1)
     assert r(store, b"TTL", b"k") == (b":0\r\n", [])
+
+
+@pytest.mark.parametrize("argv0, unit, error", [
+    (b"EXPIRE", 1000, b"-ERR invalid expire time in 'expire' command\r\n"),
+    (b"PEXPIRE", 1, b"-ERR invalid expire time in 'pexpire' command\r\n"),
+])
+def test_the_millisecond_conversion_bound_is_exact_at_int64_max(argv0, unit, error):
+    # the existing coverage lands grossly past INT64_MAX, so `> INT64_MAX` and
+    # `>= INT64_MAX` look identical to it. a deadline landing exactly on INT64_MAX is
+    # legal -- PEXPIREAT accepts one -- and the check must not refuse it.
+    #
+    # the clock is chosen rather than frozen at the shared value, because EXPIRE multiplies
+    # by 1000 and INT64_MAX - FROZEN is not a multiple of 1000: no whole number of seconds
+    # lands on the boundary from there, so the comparison is simply unreachable and a test
+    # written against that clock cannot tell > from >= however it is phrased
+    amount = 4_000_000
+    now = INT64_MAX - amount * unit
+
+    class ClockOnTheBoundary(Store):
+        def now_ms(self):
+            return now
+
+    store = ClockOnTheBoundary()
+    store.write(b"k", b"v", keep_ttl=False)
+    assert r(store, argv0, b"k", b"%d" % amount) == (
+        b":1\r\n", [[b"PEXPIREAT", b"k", b"%d" % INT64_MAX]])
+
+    store = ClockOnTheBoundary()
+    store.write(b"k", b"v", keep_ttl=False)
+    assert r(store, argv0, b"k", b"%d" % (amount + 1))[0] == error
