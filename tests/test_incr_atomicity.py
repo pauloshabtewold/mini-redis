@@ -203,10 +203,10 @@ def test_many_connections_incrementing_one_counter_stay_exact(mini_redis_server)
     assert value == b"16000", value
 
 
-# --- the gate's own entry point, at whatever N is given on the command line --------------
+# --- the standalone entry point, at whatever N is given on the command line --------------
 
 
-def _run_gate_burst(n):
+def _run_burst_against_a_fresh_server(n):
     # not the mini_redis_server fixture: pytest refuses a fixture called outside a
     # test, so this builds its own server from the same two helpers the fixture uses
     port = free_port()
@@ -233,7 +233,9 @@ def _run_gate_burst(n):
 
 if __name__ == "__main__":
     count = int(sys.argv[1]) if len(sys.argv) > 1 else N
-    received_bytes, expected_bytes, peak_bytes, counter_value = _run_gate_burst(count)
+    received_bytes, expected_bytes, peak_bytes, counter_value = (
+        _run_burst_against_a_fresh_server(count)
+    )
     print("reply bytes received:", len(received_bytes))
     print("reply bytes expected:", len(expected_bytes))
     print("peak outstanding:", peak_bytes)

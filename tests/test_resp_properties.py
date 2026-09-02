@@ -1,10 +1,9 @@
 """The parser's contract over input this module builds, not its answers to chosen input.
 
 Every other parser test here names an input and the output it expects, which is what
-`test_resp.py` and `test_resp_limits.py` are for and what the feature gate does. That
-shape can only find defects on inputs somebody thought of, and the one defect that
-reached a public remote -- a digit run longer than the interpreter converts -- was on an
-input nobody would write by hand. These tests assert the properties instead: whatever the
+`test_resp.py` and `test_resp_limits.py` are for. That shape can only find defects on
+inputs somebody thought of, and the one defect that reached a public remote -- a digit
+run longer than the interpreter converts -- was on an input nobody would write by hand. These tests assert the properties instead: whatever the
 bytes are, the parser raises nothing but `ProtocolError`, consumes no more than it was
 given, leaves the caller's buffer alone, and never changes its mind about a command once
 it has decoded one.
