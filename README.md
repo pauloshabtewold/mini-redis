@@ -87,5 +87,5 @@ commands/       registry.py, server.py and string.py have code; list.py does not
 tests/          pytest suite, run in CI against Python 3.11 and 3.13
 ```
 
-[Design notes](docs/DESIGN.md) cover why each of these is shaped the way it is, and thirteen
+[Design notes](docs/DESIGN.md) cover why each of these is shaped the way it is, and fifteen
 deliberate differences from real Redis.

@@ -1,4 +1,10 @@
-"""Connection and server commands: PING, ECHO, HELLO, DBSIZE, KEYS, FLUSHALL, INFO, CONFIG."""
+"""Connection and server commands: PING, ECHO and HELLO.
+
+DBSIZE, KEYS, FLUSHALL, INFO and CONFIG belong to this group and are not written
+yet. They are named here rather than left out because this file, unlike the empty
+stubs, already has working code, so a reader has no other signal that the group is
+incomplete -- and no signal at all that these five are where it continues.
+"""
 
 from commands.registry import Kind, Reply, command, wrong_arity
 import resp
