@@ -120,3 +120,35 @@ def test_execute_command_incr_and_decr_work_while_the_helper_methods_do_not(redi
         assert "INCRBY" in str(exc), exc
     else:
         raise AssertionError("r.incr() stopped sending INCRBY; re-check the mapping")
+
+
+def test_the_four_later_set_options_survive_the_wire(redis_client):
+    # EX/PX/NX/XX have had wire coverage since this module was written; GET, KEEPTTL, EXAT
+    # and PXAT arrived later and had none -- every test of them drove commands.dispatch()
+    # directly, which never encodes or decodes a byte. That is the half where two real
+    # defects were found, so the parse-it-off-the-wire half is the half worth pinning
+    r = redis_client
+    assert r.set("w:get", "first") is True
+    assert r.set("w:get", "second", get=True) == b"first", "GET returns the replaced value"
+    assert r.get("w:get") == b"second"
+    assert r.set("w:getmiss", "v", get=True) is None, "GET on a missing key is nil"
+
+    assert r.set("w:keep", "v", ex=100) is True
+    assert r.set("w:keep", "w", keepttl=True) is True
+    assert 90 < r.ttl("w:keep") <= 100, "KEEPTTL must not discard the deadline"
+    assert r.set("w:keep", "x") is True
+    assert r.ttl("w:keep") == -1, "a plain SET must still discard it"
+
+    # EXAT/PXAT are absolute where EX/PX are durations; redis-py sends them as datetimes or
+    # ints, and an int is the shape that reaches the wire unchanged
+    # execute_command still runs redis-py's own SET response callback, so the reply comes
+    # back as True rather than b"OK" -- the deadline it set is the thing worth asserting
+    far = int(time.time()) + 1000
+    assert r.execute_command("SET", "w:exat", "v", "EXAT", far) is True
+    assert 900 < r.ttl("w:exat") <= 1000, "EXAT is absolute seconds, not a duration"
+    assert r.execute_command("SET", "w:pxat", "v", "PXAT", far * 1000) is True
+    assert 900 < r.ttl("w:pxat") <= 1000, "PXAT is absolute milliseconds"
+
+    # and the one that has to delete rather than schedule, over a real socket
+    assert r.execute_command("SET", "w:past", "v", "PXAT", 1) is True
+    assert r.exists("w:past") == 0, "a deadline already past must leave nothing resident"

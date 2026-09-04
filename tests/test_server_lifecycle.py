@@ -464,6 +464,28 @@ def test_the_loop_is_built_with_a_bounded_select_timeout():
         server._loop.close()
 
 
+def test_the_bounded_timeout_reaches_the_select_call_itself():
+    # the test above reads the attribute the loop was built with, which is configuration, not
+    # behaviour: severing the two -- select(0) with _timeout still 0.1 -- passes it untouched.
+    # what that costs is measurable and total. an idle loop that never blocks spins: 10 passes
+    # per wall second becomes tens of thousands, and this server has one thread to spend
+    server = Server(0)
+    seen = []
+    real_select = server._loop._selector.select
+
+    def recording_select(timeout=None):
+        seen.append(timeout)
+        return real_select(timeout)
+
+    server._loop._selector.select = recording_select
+    try:
+        server._loop.run_once()
+        assert seen == [server._loop._timeout], (
+            "select() was called with %r, not the configured %r" % (seen, server._loop._timeout))
+    finally:
+        server._loop.close()
+
+
 def test_run_gives_the_signal_handlers_back():
     # run() is called in-process here, so a handler left pointing at a discarded Server would
     # swallow every later signal in the pytest process -- Ctrl-C included

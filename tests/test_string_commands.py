@@ -483,3 +483,18 @@ def test_set_with_get_raises_wrongtype_through_dispatch():
     assert commands.dispatch(store, None, [b"SET", b"w", b"new", b"GET"]) == (
         b"-WRONGTYPE Operation against a key holding the wrong kind of value\r\n", [])
     assert store.lookup(b"w") == b"v", "the refused command must not have written"
+
+
+@pytest.mark.parametrize("token, argument", [(b"EXAT", FROZEN // 1000), (b"PXAT", FROZEN)],
+                         ids=["exat", "pxat"])
+def test_an_absolute_deadline_landing_exactly_on_now_deletes(conn, token, argument):
+    # every other test of this branch uses PXAT 1 -- far enough in the past that `<= now` and
+    # `< now` agree, so the boundary itself is untested and a strict comparison passes. the
+    # sibling checks in _apply_expiry and Store.lookup are both pinned at the exact instant;
+    # this is the third copy of the same rule and it was not
+    store = FrozenStore()
+    response, effects = commands.dispatch(
+        store, conn, [b"SET", b"k", b"v", token, b"%d" % argument])
+    assert response == b"+OK\r\n"
+    assert effects == [[b"DEL", b"k"]], "a deadline equal to now is already past"
+    assert b"k" not in store._data and b"k" not in store._expiry
