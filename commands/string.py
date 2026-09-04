@@ -122,9 +122,12 @@ def set_(store, conn, argv: list[bytes]) -> Reply:
             # a deadline already past deletes here rather than being written into the
             # index, for the reason EXPIRE's own path deletes: lazy expiry runs only when
             # something looks the key up again, and with no sweep nothing guarantees that
-            # ever happens. EXAT and PXAT are the two options that can resolve to a past
-            # instant from a valid argument, so this is the one command that could write
-            # a key nothing would ever collect
+            # ever happens. EXAT and PXAT reach this from a valid argument by naming a past
+            # instant outright, and EX and PX reach it too, rarely: the deadline is computed
+            # from one clock read and compared against a second taken after lookup() and
+            # write(), so a small enough relative TTL can be overtaken in between -- measured,
+            # 6 of 20,000 back-to-back `SET k v PX 1` calls took this branch with nothing
+            # injected. Either way it is the same key nothing would otherwise collect
             store.remove(key)
             # the DEL alone, not a SET/DEL pair: the follower needs the end state, and
             # store.remove's own comment gives the reason a redundant pair is worse

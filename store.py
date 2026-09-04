@@ -92,7 +92,13 @@ class Store:
         return self._expiry.get(key)
 
     def kind_of(self, value: object) -> bytes:
-        # one entry today; list support adds one
+        # one entry today; list support adds one. the raise below is a TypeError rather than
+        # a WrongTypeError deliberately -- it means the store holds something no command can
+        # put there, which is a defect in this file and not a client's mistake, so it travels
+        # to the connection boundary rather than back to the client as a reply. dispatch()
+        # catches WrongTypeError only. Whoever adds the second kind adds it here in the same
+        # commit as the code that can create it, or every lookup(kind=) on the new type takes
+        # this branch and closes a connection instead of answering WRONGTYPE
         if isinstance(value, bytes):
             return KIND_STRING
         raise TypeError("not a value kind this store recognizes: %r" % (type(value),))
