@@ -109,7 +109,7 @@ event_loop.py   selectors readiness dispatch (on_readable / on_writable / on_acc
 connection.py   per-connection socket, read/write buffers, lifecycle
 resp.py         RESP2 parser and serializer
 store.py        keyspace, expiry index, pending-effects queue
-commands/       registry.py, server.py, string.py and list.py have code; twenty-six commands total
+commands/       __init__.py, registry.py, server.py, string.py and list.py; twenty-six commands total
 tests/          pytest suite, run in CI against Python 3.11 and 3.13
 ```
 

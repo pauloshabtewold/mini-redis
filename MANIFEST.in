@@ -1,3 +1,4 @@
 # setuptools' default sdist glob is test*/test*.py, which picks up the test modules and silently
-# leaves behind the package marker and the non-test-prefixed helper both of them import
+# leaves behind the package marker and both non-test-prefixed helpers they import, conftest.py
+# and int_ceiling.py
 recursive-include tests *.py
