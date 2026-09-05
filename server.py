@@ -106,6 +106,16 @@ class Server:
         self._running = False
         self._ran = False
 
+    @property
+    def connected_clients(self) -> int:
+        # public and read-only, not a plain attribute a handler could read as
+        # conn.server._connections: a private reach from commands/ into this module's own
+        # state is the same category of defect the store's own internals check exists to
+        # prevent, sitting just outside the set that check scans. A property rather than a
+        # method because the connection's own slot for this object grants attribute reads
+        # and nothing else -- no calls -- so what it exposes has to already be shaped as one
+        return len(self._connections)
+
     def _open_listener(self) -> socket.socket:
         listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
@@ -132,6 +142,9 @@ class Server:
             conn.close()
             return
         self._connections.add(conn)
+        # filled only once the connection is both registered and tracked, so this slot
+        # never points at a connection that _on_accept is about to close instead of keep
+        conn.server = self
 
     def _on_readable(self, conn: Connection) -> None:
         self._guard(conn, self._read_and_dispatch)
@@ -159,6 +172,10 @@ class Server:
             logger.exception("closing %s failed; abandoning it", conn.addr)
             # the connection cannot be tracked any more, so drop it and take the descriptor back
             self._connections.discard(conn)
+            # _close clears this on its own happy path, right after the same discard;
+            # reaching here means it raised before getting there, so the slot is still
+            # pointing at this Server unless this recovery clears it too
+            conn.server = None
             try:
                 # _close does this before the socket close; reaching here means it raised
                 # first, so the registration is still in the selector's map keyed by a
@@ -257,6 +274,10 @@ class Server:
         self._loop.unregister(conn)
         # discarded before the close rather than after it: close() sets the flag first, so a raise from the socket would leave this connection in the set with every later _close returning at the guard above
         self._connections.discard(conn)
+        # cleared before close() for the same reason: a raise from the socket would
+        # otherwise leave this connection pointing at a Server it is no longer part of,
+        # with every later _close returning at the guard above before reaching this line
+        conn.server = None
         conn.close()
 
     def _request_stop(self, signum, frame) -> None:

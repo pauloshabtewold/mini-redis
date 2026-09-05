@@ -1,13 +1,9 @@
-"""INCR, DECR: 64-bit signed arithmetic on a string value, with the TTL preserved.
-
-The INCR/DECR half, which needs no second type and so ships alongside the expiry
-family rather than waiting for lists.
-"""
+"""INCR, DECR: 64-bit signed arithmetic on a string value, with the TTL preserved."""
 
 import pytest
 
 import commands
-from tests.conftest import FROZEN, FrozenStore, ListKinded, r
+from tests.conftest import FROZEN, FrozenStore, r
 
 
 @pytest.fixture
@@ -117,15 +113,13 @@ def test_incr_wrong_arity(store):
         b"-ERR wrong number of arguments for 'incr' command\r\n", [])
 
 
-def test_incr_raises_wrongtype_through_dispatch():
-    s = ListKinded()
-    s.write(b"w", b"v", keep_ttl=False)
-    assert commands.dispatch(s, None, [b"INCR", b"w"]) == (
+def test_incr_raises_wrongtype_through_dispatch(store):
+    r(store, b"RPUSH", b"w", b"v")
+    assert r(store, b"INCR", b"w") == (
         b"-WRONGTYPE Operation against a key holding the wrong kind of value\r\n", [])
 
 
-def test_decr_raises_wrongtype_through_dispatch():
-    s = ListKinded()
-    s.write(b"w", b"v", keep_ttl=False)
-    assert commands.dispatch(s, None, [b"DECR", b"w"]) == (
+def test_decr_raises_wrongtype_through_dispatch(store):
+    r(store, b"RPUSH", b"w", b"v")
+    assert r(store, b"DECR", b"w") == (
         b"-WRONGTYPE Operation against a key holding the wrong kind of value\r\n", [])

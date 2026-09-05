@@ -1034,3 +1034,35 @@ def test_abandon_releases_the_selector_registration_as_well_as_the_socket():
         server._loop.close()
         sock.close()
         peer.close()
+
+
+def test_abandon_clears_the_server_slot_when_close_fails_before_reaching_it():
+    # _close clears conn.server only after self._loop.unregister(conn) succeeds.
+    # reaching _abandon's recovery means unregister raised first, so without this the
+    # slot is left pointing at a Server that no longer tracks this connection
+    server = Server(0)
+    sock, peer = socket.socketpair()
+    sock.setblocking(False)
+    try:
+        conn = Connection(sock, ("stub", 0))
+        server._loop.register(conn)
+        server._connections.add(conn)
+        # set explicitly, the way _on_accept fills it on a real accept: a bare
+        # Connection built directly for this test carries None here otherwise, which
+        # would make the assertion below pass whether or not the fix is present
+        conn.server = server
+
+        def unregister_raising(_conn):
+            raise KeyError("not registered")
+
+        server._loop.unregister = unregister_raising
+        server._abandon(conn)
+
+        assert conn.closed and conn not in server._connections
+        assert conn.server is None, (
+            "the slot must not go on pointing at a Server this connection is no "
+            "longer part of")
+    finally:
+        server._loop.close()
+        sock.close()
+        peer.close()

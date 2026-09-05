@@ -12,6 +12,7 @@ import pytest
 import redis
 
 import commands
+from connection import Connection
 from store import Store
 
 REPO_ROOT = pathlib.Path(__file__).resolve().parent.parent
@@ -73,19 +74,22 @@ def redis_client(mini_redis_server):
 # --- unit-test helpers below: shared by tests that call commands.dispatch() directly
 # against a Store, unlike the end-to-end fixtures above, which drive a real subprocess
 
+@pytest.fixture
+def conn():
+    a, b = socket.socketpair()
+    a.setblocking(False)
+    connection = Connection(a, ("127.0.0.1", 0))
+    yield connection
+    a.close()
+    b.close()
+
+
 FROZEN = 1_700_000_000_000
 
 
 class FrozenStore(Store):
     def now_ms(self):
         return FROZEN
-
-
-class ListKinded(Store):
-    # a second type does not exist yet; this is a real use of the shipped kind_of
-    # API with a substituted implementation, not end-to-end WRONGTYPE coverage
-    def kind_of(self, value):
-        return b"list"
 
 
 def r(store, *argv):

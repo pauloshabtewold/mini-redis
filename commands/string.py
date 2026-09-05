@@ -146,8 +146,11 @@ def set_(store, conn, argv: list[bytes]) -> Reply:
 
 @command(b"GET", arity=2, kind=Kind.READ)
 def get(store, conn, argv: list[bytes]) -> Reply:
-    # one of only three commands that pass a kind, with INCR and DECR -- SET, DEL,
-    # EXISTS and TYPE are type-agnostic on a real server and stay so here
+    # one of nine commands that unconditionally pass a kind -- INCR and DECR here, and
+    # all six list commands in list.py. SET passes one too, but only when its GET option
+    # is present, since only then does it need to reject a value it could not return as
+    # the old string; DEL, EXISTS and TYPE stay genuinely type-agnostic, on a real server
+    # and here
     value = store.lookup(argv[1], kind=KIND_STRING)
     return resp.encode_bulk_string(value), []
 

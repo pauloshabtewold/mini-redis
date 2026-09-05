@@ -1,8 +1,11 @@
 """The keyspace, the expiry index, and the pending-effects queue."""
 
 import time
+from collections import deque
+from collections.abc import Iterator
 
 KIND_STRING = b"string"
+KIND_LIST = b"list"
 
 # distinguishes "key not present" from any value the key could legitimately hold -- b""
 # is a legal stored value and None never is, so testing the read-back value itself could
@@ -40,6 +43,15 @@ class Store:
         # instance and every handler holding it sees the frozen clock.
         return int(time.time() * 1000)
 
+    def _has_passed(self, deadline: int | None, now: int) -> bool:
+        # the one comparison every expiry check in this file makes: a deadline equal to
+        # now has already passed, and no deadline at all never has. Four call sites is
+        # four chances for the polarity or the None case to drift apart from the other
+        # three; one predicate leaves exactly one place to get the boundary right and
+        # exactly one place to change it. now arrives as an argument rather than a call
+        # to now_ms() so a caller checking many keys still reads the clock once
+        return deadline is not None and deadline <= now
+
     def lookup(self, key: bytes, kind: bytes | None = None) -> object | None:
         # the one place any handler -- read or write -- may ask whether a key exists.
         # replication will fork this on a delete_expired flag so a follower can answer nil
@@ -50,7 +62,7 @@ class Store:
         if value is _MISSING:
             return None
         deadline = self._expiry.get(key)
-        if deadline is not None and deadline <= self.now_ms():
+        if self._has_passed(deadline, self.now_ms()):
             # the DEL this produces goes on the queue rather than back to the caller: its
             # other producer will be the active expiry sweep, running outside dispatch
             # entirely, after select() returns, with no command and no handler to return
@@ -92,16 +104,54 @@ class Store:
         return self._expiry.get(key)
 
     def kind_of(self, value: object) -> bytes:
-        # one entry today; list support adds one. the raise below is a TypeError rather than
+        # bytes is a string, deque is a list -- the raise below is a TypeError rather than
         # a WrongTypeError deliberately -- it means the store holds something no command can
         # put there, which is a defect in this file and not a client's mistake, so it travels
         # to the connection boundary rather than back to the client as a reply. dispatch()
-        # catches WrongTypeError only. Whoever adds the second kind adds it here in the same
-        # commit as the code that can create it, or every lookup(kind=) on the new type takes
+        # catches WrongTypeError only. Whichever kind arrives third adds its branch here in
+        # the same commit as the code that can create it, or every lookup(kind=) on it takes
         # this branch and closes a connection instead of answering WRONGTYPE
         if isinstance(value, bytes):
             return KIND_STRING
+        if isinstance(value, deque):
+            return KIND_LIST
         raise TypeError("not a value kind this store recognizes: %r" % (type(value),))
+
+    def live_count(self) -> int:
+        # DBSIZE reads this rather than counting through lookup(), which would delete each
+        # expired key it scanned past and append a DEL to the effects queue for it -- a
+        # count turning into a mutation with no write anyone asked for. len(_data) is O(1);
+        # the correction below is linear in the expiry index rather than in the keyspace,
+        # so a keyspace with few TTLs stays cheap no matter how large it grows
+        now = self.now_ms()
+        expired = sum(1 for deadline in self._expiry.values() if self._has_passed(deadline, now))
+        return len(self._data) - expired
+
+    def expiring_count(self) -> int:
+        # INFO's expires= field -- the number of deadlines in _expiry that have not yet
+        # passed. A separate method rather than a second return value alongside
+        # live_count(), so a caller wanting only one of the two numbers does not have to
+        # compute or discard the other
+        now = self.now_ms()
+        return sum(1 for deadline in self._expiry.values() if not self._has_passed(deadline, now))
+
+    def live_keys(self) -> Iterator[bytes]:
+        # KEYS reads this rather than lookup() per key, for the same reason live_count()
+        # does -- a read command must not delete what it was only asked to list. _data's
+        # own iteration order, since nothing here claims a stronger one
+        now = self.now_ms()
+        for key in self._data:
+            deadline = self._expiry.get(key)
+            if not self._has_passed(deadline, now):
+                yield key
+
+    def flush(self) -> int:
+        # every key, expired or not -- FLUSHALL empties the keyspace rather than reporting
+        # on what was still live in it, which is why this walks _data directly instead of
+        # live_keys(). list(self._data) is a snapshot taken before the loop starts, not a
+        # live view of it: remove() mutates _data on every iteration, and iterating the
+        # dict itself while deleting from it raises RuntimeError
+        return sum(1 for key in list(self._data) if self.remove(key))
 
     def take_effects(self) -> list[list[bytes]]:
         # returns the queue and clears it in the same step, so no consumer can drain it

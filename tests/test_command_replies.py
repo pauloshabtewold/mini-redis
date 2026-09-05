@@ -17,16 +17,6 @@ from store import Store
 
 
 @pytest.fixture
-def conn():
-    a, b = socket.socketpair()
-    a.setblocking(False)
-    connection = Connection(a, ("127.0.0.1", 0))
-    yield connection
-    a.close()
-    b.close()
-
-
-@pytest.fixture
 def store():
     return Store()
 

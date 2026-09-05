@@ -62,6 +62,16 @@ class Connection:
         # filled and interpreted only by their owning module
         self.rate_limit_state = None
         self.replication_state = None
+        # the third opaque slot, and the only one whose filler is server.py itself rather
+        # than a module of its own: set in Server._on_accept once this connection is
+        # registered and tracked, cleared back to None in Server._close. Untyped like the
+        # two slots above, so this module gains no import to name what fills it. The
+        # contract is what makes reaching into it from commands/ safe: a handler may read
+        # the named public attributes of the object held here, and nothing else -- no
+        # method calls, no underscore-prefixed names. A private reach would be the same
+        # category of defect as commands/ touching store.py's own internals, just outside
+        # the boundary written to catch that one
+        self.server = None
 
     def fileno(self) -> int:
         return self._sock.fileno()

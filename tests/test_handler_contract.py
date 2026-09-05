@@ -1,6 +1,7 @@
 """The (response, effects) contract every registered command handler must satisfy."""
 
 import socket
+from collections import deque
 
 import pytest
 
@@ -52,17 +53,31 @@ def test_every_registered_handler_returns_a_reply_pair():
         arity = commands.registry.COMMANDS[name].arity
         return [name] + [filler] * (abs(arity) - 1)
 
-    try:
-        empty = Store()
-        for name in commands.registry.COMMANDS:
-            drive(empty, argv_for(name, b"x"))
+    # neither LPOP nor RPOP creates a container of its own -- unlike every other write
+    # command the pass below exists for, each can only ever produce an effect against a
+    # key that is already a non-empty list, which a store preloaded as a string can never
+    # give them
+    NEEDS_A_LIST = {b"LPOP", b"RPOP"}
 
-        preloaded = Store()
-        preloaded.write(b"x", b"1", keep_ttl=False)
+    try:
+        # every pass below builds a fresh Store() per command rather than sharing one
+        # across the whole traversal: a shared store lets an earlier command's write
+        # decide what kind a later command's key holds, which makes that later command's
+        # own pass-or-fail depend on registration order instead of on its own handler
         for name in commands.registry.COMMANDS:
-            drive(preloaded, argv_for(name, b"x"))
+            drive(Store(), argv_for(name, b"x"))
+
         for name in commands.registry.COMMANDS:
-            drive(preloaded, argv_for(name, b"1"))
+            store = Store()
+            if name in NEEDS_A_LIST:
+                store.write(b"x", deque([b"x"]), keep_ttl=False)
+            else:
+                store.write(b"x", b"1", keep_ttl=False)
+            drive(store, argv_for(name, b"x"))
+        for name in commands.registry.COMMANDS:
+            store = Store()
+            store.write(b"x", b"1", keep_ttl=False)
+            drive(store, argv_for(name, b"1"))
 
         # one filler cannot be both an existing key and a parsing integer, so EXPIRE,
         # PEXPIRE and PEXPIREAT cannot reach store.expire_at through the uniform

@@ -19,6 +19,17 @@ EXPECTED = {
     b"PTTL": Kind.READ,
     b"INCR": Kind.WRITE,
     b"DECR": Kind.WRITE,
+    b"LPUSH": Kind.WRITE,
+    b"RPUSH": Kind.WRITE,
+    b"LPOP": Kind.WRITE,
+    b"RPOP": Kind.WRITE,
+    b"LRANGE": Kind.READ,
+    b"LLEN": Kind.READ,
+    b"DBSIZE": Kind.OTHER,
+    b"KEYS": Kind.OTHER,
+    b"FLUSHALL": Kind.WRITE,
+    b"INFO": Kind.OTHER,
+    b"CONFIG": Kind.OTHER,
 }
 
 

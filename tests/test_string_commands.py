@@ -1,24 +1,11 @@
 """SET, GET, DEL, EXISTS, TYPE: the option grammar, WRONGTYPE, and lazy expiry."""
 
-import socket
-
 import pytest
 
 import commands
 from commands.registry import parse_int64
-from connection import Connection
 from store import Store
-from tests.conftest import FROZEN, FrozenStore, ListKinded
-
-
-@pytest.fixture
-def conn():
-    a, b = socket.socketpair()
-    a.setblocking(False)
-    connection = Connection(a, ("127.0.0.1", 0))
-    yield connection
-    a.close()
-    b.close()
+from tests.conftest import FROZEN, FrozenStore
 
 
 @pytest.fixture
@@ -262,8 +249,8 @@ def test_set_option_grammar_and_arity_errors(store, conn, argv, expected):
 
 
 def test_get_raises_wrongtype_through_dispatch():
-    s = ListKinded()
-    s.write(b"w", b"v", keep_ttl=False)
+    s = Store()
+    commands.dispatch(s, None, [b"RPUSH", b"w", b"v"])
     assert commands.dispatch(s, None, [b"GET", b"w"]) == (
         b"-WRONGTYPE Operation against a key holding the wrong kind of value\r\n", [])
 
@@ -272,11 +259,11 @@ def test_set_del_exists_type_stay_type_agnostic_against_the_same_store():
     # the three assertions after SET are the ones that fail against a WRONGTYPE check
     # added to SET, EXISTS or DEL "for consistency" -- a behaviour change list support
     # would have to undo
-    s = ListKinded()
-    s.write(b"w", b"v", keep_ttl=False)
+    s = Store()
+    commands.dispatch(s, None, [b"RPUSH", b"w", b"v"])
     assert commands.dispatch(s, None, [b"SET", b"w", b"v2"])[0] == b"+OK\r\n"
     assert commands.dispatch(s, None, [b"EXISTS", b"w"]) == (b":1\r\n", [])
-    assert commands.dispatch(s, None, [b"TYPE", b"w"]) == (b"+list\r\n", [])
+    assert commands.dispatch(s, None, [b"TYPE", b"w"]) == (b"+string\r\n", [])
     assert commands.dispatch(s, None, [b"DEL", b"w"]) == (b":1\r\n", [[b"DEL", b"w"]])
 
 
@@ -476,13 +463,13 @@ def test_set_with_get_raises_wrongtype_through_dispatch():
     # SET is type-agnostic and overwrites anything, but GET makes it read the value it is
     # replacing, and reading a value of the wrong kind is WRONGTYPE. Without the kind on
     # that lookup the command answers a plausible-looking old value and overwrites the
-    # key -- the corruption the check exists to prevent. Unreachable while only strings
-    # exist; live the day commands/list.py ships, which is when nobody will be looking
-    store = ListKinded()
-    store.write(b"w", b"v", keep_ttl=False)
+    # key -- the corruption the check exists to prevent. This path was unreachable before
+    # a second value kind existed; a real list, built with RPUSH, reaches it now
+    store = Store()
+    commands.dispatch(store, None, [b"RPUSH", b"w", b"v"])
     assert commands.dispatch(store, None, [b"SET", b"w", b"new", b"GET"]) == (
         b"-WRONGTYPE Operation against a key holding the wrong kind of value\r\n", [])
-    assert store.lookup(b"w") == b"v", "the refused command must not have written"
+    assert list(store.lookup(b"w")) == [b"v"], "the refused command must not have written"
 
 
 @pytest.mark.parametrize("token, argument", [(b"EXAT", FROZEN // 1000), (b"PXAT", FROZEN)],

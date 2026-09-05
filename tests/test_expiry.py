@@ -119,15 +119,8 @@ def test_ttl_on_a_logically_expired_key_is_absent_not_negative(store):
 
 def test_expire_and_pexpireat_are_type_agnostic():
     # measured: EXPIRE, TTL, PTTL and PEXPIREAT all operate on a list key on 7.2.7
-    class ListKinded(Store):
-        def now_ms(self):
-            return FROZEN
-
-        def kind_of(self, value):
-            return b"list"
-
-    s = ListKinded()
-    s.write(b"l", b"v", keep_ttl=False)
+    s = FrozenStore()
+    r(s, b"RPUSH", b"l", b"v")
     assert r(s, b"EXPIRE", b"l", b"10") == (
         b":1\r\n", [[b"PEXPIREAT", b"l", b"%d" % (FROZEN + 10_000)]])
     assert r(s, b"TTL", b"l") == (b":10\r\n", [])

@@ -4,9 +4,11 @@ and the WRONGTYPE check. test_store_properties.py covers the same contract over 
 this module does not choose.
 """
 
+from collections import deque
+
 import pytest
 
-from store import KIND_STRING, Store, WrongTypeError
+from store import KIND_LIST, KIND_STRING, Store, WrongTypeError
 
 
 @pytest.fixture
@@ -65,6 +67,40 @@ def test_take_effects_returns_and_clears(keyspace):
     assert keyspace.take_effects() == []
 
 
+def test_kind_of_recognizes_a_deque_as_a_list(keyspace):
+    assert keyspace.kind_of(deque([b"a"])) == KIND_LIST
+    assert keyspace.kind_of(deque()) == KIND_LIST, "an empty deque is still a list"
+
+
+def test_live_count_and_live_keys_exclude_an_expired_key_without_removing_it(keyspace):
+    keyspace.write(b"live", b"v", keep_ttl=False)
+    keyspace.write(b"gone", b"v", keep_ttl=False)
+    keyspace.expire_at(b"gone", keyspace.now_ms() - 1)
+    assert keyspace.live_count() == 1
+    assert list(keyspace.live_keys()) == [b"live"]
+    assert b"gone" in keyspace._data
+    assert keyspace.take_effects() == []
+
+
+def test_expiring_count_counts_only_unexpired_deadlines(keyspace):
+    keyspace.write(b"a", b"v", keep_ttl=False)
+    keyspace.write(b"b", b"v", keep_ttl=False)
+    keyspace.expire_at(b"a", keyspace.now_ms() + 3_600_000)
+    keyspace.expire_at(b"b", keyspace.now_ms() - 1)
+    assert keyspace.expiring_count() == 1
+
+
+def test_flush_removes_every_key_expired_or_not_and_reports_the_count(keyspace):
+    keyspace.write(b"live", b"v", keep_ttl=False)
+    keyspace.write(b"gone", b"v", keep_ttl=False)
+    keyspace.expire_at(b"gone", keyspace.now_ms() - 1)
+    assert keyspace.flush() == 2
+    assert keyspace.live_count() == 0
+    assert list(keyspace.live_keys()) == []
+    assert keyspace._data == {} and keyspace._expiry == {}
+    assert keyspace.take_effects() == []
+
+
 # edge
 
 
@@ -99,6 +135,14 @@ def test_lookup_with_a_matching_kind_returns_the_value(keyspace):
     assert keyspace.lookup(b"k", KIND_STRING) == b"v"
 
 
+def test_live_count_and_live_keys_treat_a_deadline_equal_to_now_as_expired(keyspace):
+    keyspace.write(b"k", b"v", keep_ttl=False)
+    keyspace.expire_at(b"k", keyspace.now_ms())
+    assert keyspace.live_count() == 0
+    assert list(keyspace.live_keys()) == []
+    assert b"k" in keyspace._data
+
+
 # error
 
 
@@ -125,13 +169,24 @@ def test_lookup_with_a_mismatched_kind_raises_wrongtype(keyspace):
     )
 
 
+def test_lookup_with_a_mismatched_kind_raises_wrongtype_for_a_real_list(keyspace):
+    keyspace.write(b"k", deque([b"a"]), keep_ttl=False)
+    with pytest.raises(WrongTypeError) as exc_info:
+        keyspace.lookup(b"k", KIND_STRING)
+    assert exc_info.value.message == (
+        b"WRONGTYPE Operation against a key holding the wrong kind of value"
+    )
+
+
 def test_a_missing_key_is_missing_before_it_is_the_wrong_type(keyspace):
     assert keyspace.lookup(b"gone", b"list") is None
 
 
-def test_kind_of_on_a_non_bytes_value_raises_typeerror(keyspace):
+@pytest.mark.parametrize("value", [123, None, [b"a"], {b"a"}, "str"],
+                         ids=["int", "none", "list", "set", "str"])
+def test_kind_of_on_a_non_bytes_value_raises_typeerror(keyspace, value):
     with pytest.raises(TypeError):
-        keyspace.kind_of(123)
+        keyspace.kind_of(value)
 
 
 def test_check_invariants_raises_on_an_injected_orphan(keyspace):
