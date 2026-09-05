@@ -12,6 +12,7 @@ import pytest
 from redis._parsers.helpers import parse_info
 
 import commands
+from commands.server import _glob_match
 from connection import Connection
 from store import Store
 from tests.conftest import FROZEN, FrozenStore
@@ -110,9 +111,10 @@ def test_keys_glob_grammar(store, conn, pattern, preload, expected):
 
 
 def test_keys_star_matches_an_empty_string_key(store, conn):
-    # the "a trailing run of stars matches the rest, including nothing" case only ran as
-    # a loop-exit condition, which a key that is already empty on entry never reaches --
-    # so this used to answer *0 even though the empty key was live and DBSIZE counted it
+    # this used to answer *0 even though the empty key was live and DBSIZE counted it.
+    # The answer now comes from keys()'s one-byte-'*' short-circuit rather than from the
+    # matcher, which is where the reference's comes from -- so the test below can pin
+    # both halves separately without this one changing whichever half supplies it
     commands.dispatch(store, conn, [b"SET", b"", b"v"])
     assert commands.dispatch(store, conn, [b"DBSIZE"]) == (b":1\r\n", [])
     reply, effects = commands.dispatch(store, conn, [b"KEYS", b"*"])
@@ -122,16 +124,64 @@ def test_keys_star_matches_an_empty_string_key(store, conn):
 
 @pytest.mark.parametrize("pattern, expected", [
     (b"*", [b""]),
-    (b"**", [b""]),
+    (b"**", []),
+    (b"***", []),
     (b"*a", []),
-], ids=["single-star", "double-star", "star-plus-content"])
+    (b"", [b""]),
+], ids=["single-star", "double-star", "triple-star", "star-plus-content", "empty"])
 def test_keys_star_variants_against_an_empty_string_key(store, conn, pattern, expected):
-    # pins the boundary: any run of nothing but '*' matches an empty key, but a '*'
-    # followed by further pattern content still needs a byte of key that isn't there
+    # measured against redis-server 7.2.7 on each of these five: an empty key matches
+    # only the empty pattern and the one-byte '*'. The two are answered by different
+    # things -- the empty pattern by the matcher, '*' by keys()'s short-circuit -- and
+    # every longer run of stars matches nothing, because the reference's matcher loop is
+    # guarded on the string having bytes left and never consumes them
     commands.dispatch(store, conn, [b"SET", b"", b"v"])
     reply, effects = commands.dispatch(store, conn, [b"KEYS", pattern])
     assert effects == []
     assert sorted(reply.split(b"\r\n")[2::2]) == expected
+
+
+def test_the_matcher_itself_refuses_every_star_pattern_against_an_empty_key(store, conn):
+    # the layer below the test above: keys()'s short-circuit is the only reason '*' lists
+    # an empty key, so a repair that moved the answer back into the matcher would pass
+    # every KEYS assertion here and still diverge from the reference on '**'
+    assert _glob_match(b"", b"") is True
+    for pattern in (b"*", b"**", b"***", b"*a", b"?"):
+        assert _glob_match(pattern, b"") is False, pattern
+
+
+@pytest.mark.parametrize("pattern, preload, expected", [
+    # a range straddling 0x80 is read signed, as the reference reads it: 'a' is 97 and
+    # \xff is -1, so the swap fires and the range is -1..97 -- every byte at or below 'a'
+    # plus \xff, and not 'b', 'c' or \x80
+    (b"[a-\xff]", [b" ", b"0", b"a", b"b", b"c", b"\x7f", b"\x80", b"\xff"],
+     [b" ", b"0", b"a", b"\xff"]),
+    # written the other way round it is the same range, because the swap normalises it
+    (b"[\xff-a]", [b" ", b"a", b"b", b"\xff"], [b" ", b"a", b"\xff"]),
+    # the widest-looking range in the grammar matches almost nothing: 0 and -1, swapped
+    (b"[\x00-\xff]", [b" ", b"a", b"\x80", b"\xff"], [b"\xff"]),
+    # both endpoints above 0x80: signed and unsigned readings agree, so this is unchanged
+    (b"[\x80-\xff]", [b"a", b"\x80", b"\xc3", b"\xff"], [b"\x80", b"\xc3", b"\xff"]),
+    # both endpoints below it: likewise unchanged
+    (b"[a-c]", [b"a", b"b", b"c", b"d", b"\xff"], [b"a", b"b", b"c"]),
+    # a high byte as a plain class member is an equality test, which no reading changes
+    (b"[\xff]", [b"a", b"\x80", b"\xff"], [b"\xff"]),
+], ids=[
+    "straddles-0x80", "straddles-reversed", "widest-range-is-inverted",
+    "both-endpoints-high", "both-endpoints-low", "high-byte-literal-member",
+])
+def test_keys_class_ranges_read_bytes_the_way_the_reference_does(
+    store, conn, pattern, preload, expected
+):
+    # measured against redis-server 7.2.7. It walks pattern and key through `char`, which
+    # is signed on every platform this is measured on, so a range with exactly one
+    # endpoint at or above 0x80 orders its endpoints differently than an unsigned reading
+    # would. Only ordering is affected -- equality survives either reading
+    for key in preload:
+        commands.dispatch(store, conn, [b"SET", key, b"v"])
+    reply, effects = commands.dispatch(store, conn, [b"KEYS", pattern])
+    assert effects == []
+    assert sorted(reply.split(b"\r\n")[2::2]) == sorted(expected)
 
 
 def test_keys_matching_against_many_non_consecutive_stars_stays_fast(store, conn):
@@ -249,6 +299,36 @@ def test_info_takes_more_than_one_section_name(store, conn):
     body = response.split(b"\r\n", 1)[1][:-2]
     assert b"redis_version" in body and b"role:master" in body
     assert b"connected_clients" not in body
+
+
+def _info_fields(store, conn, argv):
+    # the field names only, never their values: used_memory is a resident-memory
+    # high-water mark, so two INFO calls a moment apart can legitimately disagree on it
+    # and comparing whole bodies would make that a flaky test rather than a caught one
+    response, effects = commands.dispatch(store, conn, argv)
+    assert effects == []
+    body = response.split(b"\r\n", 1)[1][:-2]
+    return set(parse_info(body.decode("ascii")))
+
+
+@pytest.mark.parametrize("selector", [b"all", b"everything", b"default", b"ALL", b"Default"])
+def test_info_whole_report_selectors_report_every_section(store, conn, selector):
+    # 'all', 'everything' and 'default' are the reference's selectors over the whole
+    # report, not section names -- and 'default' is what a bare INFO already means there,
+    # so a client spelling the bare form out used to get a zero-byte body back
+    commands.dispatch(store, conn, [b"SET", b"k", b"v"])
+    assert _info_fields(store, conn, [b"INFO", selector]) == _info_fields(
+        store, conn, [b"INFO"]
+    )
+
+
+def test_a_whole_report_selector_beside_a_section_name_widens_rather_than_narrows(store, conn):
+    # the reference's reading of `INFO default Server`: the selector wins, so the reply
+    # is the whole report and not the one section named beside it
+    commands.dispatch(store, conn, [b"SET", b"k", b"v"])
+    assert _info_fields(store, conn, [b"INFO", b"default", b"Server"]) == _info_fields(
+        store, conn, [b"INFO"]
+    )
 
 
 def test_used_memory_agrees_with_an_independent_reading_of_the_same_process():

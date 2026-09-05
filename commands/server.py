@@ -45,7 +45,12 @@ def hello(store, conn, argv: list[bytes]) -> Reply:
         resp.encode_bulk_string(b"proto"),
         resp.encode_integer(2),
         resp.encode_bulk_string(b"id"),
-        resp.encode_integer(conn.id),
+        # 0 when dispatch is driven with no socket at all, which is this project's own
+        # convention for in-process use -- the same guard INFO's connected_clients takes,
+        # for the same callers. Unguarded, the one command whose reply carries a
+        # connection fact is the one command that convention cannot call, and it fails
+        # with an AttributeError rather than a reply
+        resp.encode_integer(0 if conn is None else conn.id),
         resp.encode_bulk_string(b"mode"),
         resp.encode_bulk_string(b"standalone"),
         resp.encode_bulk_string(b"role"),
@@ -110,10 +115,14 @@ def _glob_match(pattern: bytes, key: bytes) -> bool:
     found. Stack depth stays flat regardless of how many `*` groups appear; only the
     running time grows, and only as `len(pattern) * len(key)` in the worst case.
 
-    The main loop runs only while `key` still has bytes left, so it never reaches its
-    own "a trailing `*` matches nothing" case when `key` is already empty on entry --
-    that cleanup runs once, unconditionally, after the loop instead of solely as one of
-    its exit paths, which is what lets a pattern of nothing but `*` match an empty key.
+    The main loop runs only while `key` still has bytes left, so a key already empty on
+    entry never enters it -- and the trailing-`*` cleanup below is guarded on that,
+    because the reference's loop is guarded the same way. Its `while (patternLen &&
+    stringLen)` is followed by a match only when both are exhausted, so an empty key
+    matches nothing there but the empty pattern, `*` included. `KEYS *` still lists an
+    empty-string key, because the reference does not reach its matcher for that pattern
+    either: `keysCommand` short-circuits the exact one-byte `*`, and `keys()` below
+    carries the same short-circuit for the same reason.
     """
     plen, klen = len(pattern), len(key)
     p = k = 0
@@ -131,9 +140,24 @@ def _glob_match(pattern: bytes, key: bytes) -> bool:
             p, k = star_p + 1, star_k
         else:
             return False
-    while p < plen and pattern[p] == _STAR:
-        p += 1
+    if klen:
+        # only when the key had bytes on entry. Unguarded, this consumes stars the
+        # reference's loop never reaches, and every run of nothing but `*` matches an
+        # empty key -- which `*` alone appears to get right only because the caller's
+        # short-circuit answers that one pattern before this function sees it
+        while p < plen and pattern[p] == _STAR:
+            p += 1
     return p == plen
+
+
+def _signed(byte: int) -> int:
+    # the reference walks its pattern and its key through `char`, which is signed on
+    # every platform this is measured against, so 0xff reads as -1 there and a range's
+    # low-high ordering is decided on that reading: `[\x00-\xff]` is the inverted range
+    # -1..0 and matches almost nothing, where an unsigned reading makes it match
+    # everything. Only the class-range branch orders bytes rather than comparing them for
+    # equality, so it is the only place this is needed -- equality survives either reading
+    return byte - 256 if byte >= 128 else byte
 
 
 def _match_atom(pattern: bytes, p: int, key: bytes, k: int) -> tuple[bool, int]:
@@ -174,10 +198,14 @@ def _match_atom(pattern: bytes, p: int, key: bytes, k: int) -> tuple[bool, int]:
             p -= 1
             break
         elif p + 2 < plen and pattern[p + 1] == _DASH:
-            lo, hi = pattern[p], pattern[p + 2]
+            # signed, because the reference's comparison is -- see _signed. Both
+            # endpoints and the key byte take the same reading, so a range entirely
+            # below 0x80 or entirely above it behaves exactly as an unsigned one would;
+            # only a range straddling 0x80 can tell the two apart
+            lo, hi = _signed(pattern[p]), _signed(pattern[p + 2])
             if lo > hi:
                 lo, hi = hi, lo
-            if lo <= key[k] <= hi:
+            if lo <= _signed(key[k]) <= hi:
                 matched = True
             p += 2
         elif pattern[p] == key[k]:
@@ -189,9 +217,18 @@ def _match_atom(pattern: bytes, p: int, key: bytes, k: int) -> tuple[bool, int]:
 @command(b"KEYS", arity=2, kind=Kind.OTHER)
 def keys(store, conn, argv: list[bytes]) -> Reply:
     pattern = argv[1]
+    # the reference's own short-circuit, not an optimisation added on top of it:
+    # keysCommand tests for the exact one-byte `*` and never calls its matcher for that
+    # pattern. It is the only reason `KEYS *` lists an empty-string key on either server,
+    # because the matcher itself answers no to every pattern against an empty key but the
+    # empty one. Removing this line silently stops listing that key -- the defect a
+    # previous round found, repaired then in the matcher and repaired here instead
+    all_keys = pattern == b"*"
     # store.live_keys() rather than the shared lookup, for DBSIZE's own reason: a read
     # command must not delete what it was only asked to list
-    matched = [key for key in store.live_keys() if _glob_match(pattern, key)]
+    matched = [
+        key for key in store.live_keys() if all_keys or _glob_match(pattern, key)
+    ]
     return resp.encode_array([resp.encode_bulk_string(key) for key in matched]), []
 
 
@@ -264,6 +301,15 @@ def _section_body(name: bytes, fields: list[bytes]) -> bytes:
     return b"# " + name + b"\r\n" + b"".join(field + b"\r\n" for field in fields) + b"\r\n"
 
 
+# the reference's three whole-report selectors, which are not section names: `all` and
+# `everything` widen the report past its default sections there, and `default` names
+# exactly what a bare INFO already returns. Treating them as unrecognised section names
+# answers a client that spells the bare form out with an empty body, which is the one
+# shape of "less" that tells it nothing rather than telling it less. Every section here
+# is a default section, so all three select the same set
+_INFO_WHOLE_REPORT = frozenset((b"ALL", b"EVERYTHING", b"DEFAULT"))
+
+
 @command(b"INFO", arity=-1, kind=Kind.OTHER)
 def info(store, conn, argv: list[bytes]) -> Reply:
     # bare INFO reports every section; named arguments filter to only those, matched
@@ -271,6 +317,11 @@ def info(store, conn, argv: list[bytes]) -> Reply:
     # a client asking a section this server does not have should get back less, not a
     # connection-ending reply, and an all-unrecognised request is legitimately empty
     wanted = {name.upper() for name in argv[1:]}
+    if wanted & _INFO_WHOLE_REPORT:
+        # an empty filter is what the bare form already uses, so a selector alongside a
+        # section name widens rather than intersects -- which is the reference's own
+        # reading of `INFO default Server`
+        wanted = set()
     body = b""
     for name, fields in _info_sections(store, conn):
         if wanted and name.upper() not in wanted:

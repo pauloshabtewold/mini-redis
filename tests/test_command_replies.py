@@ -78,6 +78,17 @@ def test_hello_reports_the_replication_role_not_the_connection_role():
         a.close()
 
 
+def test_hello_answers_with_no_connection_at_all():
+    # conn is None whenever dispatch is driven with no socket, which is this project's
+    # own convention for in-process use and what conftest's r() helper is built on. INFO
+    # guards it for connected_clients; HELLO did not, and raised AttributeError on the
+    # one field that names a connection rather than answering an id of zero
+    store = Store()
+    response, effects = commands.dispatch(store, None, [b"HELLO"])
+    assert b"$2\r\nid\r\n:0\r\n" in response
+    assert effects == []
+
+
 def test_hello_reports_this_connection_s_own_id():
     store = Store()
     a, _b = socket.socketpair()
