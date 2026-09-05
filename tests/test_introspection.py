@@ -137,14 +137,17 @@ def test_keys_star_variants_against_an_empty_string_key(store, conn, pattern, ex
 def test_keys_matching_against_many_non_consecutive_stars_stays_fast(store, conn):
     # a naive backtracking matcher retries every split point at every '*', which is
     # exponential in the number of stars rather than in pattern length -- 20 stars
-    # against a key with no trailing 'y' took 10.8s unmemoised on the machine this was
-    # measured on, next to single-digit milliseconds for a matcher that remembers a
-    # (pattern index, key index) pair it has already resolved. The budget below sits
-    # far under that 10.8s so a real regression still fails it, with enough room above
-    # a healthy run that a loaded machine does not flake it. A second key that the same
-    # pattern does match sits in the same store, so a matcher that is fast only because
-    # it is also wrong -- for instance one that always answers "no match" -- cannot pass
-    # by returning a coincidentally cheap answer
+    # against a key with no trailing 'y' took 10.8s on the machine this was measured
+    # on, next to single-digit milliseconds for the matcher that shipped. That matcher
+    # keeps one resume point rather than a memo: the most recent '*' and how far into
+    # the key it has been extended, retried a byte at a time. Memoising (pattern index,
+    # key index) pairs bounds the same blow-up but leaves a stack frame per star group,
+    # which is what the sibling test below covers. The budget sits far under that 10.8s
+    # so a real regression still fails it, with enough room above a healthy run that a
+    # loaded machine does not flake it. A second key that the same pattern does match
+    # sits in the same store, so a matcher that is fast only because it is also wrong
+    # -- for instance one that always answers "no match" -- cannot pass by returning a
+    # coincidentally cheap answer
     commands.dispatch(store, conn, [b"SET", b"x" * 25, b"v"])
     commands.dispatch(store, conn, [b"SET", b"x" * 24 + b"y", b"v"])
     pattern = (b"*x" * 20) + b"y"
