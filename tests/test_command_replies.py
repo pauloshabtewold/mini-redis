@@ -1,9 +1,13 @@
-"""Every registered command's reply, byte for byte, at every arity it accepts and refuses.
+"""PING, ECHO and HELLO's replies, byte for byte, at every arity each accepts and refuses,
+plus the dispatcher's own unknown-command frame and arity convention.
 
 Every one of these was checked by hand when the commands were written, and by nothing that runs
 again. Twenty mutations of the command layer -- ECHO returning the wrong bytes, HELLO's whole
 reply replaced, the CR/LF sanitiser deleted -- left the suite green, and commands/server.py
-executed 14 of its 37 lines. This module is what makes those lines run.
+executed 14 of the 37 statement lines it had then. This module is what makes those three
+commands' lines run; the five introspection and admin commands that have since joined them in
+the same file are covered by test_introspection.py, and the shape every registered handler
+must return is driven from the registry itself by test_handler_contract.py.
 """
 
 import socket
@@ -169,8 +173,11 @@ def test_a_duplicate_registration_is_refused_rather_than_shadowing():
     assert commands.dispatch(store, None, [b"PING"]) == (b"+PONG\r\n", [])
 
 
-def test_every_handler_returns_bytes_in_the_reply_slot_and_writes_nothing_to_the_socket():
-    # the command layer never touches a socket: a handler that wrote to one would make a follower
+def test_these_handlers_return_bytes_in_the_reply_slot_and_write_nothing_to_the_socket():
+    # a fixed set of argv rather than a sweep of the registry -- test_handler_contract.py
+    # drives every registered command from its own arity, and duplicating that here would
+    # be a second traversal to keep in step with the first. What this adds is the socket:
+    # the command layer never touches one: a handler that wrote to one would make a follower
     # replaying its leader's stream through this same dispatcher, producing no replies, impossible
     class Recording:
         def __init__(self):

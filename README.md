@@ -20,7 +20,10 @@ library. `INCRBY` and `DECRBY` are not among them, and `redis-py` defines `.incr
 correctly. `r.execute_command("INCR", "k")` reaches it. `redis-py`'s `.lpop(name, count)`
 has the same shape: it sends `LPOP name count` on the wire, and this server's exact
 two-argument arity for `LPOP` answers a wrong-number-of-arguments error rather than the
-two-element reply real Redis would give. `redis-benchmark`'s default run gets further
+two-element reply real Redis would give. The one that costs the most is `pipeline()`,
+whose `transaction` argument defaults to true: the default call wraps the batch in
+`MULTI`/`EXEC`, neither of which this server implements, so it fails on `EXEC` where
+`r.pipeline(transaction=False)` sends the same commands and works. `redis-benchmark`'s default run gets further
 than it used to — `PING`, `SET`, `GET`, `INCR`, `LPUSH`, `RPUSH`, `LPOP` and `RPOP` all
 complete now — and exits at `SADD`, the first command in its sequence this server does
 not implement at all.
