@@ -516,6 +516,49 @@ def test_config_get_glob_matches_a_pattern_over_the_table(store, conn, pattern, 
     assert reply.split(b"\r\n")[2:-1:2] == expected
 
 
+@pytest.mark.parametrize("pattern, expected", [
+    # the fold happens inside the comparison and, for a class range, AFTER the low-high
+    # swap -- which is the reference's order and is what decides these. `[Z-a]` is 90..97,
+    # needs no swap, and folds to 122..97: an inverted range matching nothing. Lowering
+    # the pattern before matching instead would hand the swap `[z-a]`, which it corrects
+    # to 97..122, and `maxmemory` would match where redis-server 7.2.7 answers nothing.
+    # Every expectation below is 7.2.7's own answer
+    (b"[Z-a]axmemory", []),
+    (b"[a-Z]axmemory", []),
+    (b"[M-a]axmemory", []),
+    # ranges that do not straddle a case boundary are unaffected by the order
+    (b"[A-z]axmemory", [b"maxmemory", b"0"]),
+    (b"[L-N]axmemory", [b"maxmemory", b"0"]),
+    (b"[l-n]axmemory", [b"maxmemory", b"0"]),
+    (b"[m-m]axmemory", [b"maxmemory", b"0"]),
+    # and the ordinary folding a client would expect from the flag
+    (b"MAXMEMORY*", [b"maxmemory", b"0", b"maxmemory-policy", b"noeviction"]),
+    (b"SaVe", [b"SaVe", b""]),
+], ids=[
+    "upper-lower-range", "lower-upper-range", "mid-upper-lower-range",
+    "spans-both-cases", "both-upper", "both-lower", "single-byte",
+    "upper-prefix-glob", "mixed-case-exact",
+])
+def test_config_get_folds_case_inside_the_comparison_not_before_it(
+    store, conn, pattern, expected
+):
+    reply, effects = commands.dispatch(store, conn, [b"CONFIG", b"GET", pattern])
+    assert effects == []
+    assert reply.split(b"\r\n")[2:-1:2] == expected
+
+
+def test_keys_never_folds_case_however_config_get_matches(store, conn):
+    # the flag belongs to CONFIG GET's caller and to nothing else: a key is arbitrary
+    # bytes and its case is the client's business, so the same pattern that folds over
+    # the parameter table must not fold over the keyspace
+    for key in (b"maxmemory", b"MAXMEMORY", b"MaxMemory"):
+        commands.dispatch(store, conn, [b"SET", key, b"v"])
+    reply, _ = commands.dispatch(store, conn, [b"KEYS", b"MAXMEMORY"])
+    assert sorted(reply.split(b"\r\n")[2::2]) == [b"MAXMEMORY"]
+    reply, _ = commands.dispatch(store, conn, [b"KEYS", b"[Z-a]axmemory"])
+    assert reply == b"*0\r\n"
+
+
 def test_config_get_answers_every_pattern_it_is_given_and_never_twice(store, conn):
     # the reference deduplicates across patterns -- `CONFIG GET * maxmemory` answers 195
     # pairs there, not 196 -- so a parameter two patterns both reach is answered once

@@ -86,7 +86,7 @@ _DASH = ord("-")
 _BACKSLASH = ord("\\")
 
 
-def _glob_match(pattern: bytes, key: bytes) -> bool:
+def _glob_match(pattern: bytes, key: bytes, *, nocase: bool = False) -> bool:
     """True if `key` matches `pattern` in full, under the reference's own glob grammar.
 
     `*`, `?`, `[abc]`, `[a-z]` and `[^...]` negation behave as the reference's own glob
@@ -132,7 +132,8 @@ def _glob_match(pattern: bytes, key: bytes) -> bool:
             star_p, star_k = p, k
             p += 1
             continue
-        matched, next_p = _match_atom(pattern, p, key, k) if p < plen else (False, p)
+        matched, next_p = (
+            _match_atom(pattern, p, key, k, nocase) if p < plen else (False, p))
         if matched:
             p, k = next_p, k + 1
         elif star_p != -1:
@@ -160,7 +161,17 @@ def _signed(byte: int) -> int:
     return byte - 256 if byte >= 128 else byte
 
 
-def _match_atom(pattern: bytes, p: int, key: bytes, k: int) -> tuple[bool, int]:
+def _fold(byte: int, nocase: bool) -> int:
+    # C tolower() over the ASCII letters, which is the whole of what it changes for the
+    # bytes a comparison here can involve. Applied inside the comparison rather than to
+    # the pattern beforehand, because the two are not the same thing wherever the
+    # comparison is order-sensitive -- see the class-range branch below
+    return byte + 32 if nocase and 65 <= byte <= 90 else byte
+
+
+def _match_atom(
+    pattern: bytes, p: int, key: bytes, k: int, nocase: bool = False
+) -> tuple[bool, int]:
     """Match the single non-`*` atom at `pattern[p]` against `key[k]`.
 
     Returns whether it matched and the pattern index immediately past the atom: one byte
@@ -176,9 +187,9 @@ def _match_atom(pattern: bytes, p: int, key: bytes, k: int) -> tuple[bool, int]:
         return True, p + 1
     if ch == _BACKSLASH:
         escaped = p + 1 if p + 1 < plen else p
-        return pattern[escaped] == key[k], escaped + 1
+        return _fold(pattern[escaped], nocase) == _fold(key[k], nocase), escaped + 1
     if ch != _LBRACKET:
-        return ch == key[k], p + 1
+        return _fold(ch, nocase) == _fold(key[k], nocase), p + 1
 
     p += 1
     negate = p < plen and pattern[p] == _CARET
@@ -188,7 +199,7 @@ def _match_atom(pattern: bytes, p: int, key: bytes, k: int) -> tuple[bool, int]:
     while True:
         if p < plen and pattern[p] == _BACKSLASH and p + 1 < plen:
             p += 1
-            if pattern[p] == key[k]:
+            if _fold(pattern[p], nocase) == _fold(key[k], nocase):
                 matched = True
         elif p < plen and pattern[p] == _RBRACKET:
             break
@@ -205,10 +216,17 @@ def _match_atom(pattern: bytes, p: int, key: bytes, k: int) -> tuple[bool, int]:
             lo, hi = _signed(pattern[p]), _signed(pattern[p + 2])
             if lo > hi:
                 lo, hi = hi, lo
-            if lo <= _signed(key[k]) <= hi:
+            # folded AFTER the swap and never re-checked, which is the reference's own
+            # order and not an accident of it. `[Z-a]` is 90..97, needs no swap, and folds
+            # to 122..97 -- an inverted range that matches nothing, left inverted on
+            # purpose. Folding the pattern before the match instead would hand the swap
+            # `[z-a]` and it would correct that to 97..122, matching where the reference
+            # refuses
+            lo, hi = _fold(lo, nocase), _fold(hi, nocase)
+            if lo <= _fold(_signed(key[k]), nocase) <= hi:
                 matched = True
             p += 2
-        elif pattern[p] == key[k]:
+        elif _fold(pattern[p], nocase) == _fold(key[k], nocase):
             matched = True
         p += 1
     return (not matched if negate else matched), p + 1
@@ -382,11 +400,12 @@ def config(store, conn, argv: list[bytes]) -> Reply:
                 pairs.append(resp.encode_bulk_string(_CONFIG[lowered]))
             continue
         for name, value in _CONFIG.items():
-            # the pattern is lowered rather than the matcher being taught to ignore case:
-            # every name in the table is already lower, so for the ASCII these names are
-            # drawn from the two are the same thing. KEYS passes no such flag and must not
-            # -- a key is arbitrary bytes and its case is the client's business
-            if name not in seen and _glob_match(lowered, name):
+            # the matcher is told to ignore case rather than the pattern being lowered
+            # before it: the two differ wherever the comparison is order-sensitive, and a
+            # class range is, so a lowered pattern matches ranges the reference refuses.
+            # KEYS passes no flag and must not -- a key is arbitrary bytes and its case is
+            # the client's business
+            if name not in seen and _glob_match(pattern, name, nocase=True):
                 seen.add(name)
                 pairs.append(resp.encode_bulk_string(name))
                 pairs.append(resp.encode_bulk_string(value))
