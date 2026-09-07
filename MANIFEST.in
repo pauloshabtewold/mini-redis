@@ -2,3 +2,7 @@
 # leaves behind the package marker and both non-test-prefixed helpers they import, conftest.py
 # and int_ceiling.py
 recursive-include tests *.py
+
+# README.md is the sdist's own long description and links to docs/DESIGN.md, which no
+# default glob picks up -- without this the published description carries a dead link
+include docs/DESIGN.md
