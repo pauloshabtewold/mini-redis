@@ -2,6 +2,8 @@
 empty-container cleanup that removes a list's last element along with the key.
 """
 
+from collections import deque
+
 import pytest
 
 import commands
@@ -147,6 +149,91 @@ def test_a_push_preserves_an_existing_ttl():
     commands.dispatch(s, None, [b"LPUSH", b"t", b"z"])
     assert s.deadline(b"t") == before, "a push rewrote the container and cleared the TTL"
     assert commands.dispatch(s, None, [b"TTL", b"t"]) == (b":100\r\n", [])
+
+
+def test_lrange_reads_the_same_run_from_whichever_end_is_nearer(store, conn):
+    # lrange walks forward from the head for a range in the front half and backward off
+    # reversed() for one in the back half, because islice only ever starts at the head and
+    # a range near the tail would otherwise pay the whole length of the list. The two
+    # walks have to agree on every range, including the ones that straddle the midpoint,
+    # so the oracle here is a plain list slice -- a different computation from either
+    # walk, and the one thing the backward path could get wrong without the forward path
+    # noticing. Nine elements puts the boundary at index four with ranges on both sides
+    elements = [b"e%d" % i for i in range(9)]
+    commands.dispatch(store, conn, [b"RPUSH", b"k"] + elements)
+    for start in range(-12, 13):
+        for stop in range(-12, 13):
+            reply, effects = commands.dispatch(
+                store, conn, [b"LRANGE", b"k", b"%d" % start, b"%d" % stop])
+            assert effects == []
+            lo = start + 9 if start < 0 else start
+            hi = stop + 9 if stop < 0 else stop
+            expected = elements[max(lo, 0):hi + 1] if hi >= 0 else []
+            assert reply.split(b"\r\n")[2:-1:2] == expected, (start, stop)
+
+
+class _CountingDeque(deque):
+    """A deque that records how many elements a walk over it actually visited.
+
+    `Store.kind_of` recognises a value by `isinstance(value, deque)`, so a subclass is
+    still a list to every command. Counting is what turns "reads from the nearer end"
+    into something assertable without a clock in it.
+    """
+
+    def __init__(self, *args):
+        super().__init__(*args)
+        self.steps = 0
+
+    def _counted(self, walk):
+        for item in walk:
+            self.steps += 1
+            yield item
+
+    def __iter__(self):
+        return self._counted(super().__iter__())
+
+    def __reversed__(self):
+        return self._counted(super().__reversed__())
+
+
+def test_lrange_walks_from_the_nearer_end_rather_than_always_from_the_head(store, conn):
+    # the reason the walk has two directions, asserted as steps rather than as elapsed
+    # time -- a wall-clock budget on a shared machine is a flake, and the step count is
+    # the thing that actually changed. islice always starts at the head, so a head-first
+    # read of the last of a thousand elements visits all thousand; from the tail it
+    # visits one. Without this the suite cannot tell the two-ended walk from the
+    # head-first one it replaced, since they answer identically on every input
+    container = _CountingDeque(b"e%d" % i for i in range(1000))
+    store.write(b"k", container, keep_ttl=False)
+
+    container.steps = 0
+    assert commands.dispatch(store, conn, [b"LRANGE", b"k", b"-1", b"-1"])[0] == (
+        b"*1\r\n$4\r\ne999\r\n")
+    assert container.steps <= 2, container.steps
+
+    container.steps = 0
+    commands.dispatch(store, conn, [b"LRANGE", b"k", b"0", b"0"])
+    assert container.steps <= 2, container.steps
+
+    # the midpoint is genuinely half the list away from either end, and no choice of
+    # direction avoids that -- the reference's own quicklist pays it there too
+    container.steps = 0
+    commands.dispatch(store, conn, [b"LRANGE", b"k", b"500", b"500"])
+    assert 400 <= container.steps <= 600, container.steps
+
+
+def test_lrange_reads_a_single_element_off_the_tail_without_walking_the_list(store, conn):
+    # the shape the two-ended walk exists for. Timing is not the assertion -- a wall-clock
+    # budget on a shared machine is a flake -- so this asserts the answer on a list long
+    # enough that a head-first walk would be doing thousands of steps for one element
+    commands.dispatch(
+        store, conn, [b"RPUSH", b"k"] + [b"e%d" % i for i in range(5000)])
+    assert commands.dispatch(store, conn, [b"LRANGE", b"k", b"-1", b"-1"]) == (
+        b"*1\r\n$5\r\ne4999\r\n", [])
+    assert commands.dispatch(store, conn, [b"LRANGE", b"k", b"-2", b"-1"]) == (
+        b"*2\r\n$5\r\ne4998\r\n$5\r\ne4999\r\n", [])
+    assert commands.dispatch(store, conn, [b"LRANGE", b"k", b"4999", b"4999"]) == (
+        b"*1\r\n$5\r\ne4999\r\n", [])
 
 
 def test_push_and_pop_round_trip_a_non_utf8_element(store, conn):

@@ -96,8 +96,20 @@ def lrange(store, conn, argv: list[bytes]) -> Reply:
     if start > stop or start >= n:
         return resp.encode_array([]), []
     # deque has no slice syntax of its own; islice walks the run in place instead of
-    # copying the whole container into a list just to throw most of it away
-    elements = islice(container, start, stop + 1)
+    # copying the whole container into a list just to throw most of it away. Which end it
+    # walks from is the rest of the cost: islice only ever starts at the head, so a range
+    # near the tail pays the distance from the head and not the length of the range -- and
+    # `LRANGE k -1 -1`, the ordinary way to read a list's last element, is then linear in
+    # the whole list on a loop with one thread to spend. A deque walks from either end at
+    # the same cost per step, so the half that is closer to the tail is read backward off
+    # reversed() and turned round again. The comparison decides direction and nothing
+    # else, so its own boundary is not observable: at the exact midpoint both directions
+    # walk the same n/2 steps and answer the same bytes, which makes `<=` versus `<` an
+    # equivalent mutant. Noted so the next reader spends no time on it
+    if start <= n - 1 - stop:
+        elements = islice(container, start, stop + 1)
+    else:
+        elements = reversed(list(islice(reversed(container), n - 1 - stop, n - start)))
     return resp.encode_array([resp.encode_bulk_string(e) for e in elements]), []
 
 
