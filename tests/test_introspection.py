@@ -110,6 +110,72 @@ def test_keys_glob_grammar(store, conn, pattern, preload, expected):
     assert sorted(reply.split(b"\r\n")[2::2]) == sorted(expected)
 
 
+@pytest.mark.parametrize("pattern, preload, expected", [
+    # every expectation here is redis-server 7.2.7's own answer to the same pattern over
+    # the same keys. A class with no closing `]` runs the matcher off the end of the
+    # pattern, and the reference handles it by stepping back one byte and treating what
+    # it has seen as the whole class -- three separate guards in `_match_atom` implement
+    # that, and mutation testing found none of them covered: widening the range branch's
+    # length test, or dropping the backslash guard, raises IndexError and closes the
+    # connection, and dropping the step-back silently answers nothing at all
+    (b"[", [b"a", b"[", b"[a", b""], []),
+    (b"[^", [b"a", b"^", b"[^", b""], [b"^", b"a"]),
+    (b"[a", [b"a", b"b", b"[a", b"[", b""], [b"a"]),
+    # a dash as the last byte before the end: the range branch would read one past the
+    # pattern if its length test admitted this
+    (b"[a-", [b"a", b"-", b"b", b"[", b""], [b"-", b"a"]),
+    (b"[ab-", [b"a", b"b", b"-", b"c", b""], [b"-", b"a", b"b"]),
+    (b"a[b-", [b"ab", b"a-", b"ac", b"a"], [b"a-", b"ab"]),
+    # a backslash as the last byte: the escape branch would read one past it too
+    (b"[\\", [b"\\", b"a", b"[", b""], [b"\\"]),
+    # closed, and not the class it looks like: `a-]` is a range whose endpoints swap to
+    # ']'..'a', so it matches ']' as well -- not 'a' plus a literal dash
+    (b"[a-]", [b"a", b"-", b"b", b"]"], [b"]", b"a"]),
+], ids=[
+    "bare-bracket", "bracket-caret", "unclosed-member", "unclosed-trailing-dash",
+    "unclosed-two-members-and-dash", "unclosed-after-a-literal", "unclosed-trailing-backslash",
+    "closed-range-ending-in-bracket",
+])
+def test_keys_matches_a_character_class_that_is_never_closed(
+    store, conn, pattern, preload, expected
+):
+    for key in preload:
+        commands.dispatch(store, conn, [b"SET", key, b"v"])
+    reply, effects = commands.dispatch(store, conn, [b"KEYS", pattern])
+    assert effects == []
+    assert sorted(reply.split(b"\r\n")[2::2]) == sorted(expected)
+
+
+@pytest.mark.parametrize("pattern, preload, expected", [
+    # again the reference's own answers. Every case needs the `*` to be retried at a key
+    # position more than one byte along, which is the half of the backtracker the ten
+    # grammar cases above never reach: `[aL]*` and `[^a]*` let their star consume zero
+    # bytes or one and never make it back off and try again. Recording the star one byte
+    # late -- `star_k = k + 1` -- leaves every one of these answering only its shortest
+    # match, and the whole suite stays green without this
+    (b"a*b", [b"ab", b"axb", b"axyb", b"axyzb", b"ab_", b"a", b"b"],
+     [b"ab", b"axb", b"axyb", b"axyzb"]),
+    (b"a**b", [b"ab", b"axb", b"axyzb", b"a", b"b"], [b"ab", b"axb", b"axyzb"]),
+    (b"*a*b*", [b"ab", b"xaybz", b"aXXb", b"ba", b"a", b"b"], [b"aXXb", b"ab", b"xaybz"]),
+    (b"*abc", [b"abc", b"xabc", b"xxabc", b"abcx", b"ab"], [b"abc", b"xabc", b"xxabc"]),
+    (b"a*b*c", [b"abc", b"axbyc", b"axxbyyc", b"abc_", b"acb"],
+     [b"abc", b"axbyc", b"axxbyyc"]),
+    (b"*[a-c]*", [b"a", b"xbx", b"zzz", b"c", b"d"], [b"a", b"c", b"xbx"]),
+    (b"?*?", [b"ab", b"abc", b"a", b"abcd"], [b"ab", b"abc", b"abcd"]),
+], ids=[
+    "star-spans-one-to-three", "two-stars-span", "three-stars", "leading-star",
+    "two-separated-stars", "star-around-a-class", "star-between-two-single-bytes",
+])
+def test_keys_extends_a_star_across_several_bytes_before_the_rest_matches(
+    store, conn, pattern, preload, expected
+):
+    for key in preload:
+        commands.dispatch(store, conn, [b"SET", key, b"v"])
+    reply, effects = commands.dispatch(store, conn, [b"KEYS", pattern])
+    assert effects == []
+    assert sorted(reply.split(b"\r\n")[2::2]) == sorted(expected)
+
+
 def test_keys_star_matches_an_empty_string_key(store, conn):
     # this used to answer *0 even though the empty key was live and DBSIZE counted it.
     # The answer now comes from keys()'s one-byte-'*' short-circuit rather than from the
