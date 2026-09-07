@@ -468,14 +468,76 @@ def test_info_reports_zero_connected_clients_with_no_server_attached():
 # --- CONFIG --------------------------------------------------------------------------------
 
 
-def test_config_get_echoes_the_parameter_with_an_empty_value(store, conn):
+def test_config_get_answers_a_real_parameter_from_the_table(store, conn):
+    # every value in the table is a true statement about this server, and three of the
+    # five equal redis-server 7.2.7's own default because those defaults are "off" too
     assert commands.dispatch(store, conn, [b"CONFIG", b"GET", b"save"]) == (
         b"*2\r\n$4\r\nsave\r\n$0\r\n\r\n", [])
+    assert commands.dispatch(store, conn, [b"CONFIG", b"GET", b"appendonly"]) == (
+        b"*2\r\n$10\r\nappendonly\r\n$2\r\nno\r\n", [])
+    assert commands.dispatch(store, conn, [b"CONFIG", b"GET", b"maxmemory"]) == (
+        b"*2\r\n$9\r\nmaxmemory\r\n$1\r\n0\r\n", [])
 
 
-def test_config_get_answers_the_same_empty_value_for_any_parameter_name(store, conn):
+def test_config_get_answers_an_unknown_parameter_with_an_empty_array(store, conn):
+    # not the name back with an empty value, which is what an echo would do: a name this
+    # server has never heard of is not a parameter that exists and happens to be unset,
+    # and a client cannot tell those apart from the reply. The reference answers the empty
+    # array here and so does this
     assert commands.dispatch(store, conn, [b"CONFIG", b"GET", b"nosuchparam"]) == (
-        b"*2\r\n$11\r\nnosuchparam\r\n$0\r\n\r\n", [])
+        b"*0\r\n", [])
+    assert commands.dispatch(store, conn, [b"CONFIG", b"GET", b""]) == (b"*0\r\n", [])
+
+
+def test_config_get_looks_an_exact_name_up_without_regard_to_case(store, conn):
+    # and answers in the spelling the client used, not the canonical one -- measured
+    # against redis-server 7.2.7, which answers `MAXMEMORY` to `CONFIG GET MAXMEMORY`
+    assert commands.dispatch(store, conn, [b"CONFIG", b"GET", b"MAXMEMORY"]) == (
+        b"*2\r\n$9\r\nMAXMEMORY\r\n$1\r\n0\r\n", [])
+    assert commands.dispatch(store, conn, [b"CONFIG", b"GET", b"MaxMemory-Policy"]) == (
+        b"*2\r\n$16\r\nMaxMemory-Policy\r\n$10\r\nnoeviction\r\n", [])
+
+
+@pytest.mark.parametrize("pattern, expected", [
+    # a pattern is glob-matched over the table and answers canonical names, where an exact
+    # name is looked up and answers the client's spelling -- the reference draws the same
+    # line, and `*` is the form redis-py's own config_get() sends with no argument
+    (b"*", [b"appendonly", b"no", b"databases", b"1", b"maxmemory", b"0",
+            b"maxmemory-policy", b"noeviction", b"save", b""]),
+    (b"maxmemory*", [b"maxmemory", b"0", b"maxmemory-policy", b"noeviction"]),
+    (b"ma?memory", [b"maxmemory", b"0"]),
+    (b"[m]axmemory", [b"maxmemory", b"0"]),
+    (b"MAXMEMORY*", [b"maxmemory", b"0", b"maxmemory-policy", b"noeviction"]),
+    (b"nosuch*", []),
+], ids=["star", "prefix", "question-mark", "class", "upper-case-pattern", "matches-nothing"])
+def test_config_get_glob_matches_a_pattern_over_the_table(store, conn, pattern, expected):
+    reply, effects = commands.dispatch(store, conn, [b"CONFIG", b"GET", pattern])
+    assert effects == []
+    assert reply.split(b"\r\n")[2:-1:2] == expected
+
+
+def test_config_get_answers_every_pattern_it_is_given_and_never_twice(store, conn):
+    # the reference deduplicates across patterns -- `CONFIG GET * maxmemory` answers 195
+    # pairs there, not 196 -- so a parameter two patterns both reach is answered once
+    assert commands.dispatch(store, conn, [b"CONFIG", b"GET", b"save", b"appendonly"]) == (
+        b"*4\r\n$4\r\nsave\r\n$0\r\n\r\n$10\r\nappendonly\r\n$2\r\nno\r\n", [])
+    assert commands.dispatch(store, conn, [b"CONFIG", b"GET", b"maxmemory", b"maxmemory"]) == (
+        b"*2\r\n$9\r\nmaxmemory\r\n$1\r\n0\r\n", [])
+    # [2:-1:2] is the flat name/value run; every other element of that is a name
+    def names_of(reply):
+        return reply.split(b"\r\n")[2:-1:2][::2]
+
+    # a glob followed by an exact name the glob already reached
+    reply, _ = commands.dispatch(store, conn, [b"CONFIG", b"GET", b"*", b"maxmemory"])
+    assert names_of(reply) == [
+        b"appendonly", b"databases", b"maxmemory", b"maxmemory-policy", b"save"]
+    # and two globs that overlap, which the exact-name case above never reaches --
+    # measured on redis-server 7.2.7, `CONFIG GET maxmemory* ma*` answers eight names
+    # with no repeat among them, and `CONFIG GET * *` answers its whole table once
+    reply, _ = commands.dispatch(store, conn, [b"CONFIG", b"GET", b"maxmemory*", b"ma*"])
+    assert names_of(reply) == [b"maxmemory", b"maxmemory-policy"], names_of(reply)
+    reply, _ = commands.dispatch(store, conn, [b"CONFIG", b"GET", b"*", b"*"])
+    assert len(names_of(reply)) == len(set(names_of(reply))) == 5, names_of(reply)
 
 
 def test_config_subcommand_is_matched_case_insensitively(store, conn):
@@ -497,13 +559,17 @@ def test_arity_errors(store, conn, argv, expected):
     assert commands.dispatch(store, conn, argv) == (expected, [])
 
 
-@pytest.mark.parametrize("argv", [
-    [b"CONFIG", b"GET"],
-    [b"CONFIG", b"GET", b"a", b"b"],
-    [b"CONFIG", b"SET", b"save", b""],
-    [b"CONFIG", b"BOGUS"],
+@pytest.mark.parametrize("argv, expected", [
+    # the bare form is the one arity error in this server that has a subcommand to name,
+    # and the reference names it -- so this asserts `config|get`, not `config`
+    ([b"CONFIG", b"GET"], b"-ERR wrong number of arguments for 'config|get' command\r\n"),
+    # every subcommand but GET, including the two the reference answers `+OK` to. Asserted
+    # byte for byte rather than as "some error", because these four shapes are exactly the
+    # ones that diverge from the reference and a startswith() would pin none of them
+    ([b"CONFIG", b"SET", b"save", b""], b"-ERR syntax error\r\n"),
+    ([b"CONFIG", b"RESETSTAT"], b"-ERR syntax error\r\n"),
+    ([b"CONFIG", b"BOGUS"], b"-ERR syntax error\r\n"),
+    ([b"CONFIG", b"BOGUS", b"x", b"y"], b"-ERR syntax error\r\n"),
 ])
-def test_config_arity_and_syntax_errors_all_start_with_err(store, conn, argv):
-    response, effects = commands.dispatch(store, conn, argv)
-    assert response.startswith(b"-ERR ")
-    assert effects == []
+def test_config_subcommand_and_arity_errors(store, conn, argv, expected):
+    assert commands.dispatch(store, conn, argv) == (expected, [])

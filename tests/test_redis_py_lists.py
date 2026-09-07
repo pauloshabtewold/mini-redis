@@ -90,9 +90,24 @@ def test_config_get_echoes_the_parameter_with_an_empty_value(redis_client):
     assert r.config_get("save") == {"save": ""}
 
 
-def test_config_get_answers_the_same_empty_value_for_any_parameter_name(redis_client):
+def test_config_get_answers_an_unknown_parameter_with_an_empty_mapping(redis_client):
     r = redis_client
-    assert r.config_get("nosuchparam") == {"nosuchparam": ""}
+    assert r.config_get("nosuchparam") == {}
+
+
+def test_config_get_with_no_argument_reports_every_parameter(redis_client):
+    # config_get() with no argument sends `CONFIG GET *`, which is the call that used to
+    # come back holding a single fabricated parameter named `*`
+    r = redis_client
+    config = r.config_get()
+    assert config == {
+        "appendonly": "no",
+        "databases": "1",
+        "maxmemory": "0",
+        "maxmemory-policy": "noeviction",
+        "save": "",
+    }
+    assert config["maxmemory"] == "0"
 
 
 # --- edge cases --------------------------------------------------------------------------

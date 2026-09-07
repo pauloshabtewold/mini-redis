@@ -330,17 +330,64 @@ def info(store, conn, argv: list[bytes]) -> Reply:
     return resp.encode_bulk_string(body), []
 
 
+# The configuration this server actually has. Every value is a true statement about this
+# process -- nothing is written to disk, nothing evicts, nothing bounds the keyspace, and
+# there is one keyspace rather than sixteen -- and three of the five happen to equal the
+# reference's own default because those defaults are "off" as well. `save` is not one of
+# them: a default-configured reference answers `3600 1 300 100 60 10000` there, and `""`
+# is what a server with no snapshots honestly reports.
+#
+# A table rather than an echo of whatever was asked for. Echoing meant a name this server
+# has never heard of came back as a parameter that exists with an empty value, which is a
+# reply a client acts on -- `redis-py`'s config_get() sends `CONFIG GET *` and got back a
+# single parameter named `*`. Answering from a table makes an unknown name answer the
+# empty array the reference answers, and makes the values that are returned true
+_CONFIG: dict[bytes, bytes] = {
+    b"appendonly": b"no",
+    b"databases": b"1",
+    b"maxmemory": b"0",
+    b"maxmemory-policy": b"noeviction",
+    b"save": b"",
+}
+
+# the three bytes that make an argument a pattern rather than a name, which is the
+# distinction the reference draws before it decides how to answer
+_GLOB_METACHARACTERS = b"*?["
+
+
 @command(b"CONFIG", arity=-2, kind=Kind.OTHER)
 def config(store, conn, argv: list[bytes]) -> Reply:
-    # a stub with exactly one subcommand implemented: a benchmarking or profiling client
-    # probes CONFIG GET for a handful of parameters before doing anything else and treats
-    # an error reply as fatal, so every parameter answers the same empty value regardless
-    # of its name. Real configurability is not what this reply exists to provide
+    # one subcommand implemented. A benchmarking or profiling client probes CONFIG GET for
+    # a handful of parameters before doing anything else and treats an error reply as
+    # fatal, which is what this has to survive; real configurability is not on offer
     if argv[1].upper() != b"GET":
         return resp.encode_error(SYNTAX_ERROR), []
-    if len(argv) != 3:
-        return wrong_arity(b"CONFIG"), []
-    return resp.encode_array([
-        resp.encode_bulk_string(argv[2]),
-        resp.encode_bulk_string(b""),
-    ]), []
+    patterns = argv[2:]
+    if not patterns:
+        # the reference names the subcommand in this one message rather than the command,
+        # and it is the only arity error in this server that has a subcommand to name --
+        # so the name is spelt out here instead of coming from cmd.name like every other
+        return wrong_arity(b"CONFIG|GET"), []
+    pairs = []
+    seen = set()
+    for pattern in patterns:
+        lowered = pattern.lower()
+        if not any(byte in pattern for byte in _GLOB_METACHARACTERS):
+            # an exact name is looked up, not matched, and the reply carries the spelling
+            # the client used rather than the canonical one -- `CONFIG GET MAXMEMORY`
+            # answers `MAXMEMORY` on the reference, and the lookup itself ignores case
+            if lowered in _CONFIG and lowered not in seen:
+                seen.add(lowered)
+                pairs.append(resp.encode_bulk_string(pattern))
+                pairs.append(resp.encode_bulk_string(_CONFIG[lowered]))
+            continue
+        for name, value in _CONFIG.items():
+            # the pattern is lowered rather than the matcher being taught to ignore case:
+            # every name in the table is already lower, so for the ASCII these names are
+            # drawn from the two are the same thing. KEYS passes no such flag and must not
+            # -- a key is arbitrary bytes and its case is the client's business
+            if name not in seen and _glob_match(lowered, name):
+                seen.add(name)
+                pairs.append(resp.encode_bulk_string(name))
+                pairs.append(resp.encode_bulk_string(value))
+    return resp.encode_array(pairs), []
