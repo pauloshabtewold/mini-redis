@@ -22,8 +22,17 @@ _HEX_DIGITS = frozenset(b"0123456789abcdefABCDEF")
 _INLINE_SEPARATORS = frozenset({b" ", b"\n", b"\r", b"\t"})
 
 # real Redis reads a multibulk count with string2ll and refuses anything above INT_MAX outright.
-# a bulk length has its own, configurable ceiling, which is a later feature's flag rather than this
+# a bulk length has its own, configurable ceiling: parse_bulk_element's max_value_size parameter
 MAX_MULTIBULK_COUNT = 2**31 - 1
+
+# the reference's PROTO_INLINE_MAX_SIZE. unlike the two configurable caps above, this one takes no
+# flag: no CLI flag covers the inline limit, and MAX_MULTIBULK_COUNT above is the in-repo
+# precedent for a reference-owned ceiling stated as a constant rather than threaded as a
+# parameter. it bounds only a line that has *ended* -- an unterminated line is a different case,
+# left deliberately unbounded here and deferred to the future --incomplete-command-timeout flag,
+# because a line with no terminator yet has no declared length to compare against anything
+MAX_INLINE_SIZE = 64 * 1024
+TOO_BIG_INLINE = b"ERR Protocol error: too big inline request"
 
 
 class ProtocolError(Exception):
@@ -40,6 +49,9 @@ class ProtocolError(Exception):
 def parse_command(
     buf: bytes | bytearray | memoryview,
     search_from: int = 0,
+    *,
+    max_value_size: int = 0,
+    max_multibulk: int = 0,
 ) -> tuple[list[bytes] | None, int, int]:
     """Parse one command off the front of buf.
 
@@ -73,7 +85,11 @@ def parse_command(
     if isinstance(buf, memoryview):
         buf = bytes(buf)
     if buf[0:1] == b"*":
-        return _parse_multibulk(buf, search_from)
+        return _parse_multibulk(
+            buf, search_from, max_value_size=max_value_size, max_multibulk=max_multibulk
+        )
+    # neither cap reaches the inline branch: it declares no length and no count for
+    # either to compare against. MAX_INLINE_SIZE is what bounds it
     return _parse_inline(buf, search_from)
 
 
@@ -95,6 +111,8 @@ def _parse_length(field: bytes | bytearray, error_message: bytes) -> int:
 def parse_multibulk_header(
     buf: bytes | bytearray | memoryview,
     search_from: int = 0,
+    *,
+    max_multibulk: int = 0,
 ) -> tuple[int, int, int]:
     """Parse `*N\\r\\n` off the front of buf, returning (count, consumed, needed).
 
@@ -118,12 +136,20 @@ def parse_multibulk_header(
     if count > MAX_MULTIBULK_COUNT:
         # refused at the header, as the reference does, rather than read one command later as an element
         raise ProtocolError(invalid_count)
+    # a second, separate check rather than one folded comparison: MAX_MULTIBULK_COUNT is the
+    # reference's unconditional ceiling and must still hold when max_multibulk is switched off
+    # (0) -- folding the two into e.g. min(...) would make the hard ceiling disappear exactly
+    # when it is needed most
+    if max_multibulk and count > max_multibulk:
+        raise ProtocolError(invalid_count)
     return (count, header_end + 2, 0)
 
 
 def parse_bulk_element(
     buf: bytes | bytearray | memoryview,
     search_from: int = 1,
+    *,
+    max_value_size: int = 0,
 ) -> tuple[bytes | None, int, int]:
     """Parse one `$N\\r\\n<body>\\r\\n` element off the front of buf.
 
@@ -145,6 +171,12 @@ def parse_bulk_element(
     length = _parse_length(
         buf[1:header_end], b"ERR Protocol error: invalid bulk length"
     )
+    # the cap fires here, before body_start/body_end exist: past that point the declared
+    # length has already become the `needed` hint connection.py stores as _parse_needed,
+    # which is the buffer-growth commitment -- a check placed after it has already agreed
+    # to hold the oversized body
+    if max_value_size and length > max_value_size:
+        raise ProtocolError(b"ERR Protocol error: invalid bulk length")
     # a bulk body may legally contain \r\n, and searching for it truncates the value, so the end is computed from the declared length
     body_start = header_end + 2
     body_end = body_start + length
@@ -156,12 +188,16 @@ def parse_bulk_element(
 
 
 def _parse_multibulk(
-    buf: bytes | bytearray, search_from: int = 0
+    buf: bytes | bytearray,
+    search_from: int = 0,
+    *,
+    max_value_size: int = 0,
+    max_multibulk: int = 0,
 ) -> tuple[list[bytes] | None, int, int]:
     # the whole-command form, over the same two primitives Connection drives one step at a time, so there is one grammar here rather than two that can disagree
     # search_from reaches the header only: every element below is parsed from a fresh
     # slice whose own header starts at byte zero, so no resume position applies to it
-    count, consumed, needed = parse_multibulk_header(buf, search_from)
+    count, consumed, needed = parse_multibulk_header(buf, search_from, max_multibulk=max_multibulk)
     if consumed == 0:
         return (None, 0, needed)
     if count == 0:
@@ -171,7 +207,7 @@ def _parse_multibulk(
     argv = []
     pos = consumed
     for _ in range(count):
-        body, used, needed = parse_bulk_element(buf[pos:])
+        body, used, needed = parse_bulk_element(buf[pos:], max_value_size=max_value_size)
         if used == 0:
             # needed is relative to the element; 0 stays 0, which means no bound is known
             return (None, 0, pos + needed if needed else 0)
@@ -272,7 +308,18 @@ def _parse_inline(
 ) -> tuple[list[bytes] | None, int, int]:
     newline = buf.find(b"\n", search_from)
     if newline == -1:
+        # a line that never ends has no declared length yet to compare against anything --
+        # deliberately left unbounded here. the future --incomplete-command-timeout flag is the
+        # intended answer to everything unterminated; this deferral is that, not an oversight
         return (None, 0, 0)
+    # measured off the newline index, ahead of both the slice below (buf[:newline] would copy
+    # a multi-MiB line just to learn it is refused) and _split_inline (which would have already
+    # built the field list the reply quotes). the \r of a \r\n pair is framing, not
+    # content, and is not counted, so a line of exactly MAX_INLINE_SIZE bytes is accepted
+    # rather than refused one byte early
+    line_length = newline - 1 if buf[newline - 1:newline] == b"\r" else newline
+    if line_length > MAX_INLINE_SIZE:
+        raise ProtocolError(TOO_BIG_INLINE)
     line = buf[:newline]
     if line.endswith(b"\r"):
         line = line[:-1]

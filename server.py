@@ -9,7 +9,7 @@ from collections.abc import Callable
 
 import commands
 import resp
-from connection import Connection, Role
+from connection import BatchProtocolError, Connection, Role
 from event_loop import EventLoop
 from store import Store
 
@@ -21,6 +21,13 @@ SELECT_TIMEOUT_SECONDS = 0.1
 # 0 is unlimited, which is what the reference defaults to for an ordinary client. see
 # Server._flush for why exceeding this closes the connection instead of slowing it down.
 DEFAULT_OUTPUT_BUFFER_LIMIT = 0
+# the reference's own default for an ordinary client; well above the largest value the suite
+# round-trips and below anything that risks OOMing this machine. --max-value-size bounds
+# every inbound bulk element, including the command name and any key, not only what a
+# human would call "the value"
+DEFAULT_MAX_VALUE_SIZE = 64 * 1024 * 1024
+# the reference's own default, the same source and the same margin as the value cap above
+DEFAULT_MAX_MULTIBULK = 1024 * 1024
 
 # logging.lastResort sends an ERROR record to stderr with no configuration
 logger = logging.getLogger(__name__)
@@ -41,21 +48,45 @@ def _port(value: str) -> int:
     return number
 
 
-def _output_buffer_limit(value: str) -> int:
-    # a negative limit is the reason this is not plain type=int. `limit and len(buf) > limit`
-    # reads any non-zero value as "enabled", and every buffer length is greater than a
-    # negative number -- including zero, so every connection is closed after its first
-    # reply while the server still logs a healthy startup line. -1 is a conventional
-    # spelling of "unlimited" elsewhere, which makes it the likeliest value to be typed here
+def _check_not_negative(value: int, label: str) -> None:
+    # the "0 disables, a negative number is refused" rule, stated once and used by all
+    # three CLI validators below and by Server.__init__. `limit and len(buf) >
+    # limit` reads any non-zero value as "enabled", and every buffer length is greater
+    # than a negative number -- including zero -- so a negative limit reaching that
+    # check would close every connection after its first reply while the server still
+    # logs a healthy startup line. -1 is a conventional spelling of "unlimited"
+    # elsewhere, which makes it the likeliest value to be typed here by someone
+    # reaching for the opposite of what it does
+    if value < 0:
+        raise ValueError(
+            "%s cannot be negative; 0 disables the check, not %d" % (label, value))
+
+
+def _numeric_limit(value: str, label: str, unit: str) -> int:
+    # shared by the three CLI validators below, so a value typed on the command line
+    # and a value passed straight to Server.__init__ are refused by the same rule
     try:
         number = int(value)
     except ValueError:
         raise argparse.ArgumentTypeError(
-            "output buffer limit must be a number of bytes, not %r" % value) from None
-    if number < 0:
-        raise argparse.ArgumentTypeError(
-            "output buffer limit cannot be negative; 0 disables the check, not %d" % number)
+            "%s must be a number of %s, not %r" % (label, unit, value)) from None
+    try:
+        _check_not_negative(number, label)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(str(exc)) from None
     return number
+
+
+def _output_buffer_limit(value: str) -> int:
+    return _numeric_limit(value, "output buffer limit", "bytes")
+
+
+def _max_value_size(value: str) -> int:
+    return _numeric_limit(value, "max value size", "bytes")
+
+
+def _max_multibulk(value: str) -> int:
+    return _numeric_limit(value, "max multibulk count", "elements")
 
 
 def build_arg_parser() -> argparse.ArgumentParser:
@@ -70,12 +101,31 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help="close a connection whose queued replies exceed BYTES; 0 disables the "
              "check, which is the reference's own default for an ordinary client",
     )
+    parser.add_argument(
+        "--max-value-size",
+        type=_max_value_size,
+        default=DEFAULT_MAX_VALUE_SIZE,
+        metavar="BYTES",
+        help="refuse a single inbound bulk element -- including the command name and "
+             "any key -- declaring more than BYTES; 0 disables the check",
+    )
+    parser.add_argument(
+        "--max-multibulk",
+        type=_max_multibulk,
+        default=DEFAULT_MAX_MULTIBULK,
+        metavar="COUNT",
+        help="refuse a command declaring more than COUNT elements; 0 disables the check",
+    )
     return parser
 
 
 class Server:
     def __init__(
-        self, port: int, output_buffer_limit: int = DEFAULT_OUTPUT_BUFFER_LIMIT
+        self,
+        port: int,
+        output_buffer_limit: int = DEFAULT_OUTPUT_BUFFER_LIMIT,
+        max_value_size: int = DEFAULT_MAX_VALUE_SIZE,
+        max_multibulk: int = DEFAULT_MAX_MULTIBULK,
     ) -> None:
         # both checked here as well as in the parser, for the same reason: Server is
         # constructed directly by tests and will be by anything embedding this, so a
@@ -86,14 +136,15 @@ class Server:
         if not 0 <= port <= 65535:
             raise ValueError("port must be between 0 and 65535, not %d" % port)
         self.port = port
-        if output_buffer_limit < 0:
-            raise ValueError(
-                "output_buffer_limit cannot be negative; 0 disables the check, not %d"
-                % output_buffer_limit)
+        _check_not_negative(output_buffer_limit, "output_buffer_limit")
         # a per-connection ceiling on queued replies, not a process-wide one: what this
         # bounds is one client's ability to make the server hold bytes it has not managed
         # to send, and connections do not share a write buffer to divide between them
         self.output_buffer_limit = output_buffer_limit
+        _check_not_negative(max_value_size, "max_value_size")
+        self.max_value_size = max_value_size
+        _check_not_negative(max_multibulk, "max_multibulk")
+        self.max_multibulk = max_multibulk
         self._connections: set[Connection] = set()
         self._loop = EventLoop(
             self._on_accept, self._on_readable, self._on_writable, SELECT_TIMEOUT_SECONDS
@@ -200,13 +251,32 @@ class Server:
             self._close(conn)
             return
         try:
-            parsed_commands = conn.take_commands()
-        except resp.ProtocolError as exc:
+            parsed_commands = conn.take_commands(
+                max_value_size=self.max_value_size, max_multibulk=self.max_multibulk
+            )
+        except BatchProtocolError as exc:
+            # everything take_commands() had already parsed off this batch is answered
+            # first, then the error, then the close -- exc.commands is what makes that
+            # possible, since the list take_commands() built is otherwise a local this
+            # raise would discard along with its frame
+            self._dispatch_batch(conn, exc.commands)
+            if conn.closed:
+                # dispatching those commands can itself trip --output-buffer-limit and
+                # close the connection, and an error queued onto it after that is a
+                # reply nobody reads. _flush and _close both already guard on
+                # this same flag, so nothing today makes this branch observable --
+                # kept because it states the intent at the line, and because it is
+                # what keeps this arm correct if anything reaching the wire is ever
+                # added after it
+                return
             # exc.message is already the RESP error body; delivery is best-effort since the connection closes right after, so a short send() drops the tail of a message the peer was about to lose anyway
             conn.queue(resp.encode_error(exc.message))
             self._flush(conn)
             self._close(conn)
             return
+        self._dispatch_batch(conn, parsed_commands)
+
+    def _dispatch_batch(self, conn: Connection, parsed_commands: list[list[bytes]]) -> None:
         # every command take_commands() returns is dispatched: level-triggered readiness re-reports unread socket bytes, not commands already taken out of the buffer, so a leftover here is never revisited and the client waits forever
         for argv in parsed_commands:
             response, effects = commands.dispatch(self._store, conn, argv)
@@ -329,7 +399,9 @@ class Server:
 
 def main(argv=None) -> None:
     args = build_arg_parser().parse_args(argv)
-    Server(args.port, args.output_buffer_limit).run()
+    Server(
+        args.port, args.output_buffer_limit, args.max_value_size, args.max_multibulk
+    ).run()
 
 
 if __name__ == "__main__":

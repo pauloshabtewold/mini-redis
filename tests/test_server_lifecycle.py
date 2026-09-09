@@ -4,6 +4,7 @@ import pathlib
 import selectors
 import signal
 import socket
+import struct
 import subprocess
 import sys
 import time
@@ -943,7 +944,7 @@ def test_a_pipeline_whose_replies_keep_draining_is_never_closed_by_the_limit(ser
     # would exceed if they piled up. what this does NOT say is that a reading client is
     # safe: this is a hard limit, and a client reading slower than the server produces is
     # closed like any other, which redis-server 7.2.7 does too under an equivalent
-    # client-output-buffer-limit. the name used to claim otherwise
+    # client-output-buffer-limit.
     server, client = server_and_client
     server.output_buffer_limit = 4096
     conn, = server._connections
@@ -1066,3 +1067,71 @@ def test_abandon_clears_the_server_slot_when_close_fails_before_reaching_it():
         server._loop.close()
         sock.close()
         peer.close()
+
+
+def test_a_half_sent_command_holds_its_parsed_elements_and_waits(server_and_client):
+    # two of a three-element command have arrived; both are already out of read_buffer
+    # and into _argv, which is what lets the third be recognised the moment it lands
+    # instead of the header being relocated first. the resume hints are both zero
+    # because the last parse that ran was a clean one, not a partial one
+    server, client = server_and_client
+    conn = next(iter(server._connections))
+    client.sendall(b"*3\r\n$3\r\nSET\r\n$1\r\nk\r\n")
+    pump(server)
+    assert conn._argv == [b"SET", b"k"]
+    assert conn._elements_remaining == 1
+    assert conn.read_buffer == bytearray()
+    assert conn._parse_needed == 0 and conn._scan_from == 0
+    assert len(server._connections) == 1
+
+
+def test_an_abrupt_disconnect_mid_command_deregisters_untracks_and_clears_the_server_slot(
+    server_and_client,
+):
+    # SO_LINGER(1, 0) makes close() send an RST instead of an orderly FIN, the same
+    # abrupt hangup a crashed client leaves behind. fileno() is -1 once the socket is
+    # closed, so get_key(conn) can no longer find the registration by descriptor and
+    # raises ValueError rather than the KeyError a lookup-shaped assertion would expect
+    # -- deregistration is checked here as a scan of the selector's own map instead,
+    # which does not care what the descriptor used to be
+    server, client = server_and_client
+    conn = next(iter(server._connections))
+    client.sendall(b"*3\r\n$3\r\nSET\r\n$1\r\nk\r\n")
+    pump(server)
+
+    client.setsockopt(socket.SOL_SOCKET, socket.SO_LINGER, struct.pack("ii", 1, 0))
+    client.close()
+    pump(server)
+
+    assert len(server._connections) == 0
+    assert conn.closed is True
+    assert conn.server is None, "the slot must be cleared, not left pointing at a live Server"
+    assert all(key.data is not conn for key in server._loop._selector.get_map().values()), (
+        "a closed connection is still in the selector")
+    # the half-parsed argv is freed by the Server dropping its only reference, not by
+    # the Connection scrubbing itself on the way out
+    assert conn._argv == [b"SET", b"k"]
+
+
+def test_an_idle_partial_element_resumes_when_the_rest_arrives(server_and_client):
+    # the header is found but the body is 17 bytes short of complete -- 10 declared,
+    # 3 delivered, plus the trailing CRLF neither reached yet -- so _parse_needed holds
+    # that length instead of the header being rescanned on every later readable event
+    # while the client sits idle. the rest arriving completes SET k abcdefghij, and the
+    # reply is what proves the idle state resumed rather than being discarded
+    server, client = server_and_client
+    conn = next(iter(server._connections))
+    client.sendall(b"*3\r\n$3\r\nSET\r\n$1\r\nk\r\n$10\r\nabc")
+    pump(server)
+    assert conn._argv == [b"SET", b"k"]
+    assert conn._elements_remaining == 1
+    assert conn.read_buffer == bytearray(b"$10\r\nabc")
+    assert conn._parse_needed == 17
+
+    client.sendall(b"defghij\r\n")
+    pump(server)
+    client.settimeout(2)
+    assert client.recv(64) == b"+OK\r\n"
+    assert conn.read_buffer == bytearray()
+    assert conn._argv is None
+    assert conn._parse_needed == 0

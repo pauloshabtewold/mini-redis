@@ -31,6 +31,24 @@ class Role(enum.StrEnum):
 _NEXT_ID = itertools.count(1)
 
 
+class BatchProtocolError(resp.ProtocolError):
+    """Raised by take_commands() when a batch's parse fails partway through.
+
+    commands holds every command already parsed out of this read batch
+    before the failure -- [] when nothing had been. It rides on the
+    exception rather than on the connection because take_commands() builds
+    the list in a local that the raise would otherwise discard along with
+    the frame; the exception is the only thing that outlives it and already
+    crosses the connection/server boundary. A subclass of resp.ProtocolError
+    rather than a new type, so every existing catch of that -- including
+    this module's own callers -- keeps catching it.
+    """
+
+    def __init__(self, message: bytes, commands: list[list[bytes]]) -> None:
+        super().__init__(message)
+        self.commands = commands
+
+
 class Connection:
     def __init__(
         self,
@@ -91,64 +109,74 @@ class Connection:
         self.read_buffer.extend(data)
         return True
 
-    def take_commands(self) -> list[list[bytes]]:
+    def take_commands(
+        self, *, max_value_size: int = 0, max_multibulk: int = 0
+    ) -> list[list[bytes]]:
         # one step per pass -- an inline command, a multibulk header, or a single element -- because
         # a step's bytes leave the buffer as soon as it completes and are never scanned again
         commands = []
-        while self.read_buffer:
-            if len(self.read_buffer) < self._parse_needed:
-                # nothing between here and that length can change the parse's answer, so re-running it is pure cost
-                break
-            if self._argv is not None:
-                body, consumed, needed = resp.parse_bulk_element(
-                    self.read_buffer, self._scan_from
-                )
-                if consumed == 0:
-                    self._parse_needed = needed
-                    # a non-zero hint means the header was found and only the body is
-                    # short, so the resume position is spent and would otherwise point
-                    # past this element's own terminator into the next one's
-                    self._scan_from = 0 if needed else self._resume_after_crlf(1)
+        try:
+            while self.read_buffer:
+                if len(self.read_buffer) < self._parse_needed:
+                    # nothing between here and that length can change the parse's answer, so re-running it is pure cost
                     break
-                self._parse_needed = 0
-                self._scan_from = 0
-                del self.read_buffer[:consumed]
-                self._argv.append(body)
-                self._elements_remaining -= 1
-                if self._elements_remaining == 0:
-                    commands.append(self._argv)
-                    self._argv = None
-            elif self.read_buffer[0:1] == b"*":
-                count, consumed, needed = resp.parse_multibulk_header(
-                    self.read_buffer, self._scan_from
-                )
-                if consumed == 0:
-                    self._parse_needed = needed
-                    self._scan_from = self._resume_after_crlf(0)
-                    break
-                self._parse_needed = 0
-                self._scan_from = 0
-                del self.read_buffer[:consumed]
-                # a count of zero is RESP's empty array: the header is consumed and no command comes out of it
-                if count:
-                    self._argv = []
-                    self._elements_remaining = count
-            else:
-                argv, consumed, needed = resp.parse_command(
-                    self.read_buffer, self._scan_from
-                )
-                if consumed == 0:
-                    self._parse_needed = needed
-                    # an inline line ends at a single \n, so there is no pair to be split
-                    # across two reads and nothing to step back for
-                    self._scan_from = len(self.read_buffer)
-                    break
-                self._parse_needed = 0
-                self._scan_from = 0
-                # progress is driven by `consumed`, not by `argv`
-                del self.read_buffer[:consumed]
-                if argv is not None:
-                    commands.append(argv)
+                if self._argv is not None:
+                    body, consumed, needed = resp.parse_bulk_element(
+                        self.read_buffer, self._scan_from, max_value_size=max_value_size
+                    )
+                    if consumed == 0:
+                        self._parse_needed = needed
+                        # a non-zero hint means the header was found and only the body is
+                        # short, so the resume position is spent and would otherwise point
+                        # past this element's own terminator into the next one's
+                        self._scan_from = 0 if needed else self._resume_after_crlf(1)
+                        break
+                    self._parse_needed = 0
+                    self._scan_from = 0
+                    del self.read_buffer[:consumed]
+                    self._argv.append(body)
+                    self._elements_remaining -= 1
+                    if self._elements_remaining == 0:
+                        commands.append(self._argv)
+                        self._argv = None
+                elif self.read_buffer[0:1] == b"*":
+                    count, consumed, needed = resp.parse_multibulk_header(
+                        self.read_buffer, self._scan_from, max_multibulk=max_multibulk
+                    )
+                    if consumed == 0:
+                        self._parse_needed = needed
+                        self._scan_from = self._resume_after_crlf(0)
+                        break
+                    self._parse_needed = 0
+                    self._scan_from = 0
+                    del self.read_buffer[:consumed]
+                    # a count of zero is RESP's empty array: the header is consumed and no command comes out of it
+                    if count:
+                        self._argv = []
+                        self._elements_remaining = count
+                else:
+                    argv, consumed, needed = resp.parse_command(
+                        self.read_buffer, self._scan_from,
+                        max_value_size=max_value_size, max_multibulk=max_multibulk,
+                    )
+                    if consumed == 0:
+                        self._parse_needed = needed
+                        # an inline line ends at a single \n, so there is no pair to be split
+                        # across two reads and nothing to step back for
+                        self._scan_from = len(self.read_buffer)
+                        break
+                    self._parse_needed = 0
+                    self._scan_from = 0
+                    # progress is driven by `consumed`, not by `argv`
+                    del self.read_buffer[:consumed]
+                    if argv is not None:
+                        commands.append(argv)
+        except resp.ProtocolError as exc:
+            # commands parsed ahead of the failure ride on the exception rather than
+            # being lost with this frame -- the connection still has to be told, and
+            # told to close, which is why this re-raises rather than returning what
+            # was parsed so far
+            raise BatchProtocolError(exc.message, commands) from exc
         return commands
 
     def _resume_after_crlf(self, floor: int) -> int:

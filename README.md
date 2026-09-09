@@ -28,12 +28,23 @@ than it used to — `PING`, `SET`, `GET`, `INCR`, `LPUSH`, `RPUSH`, `LPOP` and `
 complete now — and exits at `SADD`, the first command in its sequence this server does
 not implement at all.
 
-**Nothing bounds how much memory a client can use.** There is no cap on key count or
-value size, no cap on total keyspace size, and no eviction policy to fall back on if
-there were — a client with nothing but `SET` can grow the process until the host runs
-out of memory. The read buffer is uncapped too: an unterminated command grows it for as
-long as a client keeps sending, which at least costs that client a byte per byte. Queued
-replies are the cheap one — one 64 KiB write holds a few thousand `GET`s — about three thousand at a
+**Nothing bounds how much memory a client can use.** There is no cap on key count, no
+cap on total keyspace size, and no eviction policy to fall back on if there were — a
+client with nothing but `SET` can grow the process until the host runs out of memory.
+The read buffer is uncapped too: an unterminated command grows it for as long as a
+client keeps sending, which at least costs that client a byte per byte — that is the one
+case the two caps below do not reach, because a line with no terminator yet has no
+declared length to compare against anything. A line that *has* ended is bounded even
+with no flag of its own: an inline command is refused past 64 KiB, the reference's own
+ceiling, because it is complete the moment its newline arrives and nothing later can
+reach it. `--max-value-size BYTES` refuses a single declared bulk element — including
+the command name and any key, not only what a human would call the value — that
+declares more than BYTES, before a body byte of it is read; it defaults to 64 MiB, and 0
+turns the check off. `--max-multibulk COUNT` refuses a command declaring more than COUNT
+elements; it defaults to 1,048,576, and 0 turns it off too. Neither bounds anything in
+aggregate — each is a ceiling on one element, or on one command's element count, never on
+a connection's traffic as a whole.
+Queued replies are the cheap one — one 64 KiB write holds a few thousand `GET`s — about three thousand at a
 short sixteen-byte value, and between one and six thousand across ordinary sizes — every
 reply is buffered whole, and the value they all name was stored once, so a few kilobytes
 of request can commit gigabytes. `--output-buffer-limit BYTES` closes a connection whose
@@ -92,8 +103,11 @@ cleared the moment the buffer empties, so an idle connection isn't spinning the 
 
 **One connection's failure is one connection's problem.** A single exception boundary wraps
 the whole per-connection path; anything other than a retryable error closes that connection
-and leaves the server and every other connection running. An unknown command answers with
-an error rather than a disconnect, so a client's own capability probes fail harmlessly.
+and leaves the server and every other connection running. When that error surfaces partway
+through a pipelined batch, whatever already parsed out of the same read is answered first,
+the error is queued after, and the connection closes — in that order, every time. An unknown
+command answers with an error rather than a disconnect, so a client's own capability probes
+fail harmlessly.
 
 **One lookup answers every existence question, with one exception.** `SET`'s `NX`/`XX`
 conditions, `INCR` and `DECR`'s read-modify-write, every type check, and a plain `GET`
@@ -116,5 +130,5 @@ commands/       __init__.py, registry.py, server.py, string.py and list.py; twen
 tests/          pytest suite, run in CI against Python 3.11 and 3.13
 ```
 
-[Design notes](docs/DESIGN.md) cover why each of these is shaped the way it is, and twenty
-deliberate differences from real Redis.
+[Design notes](docs/DESIGN.md) cover why each of these is shaped the way it is, and
+twenty-two deliberate differences from real Redis.
