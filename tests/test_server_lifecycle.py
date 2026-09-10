@@ -1114,11 +1114,12 @@ def test_an_abrupt_disconnect_mid_command_deregisters_untracks_and_clears_the_se
 
 
 def test_an_idle_partial_element_resumes_when_the_rest_arrives(server_and_client):
-    # the header is found but the body is 17 bytes short of complete -- 10 declared,
+    # the header is found but the element is 9 bytes short of complete -- 10 declared,
     # 3 delivered, plus the trailing CRLF neither reached yet -- so _parse_needed holds
-    # that length instead of the header being rescanned on every later readable event
-    # while the client sits idle. the rest arriving completes SET k abcdefghij, and the
-    # reply is what proves the idle state resumed rather than being discarded
+    # 17, the element's whole length rather than what is missing from it, instead of the
+    # header being rescanned on every later readable event while the client sits idle.
+    # the rest arriving completes SET k abcdefghij, and the reply is what proves the
+    # idle state resumed rather than being discarded
     server, client = server_and_client
     conn = next(iter(server._connections))
     client.sendall(b"*3\r\n$3\r\nSET\r\n$1\r\nk\r\n$10\r\nabc")

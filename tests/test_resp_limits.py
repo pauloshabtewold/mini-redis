@@ -120,9 +120,10 @@ def test_a_declared_size_exactly_at_the_cap_is_accepted():
 
 
 def test_a_zero_cap_disables_and_is_the_default():
-    # 0 disables each cap and is every parameter's default, so every existing
-    # call site that passes no cap -- 48 parse_command sites, 3 parse_bulk_element,
-    # 3 parse_multibulk_header -- keeps its present, uncapped behaviour with no edit
+    # 0 disables each cap and is every parameter's default, so every existing call site
+    # that passes no cap keeps its present, uncapped behaviour with no edit. stated
+    # without a count on purpose: an enumeration here is wrong again the next time a
+    # test module calls the parser
     whole = b"*3\r\n$3\r\nSET\r\n$1\r\nk\r\n$1\r\nv\r\n"
     expected = ([b"SET", b"k", b"v"], len(whole), 0)
     assert resp.parse_command(whole) == expected
@@ -191,10 +192,10 @@ def test_an_inline_line_exactly_at_the_ceiling_is_accepted():
 
 
 def test_an_unterminated_inline_line_is_bounded_by_no_size():
-    # this test's whole job is to fail if that deferral is closed by accident.
-    # A line that has not ended has no declared length to compare against anything, so it
-    # stays unbounded here, deferred to the future --incomplete-command-timeout flag
-    # -- a pinned absence rather than a pinned behaviour, and it reads as deletable
-    # without this comment
+    # a line that has not ended has no declared length to compare against anything, so it
+    # stays unbounded here, deferred to the future --incomplete-command-timeout flag.
+    # this test's whole job is to fail if that deferral is closed by accident -- a pinned
+    # absence rather than a pinned behaviour, and it reads as deletable without this
+    # comment
     line = b"ECHO " + b"A" * (resp.MAX_INLINE_SIZE * 3)
     assert resp.parse_command(line) == (None, 0, 0)

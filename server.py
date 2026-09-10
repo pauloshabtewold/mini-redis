@@ -21,12 +21,15 @@ SELECT_TIMEOUT_SECONDS = 0.1
 # 0 is unlimited, which is what the reference defaults to for an ordinary client. see
 # Server._flush for why exceeding this closes the connection instead of slowing it down.
 DEFAULT_OUTPUT_BUFFER_LIMIT = 0
-# the reference's own default for an ordinary client; well above the largest value the suite
-# round-trips and below anything that risks OOMing this machine. --max-value-size bounds
-# every inbound bulk element, including the command name and any key, not only what a
-# human would call "the value"
+# a local choice and not the reference's: proto-max-bulk-len defaults to 512 MiB there,
+# eight times this. 64 MiB is well above the largest value the suite round-trips and below
+# anything that risks OOMing this machine. --max-value-size bounds every inbound bulk
+# element, including the command name and any key, not only what a human would call
+# "the value"
 DEFAULT_MAX_VALUE_SIZE = 64 * 1024 * 1024
-# the reference's own default, the same source and the same margin as the value cap above
+# this project's own number as well, and with less to borrow: the reference has no
+# multibulk default at all, and refuses a count only above INT_MAX -- which is
+# MAX_MULTIBULK_COUNT in resp.py, checked separately and unconditionally
 DEFAULT_MAX_MULTIBULK = 1024 * 1024
 
 # logging.lastResort sends an ERROR record to stderr with no configuration
