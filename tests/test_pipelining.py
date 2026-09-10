@@ -114,7 +114,7 @@ def _inproc_read_exactly(server, client, count, seconds=DEADLINE_SECONDS):
     return bytes(got)
 
 
-# --- the four tests ------------------------------------------------------------------
+# --- the tests ------------------------------------------------------------------------
 
 
 def test_a_thousand_pipelined_sets_are_all_answered_with_none_dropped(mini_redis_server):
@@ -208,4 +208,65 @@ def test_a_reply_too_large_for_one_send_is_queued_and_drained_across_writable_ev
         print(
             "drain witness: %d of %d bytes were still queued after the first flush"
             % (queued, len(want))
+        )
+
+
+# --- the write side's own syscall count, and the local helper that counts it ----------
+
+
+# swapped onto a live connection after accept: send() still reaches the real socket, so
+# what the client receives is untouched -- this only counts how many times flush() had
+# to call into it, which is what turns "one flush for the whole batch" from an inference
+# about buffer sizes into a count of syscalls
+class _SendCounter:
+    def __init__(self, sock):
+        self._sock = sock
+        self.send_calls = 0
+
+    def fileno(self):
+        return self._sock.fileno()
+
+    def recv(self, bufsize):
+        return self._sock.recv(bufsize)
+
+    def send(self, data):
+        self.send_calls += 1
+        return self._sock.send(data)
+
+    def close(self):
+        self._sock.close()
+
+
+def test_a_pipelined_batch_is_flushed_once_not_once_per_command():
+    # short keys and a count well under RECV_SIZE (65536 in connection.py): the whole
+    # request has to land in one recv() for take_commands() to hand _dispatch_batch
+    # every command in a single call -- a batch that arrived split would cost two
+    # honest flushes, which is not the defect this test exists to catch
+    count = 200
+    keys = [b"k%d" % i for i in range(count)]
+    values = [b"v%d" % i for i in range(count)]
+    batch = b"".join(_encode_command(b"SET", k, v) for k, v in zip(keys, values))
+    expected = b"+OK\r\n" * count
+
+    with listening() as (server, connect, _listener):
+        client = connect()
+        pump(server)
+        conn = next(iter(server._connections))
+        # the selector's registration is keyed on conn, not on this socket, so
+        # swapping it in after accept leaves the registration and conn.fileno() both intact
+        conn._sock = _SendCounter(conn._sock)
+
+        client.sendall(batch)
+        client.setblocking(False)
+        reply = _inproc_read_exactly(server, client, len(expected))
+
+        # byte-exact equality against `count` copies of +OK only holds if the batch
+        # really carried `count` commands and came back with `count` replies -- so
+        # send_calls == 1 below cannot pass vacuously against a batch that never formed
+        assert reply == expected, (len(reply), len(expected))
+        # asserted inside the block: _close flushes once more on the way out, and a
+        # count taken after that is a count of the batch plus the teardown
+        assert conn._sock.send_calls == 1, (
+            "one flush for the whole batch should cost one send(), got %d"
+            % conn._sock.send_calls
         )
