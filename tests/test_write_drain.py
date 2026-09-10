@@ -106,7 +106,11 @@ def test_the_output_buffer_limit_is_off_by_default():
     # the reference leaves this off for an ordinary client, and a server that disconnects
     # where the reference does not is a divergence nobody asked for
     assert build_arg_parser().parse_args([]).output_buffer_limit == 0
-    assert Server(0).output_buffer_limit == 0
+    server = Server(0)
+    try:
+        assert server.output_buffer_limit == 0
+    finally:
+        server._loop.close()
 
 
 def test_no_limit_lets_a_queued_reply_grow(make_connection):

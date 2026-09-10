@@ -127,29 +127,50 @@ def test_take_commands_consumes_input_that_yields_no_command(pair):
 
 def test_take_commands_does_not_reparse_a_large_bulk_from_byte_zero(pair, monkeypatch):
     # a growing buffer re-parsed from byte zero on every readable event turns one large
-    # command into a quadratic number of parses; _parse_needed exists to make this O(1)
+    # command into a quadratic number of parses; _parse_needed exists to make this O(1).
+    # what is counted is parse_multibulk_header and parse_bulk_element, the two functions
+    # take_commands() actually drives for this wire shape -- it never calls parse_command
+    # for a multibulk, so a shim on parse_command would count zero calls no matter how
+    # much rescanning happened, and a bound compared against zero would pass either way
     conn, _peer = pair
-    calls = 0
-    real_parse_command = resp.parse_command
+    header_calls = 0
+    element_calls = 0
+    real_parse_multibulk_header = resp.parse_multibulk_header
+    real_parse_bulk_element = resp.parse_bulk_element
 
-    def counting_parse_command(buf):
-        nonlocal calls
-        calls += 1
-        return real_parse_command(buf)
+    def counting_parse_multibulk_header(buf, search_from=0, *, max_multibulk=0):
+        nonlocal header_calls
+        header_calls += 1
+        return real_parse_multibulk_header(buf, search_from, max_multibulk=max_multibulk)
 
-    monkeypatch.setattr(resp, "parse_command", counting_parse_command)
+    def counting_parse_bulk_element(buf, search_from=1, *, max_value_size=0):
+        nonlocal element_calls
+        element_calls += 1
+        return real_parse_bulk_element(buf, search_from, max_value_size=max_value_size)
+
+    monkeypatch.setattr(resp, "parse_multibulk_header", counting_parse_multibulk_header)
+    monkeypatch.setattr(resp, "parse_bulk_element", counting_parse_bulk_element)
 
     body = b"a" * 200_000
     wire = b"*1\r\n$%d\r\n" % len(body) + body + b"\r\n"
 
     chunk_size = 500
+    invocations = 0
     commands = []
     for start in range(0, len(wire), chunk_size):
         conn.read_buffer.extend(wire[start:start + chunk_size])
         commands.extend(conn.take_commands())
+        invocations += 1
 
     assert commands == [[body]]
-    assert calls <= 3, calls
+    # the counter has to have moved: a shim wired to the wrong function leaves it at
+    # zero, and an upper bound alone does not catch that -- <= 3 is satisfied by 0 too
+    assert header_calls > 0 and element_calls > 0, (header_calls, element_calls)
+    total_calls = header_calls + element_calls
+    # the real assertion is the ratio: three parses total against `invocations` readable
+    # events on a buffer that grew to 200 KB in 500-byte steps. a parser re-scanning from
+    # byte zero on every event would make total_calls track invocations, not stay flat at 3
+    assert total_calls <= 3, (total_calls, invocations)
 
 
 def test_take_commands_propagates_protocol_error(pair):
