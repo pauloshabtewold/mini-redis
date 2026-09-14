@@ -1,13 +1,17 @@
-"""Entry point: CLI flags, signal handling, and the event loop's three callback bodies. Nothing is scheduled to run periodically."""
+"""Entry point: CLI flags, signal handling, the event loop's three callback bodies, and the periodic tick that runs after every select() return."""
 
 import argparse
 import contextlib
 import logging
+import os
 import signal
 import socket
+import sys
+import time
 from collections.abc import Callable
 
 import commands
+import persistence
 import resp
 from connection import BatchProtocolError, Connection, Role
 from event_loop import EventLoop
@@ -16,7 +20,7 @@ from store import Store
 DEFAULT_PORT = 6379
 # the replication sync command is unauthenticated and is safe only bound to loopback.
 LISTEN_HOST = "127.0.0.1"
-# bounds how long a stop signal waits to be noticed, and is the floor of this design's periodic intervals (a 100 ms expiry sweep).
+# bounds how long a stop signal waits to be noticed, and floors both --expiry-sweep-interval and --snapshot-interval: the default sweep interval is equal to it, and either deadline is checked only when run_once() returns -- see Server._tick -- so it can be noticed up to one timeout late.
 SELECT_TIMEOUT_SECONDS = 0.1
 # 0 is unlimited, which is what the reference defaults to for an ordinary client. see
 # Server._flush for why exceeding this closes the connection instead of slowing it down.
@@ -31,6 +35,31 @@ DEFAULT_MAX_VALUE_SIZE = 64 * 1024 * 1024
 # multibulk default at all, and refuses a count only above INT_MAX -- which is
 # MAX_MULTIBULK_COUNT in resp.py, checked separately and unconditionally
 DEFAULT_MAX_MULTIBULK = 1024 * 1024
+# relative to the process's current working directory, not to this file or the
+# repository root: a server launched from a different directory reads and writes its
+# snapshot there
+DEFAULT_SNAPSHOT_PATH = "./dump.mrdb"
+# a local choice and not the reference's: its own save policy is a three-tier
+# changes-based 3600 1 300 100 60 10000, where this is one flat interval that runs
+# unconditionally, never skipped for having nothing new to write
+DEFAULT_SNAPSHOT_INTERVAL_SECONDS = 60
+# refusing to start over a corrupt file is the default; --ignore-snapshot is the
+# explicit escape hatch for bringing a server back up past one anyway
+DEFAULT_IGNORE_SNAPSHOT = False
+# matches the reference's own cadence: hz is 10 on redis-server 7.2.7, so its
+# background cycle runs every 100 ms too -- the one number on this page the reference
+# actually supplies
+DEFAULT_EXPIRY_SWEEP_INTERVAL_MS = 100
+# the sweep's own constants -- 20 sampled keys, a re-loop past a quarter expired, a
+# 1 ms budget -- are real Redis SOURCE-CODE constants inside activeExpireCycle rather
+# than CONFIG GET values: a running server does not expose them through CONFIG GET, so
+# they cannot be read off one
+SWEEP_SAMPLE_SIZE = 20
+SWEEP_RELOOP_THRESHOLD = 0.25
+SWEEP_BUDGET_SECONDS = 0.001
+# the one site --expiry-sweep-interval's milliseconds are turned into the seconds
+# time.monotonic() deals in
+_MILLISECONDS_PER_SECOND = 1000
 
 # logging.lastResort sends an ERROR record to stderr with no configuration
 logger = logging.getLogger(__name__)
@@ -52,8 +81,8 @@ def _port(value: str) -> int:
 
 
 def _check_not_negative(value: int, label: str) -> None:
-    # the "0 disables, a negative number is refused" rule, stated once and used by all
-    # three CLI validators below and by Server.__init__. `limit and len(buf) >
+    # the "0 disables, a negative number is refused" rule, stated once and used by every
+    # CLI validator below and by Server.__init__. `limit and len(buf) >
     # limit` reads any non-zero value as "enabled", and every buffer length is greater
     # than a negative number -- including zero -- so a negative limit reaching that
     # check would close every connection after its first reply while the server still
@@ -65,8 +94,37 @@ def _check_not_negative(value: int, label: str) -> None:
             "%s cannot be negative; 0 disables the check, not %d" % (label, value))
 
 
+def _load_initial_store(
+    snapshot_path: str | None, ignore_snapshot: bool, snapshot_interval: int
+) -> Store:
+    if snapshot_path is None:
+        return Store()
+    if ignore_snapshot:
+        if os.path.exists(snapshot_path):
+            if snapshot_interval:
+                logger.warning(
+                    "ignoring the snapshot at %s; it will be replaced at the next "
+                    "%d-second interval", snapshot_path, snapshot_interval,
+                )
+            else:
+                logger.warning(
+                    "ignoring the snapshot at %s; periodic saving is off, so the file "
+                    "is left in place", snapshot_path,
+                )
+        return Store()
+    try:
+        return persistence.load(snapshot_path)
+    # a missing file is a first run, not a failure, and is treated the same as
+    # snapshot_path=None above. anything else persistence.load raises -- a
+    # corrupt file -- is left uncaught here, so it propagates out of __init__ and
+    # refuses construction rather than starting empty over a snapshot that failed
+    # to load and then overwriting it at the next save
+    except FileNotFoundError:
+        return Store()
+
+
 def _numeric_limit(value: str, label: str, unit: str) -> int:
-    # shared by the three CLI validators below, so a value typed on the command line
+    # shared by every CLI validator below, so a value typed on the command line
     # and a value passed straight to Server.__init__ are refused by the same rule
     try:
         number = int(value)
@@ -90,6 +148,14 @@ def _max_value_size(value: str) -> int:
 
 def _max_multibulk(value: str) -> int:
     return _numeric_limit(value, "max multibulk count", "elements")
+
+
+def _snapshot_interval(value: str) -> int:
+    return _numeric_limit(value, "snapshot interval", "seconds")
+
+
+def _expiry_sweep_interval(value: str) -> int:
+    return _numeric_limit(value, "expiry sweep interval", "milliseconds")
 
 
 def build_arg_parser() -> argparse.ArgumentParser:
@@ -119,6 +185,45 @@ def build_arg_parser() -> argparse.ArgumentParser:
         metavar="COUNT",
         help="refuse a command declaring more than COUNT elements; 0 disables the check",
     )
+    parser.add_argument(
+        "--snapshot-path",
+        default=DEFAULT_SNAPSHOT_PATH,
+        metavar="PATH",
+        help="load a snapshot from PATH on startup and save to it every "
+             "--snapshot-interval; refuses to start if the file is corrupt unless "
+             "--ignore-snapshot is given",
+    )
+    parser.add_argument(
+        "--snapshot-interval",
+        type=_snapshot_interval,
+        default=DEFAULT_SNAPSHOT_INTERVAL_SECONDS,
+        metavar="SECONDS",
+        help="save a snapshot to --snapshot-path every SECONDS; 0 disables saving",
+    )
+    parser.add_argument(
+        "--expiry-sweep-interval",
+        type=_expiry_sweep_interval,
+        default=DEFAULT_EXPIRY_SWEEP_INTERVAL_MS,
+        metavar="MILLISECONDS",
+        help="run the expiry sweep no sooner than every MILLISECONDS; on an otherwise idle "
+             f"loop, no later than that plus one {SELECT_TIMEOUT_SECONDS} second select() "
+             "timeout -- a snapshot save or a long command holding the loop delays it "
+             "further; not a promise about any one key: a key nobody looks up is reclaimed "
+             "on some later pass rather than at its deadline; 0 disables the sweep",
+    )
+    parser.add_argument(
+        "--ignore-snapshot",
+        # no default= naming DEFAULT_IGNORE_SNAPSHOT, unlike every flag above: store_true
+        # already defaults to False, which is that constant's own value, so nothing here
+        # reads it -- Server.__init__ is what actually consults DEFAULT_IGNORE_SNAPSHOT,
+        # for a caller that builds a Server directly instead of going through this parser
+        action="store_true",
+        help="start with an empty keyspace instead of loading --snapshot-path: the "
+             "snapshot is ignored whether or not it is readable, so a good one is "
+             "discarded too, and the next --snapshot-interval overwrites it -- unless "
+             "--snapshot-interval is 0, which leaves the file in place instead. the "
+             "escape hatch for a file that refuses to load",
+    )
     return parser
 
 
@@ -129,6 +234,14 @@ class Server:
         output_buffer_limit: int = DEFAULT_OUTPUT_BUFFER_LIMIT,
         max_value_size: int = DEFAULT_MAX_VALUE_SIZE,
         max_multibulk: int = DEFAULT_MAX_MULTIBULK,
+        # None, not DEFAULT_SNAPSHOT_PATH: the three defaults below mirror what the CLI
+        # already defaults to, but a constructor default of ./dump.mrdb would write into
+        # whatever directory happens to be current when something builds a Server
+        # directly, which is every test in this suite and anything embedding it
+        snapshot_path: str | None = None,
+        snapshot_interval: int = DEFAULT_SNAPSHOT_INTERVAL_SECONDS,
+        expiry_sweep_interval: int = DEFAULT_EXPIRY_SWEEP_INTERVAL_MS,
+        ignore_snapshot: bool = DEFAULT_IGNORE_SNAPSHOT,
     ) -> None:
         # both checked here as well as in the parser, for the same reason: Server is
         # constructed directly by tests and will be by anything embedding this, so a
@@ -148,17 +261,29 @@ class Server:
         self.max_value_size = max_value_size
         _check_not_negative(max_multibulk, "max_multibulk")
         self.max_multibulk = max_multibulk
+        _check_not_negative(snapshot_interval, "snapshot_interval")
+        self.snapshot_interval = snapshot_interval
+        _check_not_negative(expiry_sweep_interval, "expiry_sweep_interval")
+        self.expiry_sweep_interval = expiry_sweep_interval
+        self._sweep_interval_seconds = expiry_sweep_interval / _MILLISECONDS_PER_SECOND
+        self.snapshot_path = snapshot_path
+        self.ignore_snapshot = ignore_snapshot
+        # the last validation before self._loop below: every refusal in this constructor
+        # lands before the selector opens, so a refused construction -- here, a corrupt
+        # snapshot -- leaks no descriptor for the caller to close
+        self._store = _load_initial_store(snapshot_path, ignore_snapshot, snapshot_interval)
         self._connections: set[Connection] = set()
         self._loop = EventLoop(
             self._on_accept, self._on_readable, self._on_writable, SELECT_TIMEOUT_SECONDS
         )
-        # per-process state, constructed here rather than a field on Connection --
-        # event_loop.py imports Connection and nothing else, and a field here would reach
-        # it transitively -- and rather than a module-level singleton, because two servers
-        # in one process would then share a keyspace
-        self._store = Store()
         self._running = False
         self._ran = False
+        # None means "not scheduled": a Server constructed and left unrun fires neither
+        # arm, and an arm whose interval is 0 -- or, for the snapshot, with no path --
+        # never gets a deadline in the first place. _arm_periodic_tasks() sets these
+        # from time.monotonic() once run() actually starts it
+        self._next_sweep_at: float | None = None
+        self._next_snapshot_at: float | None = None
 
     @property
     def connected_clients(self) -> int:
@@ -217,6 +342,20 @@ class Server:
             # not wrapped: measured, handleError swallows the OSError family, so a full disk or a gone pipe cannot raise here. a closed stream raises ValueError straight through it, which nothing here can produce -- no handler is configured and nothing closes stderr
             logger.exception("closing %s after an unhandled exception", conn.addr)
             self._abandon(conn)
+
+    def _guard_task(self, what: str, step: Callable[[], None]) -> None:
+        # the periodic tasks' own boundary: _guard above takes a Connection and
+        # _abandons it on failure, which a periodic task has none of. one OSError from
+        # the snapshot path -- a full disk -- would otherwise reach the top of the only
+        # thread this server has
+        # no BlockingIOError/InterruptedError carve-out to match _guard's: those name a
+        # non-blocking socket operation that just needs retrying on the next readiness
+        # event, and neither periodic task touches a socket -- a blocked write here is a
+        # slow disk, not a signal to come back later
+        try:
+            step()
+        except Exception:
+            logger.exception("%s failed", what)
 
     def _abandon(self, conn: Connection) -> None:
         # the one place a close that itself fails is handled, reached from the boundary above and from the shutdown sweep, so a failing close ends the same way wherever it is noticed. every statement in _close can raise, and a raise from the boundary's own recovery reaches the top of the only thread this server has
@@ -353,6 +492,63 @@ class Server:
         conn.server = None
         conn.close()
 
+    def _tick(self) -> None:
+        # each deadline is re-taken from the clock rather than advanced from the one it missed:
+        # a save blocks this thread until the whole keyspace is serialized, which on a large one
+        # outlasts several sweep intervals, and firing every skipped sweep back to back the
+        # moment it returns would land the whole backlog in the p99 the sampling algorithm
+        # exists to protect
+        now = time.monotonic()
+        if self._next_sweep_at is not None and now >= self._next_sweep_at:
+            self._next_sweep_at = now + self._sweep_interval_seconds
+            self._guard_task("expiry sweep", self._sweep_expired)
+        if self._next_snapshot_at is not None and now >= self._next_snapshot_at:
+            self._next_snapshot_at = now + self.snapshot_interval
+            self._guard_task("snapshot save", self._save_snapshot)
+
+    def _sweep_expired(self) -> None:
+        # bounded by elapsed time and nothing else -- no iteration cap -- because a
+        # sample's own cost is not the quantity the 1 ms budget protects; an iteration
+        # cap bounds dict lookups, and if one sampling step ever turns expensive, only a
+        # time budget still bounds the stall this puts in the p99
+        deadline = time.monotonic() + SWEEP_BUDGET_SECONDS
+        while time.monotonic() < deadline:
+            sampled, expired = self._store.sample_and_expire(SWEEP_SAMPLE_SIZE)
+            # sampled == 0 is checked before the division to its right, not only to stop
+            # on an empty expiry index: without it, an empty index divides zero by zero
+            # on that clause instead of breaking out of the loop
+            if sampled == 0 or expired / sampled <= SWEEP_RELOOP_THRESHOLD:
+                break
+        # drained once per tick rather than once per sampling pass: server.py's other
+        # drain, inside _dispatch_batch, runs once per dispatched command and would
+        # otherwise attribute these DELs to whichever command dispatches next
+        self._store.take_effects()
+
+    def _save_snapshot(self) -> None:
+        # runs whether or not the keyspace changed since the last save -- no dirty-key
+        # counter, so a save is a flat cost paid on the interval rather than a decision
+        # self.snapshot_path is never None here: _tick() only reaches this call once
+        # _next_snapshot_at holds a deadline, and _arm_periodic_tasks() only ever sets
+        # that deadline once snapshot_path is confirmed not None
+        persistence.save(self._store, self.snapshot_path)
+
+    def _arm_periodic_tasks(self) -> None:
+        # its own method for the same reason _tick() already is one: callable on its
+        # own, so a test can exercise one arming guard without driving run()'s loop
+        # taken once, in this method, rather than inside _tick: both arms' first
+        # deadlines are relative to when the server actually starts running, not to
+        # when it was built
+        now = time.monotonic()
+        if self.expiry_sweep_interval:
+            self._next_sweep_at = now + self._sweep_interval_seconds
+        # snapshot_interval alone is not enough in this method: its default is a
+        # nonzero 60 while snapshot_path defaults to None, so a Server built with no
+        # path and otherwise left at its defaults still has a nonzero interval, and
+        # only this second check keeps that combination from arming a save with
+        # nowhere to write it
+        if self.snapshot_interval and self.snapshot_path is not None:
+            self._next_snapshot_at = now + self.snapshot_interval
+
     def _request_stop(self, signum, frame) -> None:
         self._running = False
 
@@ -375,6 +571,7 @@ class Server:
             raise RuntimeError("this Server has already run; construct a new one")
         # raised before the handlers exist, because a signal delivered between installing them and this line would be cleared by the handler and then overwritten here.
         self._running = True
+        self._arm_periodic_tasks()
         # restored on the way out: run() is also called in-process, and a handler left pointing at a discarded Server swallows every later signal in that process
         restore = [
             (signal.SIGINT, signal.signal(signal.SIGINT, self._request_stop)),
@@ -391,6 +588,11 @@ class Server:
             try:
                 while self._running:
                     self._loop.run_once()
+                    # every iteration, not only when a socket was ready: run_once()
+                    # itself returns at least every SELECT_TIMEOUT_SECONDS even with
+                    # nothing to read or write, which is what lets an idle server with no
+                    # connections still sweep and save on schedule
+                    self._tick()
             finally:
                 self._shutdown(listener)
         finally:
@@ -402,9 +604,23 @@ class Server:
 
 def main(argv=None) -> None:
     args = build_arg_parser().parse_args(argv)
-    Server(
-        args.port, args.output_buffer_limit, args.max_value_size, args.max_multibulk
-    ).run()
+    try:
+        server = Server(
+            args.port, args.output_buffer_limit, args.max_value_size, args.max_multibulk,
+            snapshot_path=args.snapshot_path,
+            snapshot_interval=args.snapshot_interval,
+            expiry_sweep_interval=args.expiry_sweep_interval,
+            ignore_snapshot=args.ignore_snapshot,
+        )
+    except persistence.SnapshotError as exc:
+        # this specific exception, not a bare Exception: anything else raised while
+        # constructing a Server -- a bug, an unrelated OSError -- is left to crash with
+        # its own traceback rather than being folded into a one-line CLI message that
+        # was never meant to describe it
+        # exit 1 rather than argparse's 2: a corrupt snapshot is not a usage error
+        print(f"error: {exc}", file=sys.stderr)
+        raise SystemExit(1)
+    server.run()
 
 
 if __name__ == "__main__":

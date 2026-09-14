@@ -38,10 +38,14 @@ def wait_until_listening(port, deadline):
 
 
 @pytest.fixture
-def mini_redis_server():
+def mini_redis_server(tmp_path):
     port = free_port()
     proc = subprocess.Popen(
-        [sys.executable, str(REPO_ROOT / "server.py"), "--port", str(port)],
+        # a path under this test's own tmp_path, not the default ./dump.mrdb: a snapshot
+        # written to the repository's own working directory would outlive the test that
+        # wrote it and load back into whichever test runs against this fixture next
+        [sys.executable, str(REPO_ROOT / "server.py"), "--port", str(port),
+         "--snapshot-path", str(tmp_path / "dump.mrdb")],
         stdout=subprocess.DEVNULL,
     )
     # server.py prints its bind line to stdout on every launch, unconditionally. the

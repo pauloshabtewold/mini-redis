@@ -1,14 +1,14 @@
 """The keyspace's contract over sequences this module builds, not chosen input.
 
 test_store.py names an input and the output it expects. This module instead runs random
-sequences of write/remove/expire_at/lookup/take_effects over a small key alphabet and
-checks, after every single operation, that the two structures a `Store` keeps still agree:
-`check_invariants()` holds, every key in `_expiry` is in `_data`, every value in `_data`
-is a kind `kind_of` recognizes, every queued effect is exactly `[b"DEL", <bytes>]`, and
-any key a `lookup` returned non-`None` for is still in `_data`. A second test asserts the
-corpus itself is wide enough to matter: at least one round holds both a `bytes` and a
-`deque` value in `_data` at the same time, so the invariant above is actually exercised
-across kinds and not just vacuously true over a single one.
+sequences of write/remove/expire_at/lookup/take_effects/sample_and_expire over a small
+key alphabet and checks, after every single operation, that the structures a `Store`
+keeps still agree: `check_invariants()` holds, every key in `_expiry` is in `_data`,
+every key in the sampling index maps back to its own slot, every value in `_data` is a
+kind `kind_of` recognizes, every queued effect is exactly `[b"DEL", <bytes>]`, and any
+key a `lookup` returned non-`None` for is still in `_data`. Two further tests assert the
+corpus is wide enough to matter: one round holds a `bytes` and a `deque` value at once,
+and one moves a key out of a middle sampling slot, so neither is vacuously true.
 
 The corpus is built from a fixed seed, matching test_resp_properties.py's shape (there is
 no `hypothesis` dependency in this project and none is added here). A failure names the
@@ -32,7 +32,7 @@ VALUES = [b"", b"v", b"value", b"\x00\xff", deque(), deque([b"v"])]
 # both fire, and the boundary itself (a deadline equal to now_ms() is expired) gets exercised
 DEADLINE_OFFSETS = [-10_000, -1, 0, 1, 10_000]
 
-OPS = ["write", "remove", "expire_at", "lookup", "take_effects"]
+OPS = ["write", "remove", "expire_at", "lookup", "take_effects", "sample_and_expire"]
 
 
 def _random_sequence(rnd):
@@ -73,6 +73,14 @@ def _apply(store, op):
         return store.lookup(key)
     elif name == "take_effects":
         store.take_effects()
+    elif name == "sample_and_expire":
+        # the key _random_sequence attached to this op is unused: a sample draws from
+        # the whole index rather than acting on the one key every other op takes, the
+        # same shape "take_effects" already has above. the count passed is the size of
+        # the whole key alphabet, never smaller than the index could possibly be, which
+        # keeps this landing on sample_and_expire's own population clamp whenever fewer
+        # than all three keys currently carry a deadline
+        store.sample_and_expire(len(KEYS))
     return None
 
 
@@ -80,6 +88,8 @@ def _assert_invariants_hold(store, op, result):
     store.check_invariants()
     for key in store._expiry:
         assert key in store._data
+    for slot, key in enumerate(store._expiry_keys):
+        assert store._expiry_slots.get(key) == slot
     for value in store._data.values():
         # delegates to the store's own definition of a recognized kind rather than
         # re-listing types here, so this stays honest as a third kind arrives: kind_of()
@@ -122,3 +132,22 @@ def test_random_operation_sequences_reach_a_mixed_kind_keyspace():
                 mixed_rounds += 1
                 break
     assert mixed_rounds > 0, "no round ever held a bytes value and a list value at once"
+
+
+def test_random_operation_sequences_move_a_key_out_of_a_middle_sampling_slot():
+    # exercised only when the removed key sits in a middle slot and the index holds more
+    # than one key -- a corpus that never grows the index past one entry would leave the
+    # swap-delete's relocation branch untested while every invariant above still holds
+    rnd = random.Random(SEED)
+    moved_rounds = 0
+    for _ in range(ROUNDS):
+        store = Store()
+        for op in _random_sequence(rnd):
+            before_slots = dict(store._expiry_slots)
+            _apply(store, op)
+            moved = [key for key, slot in before_slots.items()
+                     if key in store._expiry_slots and store._expiry_slots[key] != slot]
+            if moved:
+                moved_rounds += 1
+                break
+    assert moved_rounds > 0, "no round ever moved a key out of a middle sampling slot"

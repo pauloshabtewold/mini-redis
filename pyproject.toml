@@ -36,5 +36,6 @@ pythonpath = ["."]
 # test, it parks it: the reply never ships and the client waits out its own deadline. that
 # turns a one-character regression into a run that hangs until CI's own timeout kills it,
 # with no assertion, traceback or log line naming the cause. this bounds it to a failure.
-# well above the slowest test here, which is the INCR burst at ~6s against its own 120s cap
+# 300 is headroom over the suite's slowest test rather than a figure tuned to any one of
+# them, so the number stays right however the mix of tests in the suite shifts over time.
 timeout = 300

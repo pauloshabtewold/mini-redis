@@ -1,5 +1,6 @@
 """The keyspace, the expiry index, and the pending-effects queue."""
 
+import random
 import time
 from collections import deque
 from collections.abc import Iterator
@@ -33,6 +34,16 @@ class Store:
         self._data: dict[bytes, object] = {}
         self._expiry: dict[bytes, int] = {}
         self._effects: list[list[bytes]] = []
+        # a uniform sample over the keys that carry a deadline has to draw from a
+        # sequence, and materialising one from _expiry every tick costs O(n) per tick --
+        # unaffordable at the sizes this runs against forever on an idle server. the list
+        # and its index keep that draw O(1), at the cost of maintaining both on every
+        # write to _expiry. the index earns its place alongside the list rather than
+        # being dropped in favour of it alone -- without it, removing an arbitrary key
+        # back out of the list means searching for it first, exactly the O(n) this pair
+        # exists to avoid
+        self._expiry_keys: list[bytes] = []
+        self._expiry_slots: dict[bytes, int] = {}
 
     def now_ms(self) -> int:
         # wall clock, not monotonic: PEXPIREAT is Unix milliseconds by protocol, and a
@@ -64,7 +75,7 @@ class Store:
         deadline = self._expiry.get(key)
         if self._has_passed(deadline, self.now_ms()):
             # the DEL this produces goes on the queue rather than back to the caller: its
-            # other producer will be the active expiry sweep, running outside dispatch
+            # other producer is the active expiry sweep, running outside dispatch
             # entirely, after select() returns, with no command and no handler to return
             # one from
             self.remove(key)
@@ -74,13 +85,29 @@ class Store:
             raise WrongTypeError()
         return value
 
+    def _drop_deadline(self, key: bytes) -> None:
+        # tested against None rather than for truth: a deadline of 0 is a legal past
+        # deadline and falsy, and `if not self._expiry.pop(key, None):` reads it as
+        # absent and leaves the sampling index holding a key with no deadline
+        if self._expiry.pop(key, None) is None:
+            return
+        slot = self._expiry_slots.pop(key)
+        last_key = self._expiry_keys.pop()
+        # moving the list's last entry into the vacated slot avoids shifting everything
+        # after it, which is what keeps this O(1) rather than O(n). skipped when key is
+        # itself the last entry: last_key then equals key, and running the two lines
+        # below would undo the pop two lines above, reinserting the very key it removed
+        if last_key != key:
+            self._expiry_keys[slot] = last_key
+            self._expiry_slots[last_key] = slot
+
     def write(self, key: bytes, value: object, *, keep_ttl: bool) -> None:
         # keyword-only and undefaulted because its two callers disagree on the answer:
         # plain SET discards whatever TTL was there, INCR preserves it, and a default that
         # picked wrong for either one is a key vanishing seconds after a routine refresh
         self._data[key] = value
         if not keep_ttl:
-            self._expiry.pop(key, None)
+            self._drop_deadline(key)
 
     def remove(self, key: bytes) -> bool:
         # the only thing that may delete from _data or _expiry -- DEL's own primitive, and
@@ -89,7 +116,7 @@ class Store:
         # LPOP/DEL pair instead of the LPOP alone
         present = key in self._data
         self._data.pop(key, None)
-        self._expiry.pop(key, None)
+        self._drop_deadline(key)
         return present
 
     def expire_at(self, key: bytes, deadline_ms: int) -> None:
@@ -97,7 +124,34 @@ class Store:
         # corruption check_invariants watches for, arriving from the other direction
         if key not in self._data:
             raise KeyError(key)
+        # only when the key has no slot yet: appending unconditionally on a re-set TTL
+        # would leave _expiry_keys holding the same key twice with _expiry_slots pointing
+        # at only one of the two, which _drop_deadline's swap-delete has no way to unwind
+        if key not in self._expiry:
+            # the length read here is the key's future index, taken before the append
+            # below changes it -- computing it the other way round would record the key
+            # one slot past where it actually lands
+            self._expiry_slots[key] = len(self._expiry_keys)
+            self._expiry_keys.append(key)
         self._expiry[key] = deadline_ms
+
+    def sample_and_expire(self, count: int) -> tuple[int, int]:
+        # draws without replacement over the maintained index rather than materialising
+        # one from _expiry -- see the sampling index's own comment in __init__. count is
+        # capped at the population since random.sample refuses a sample larger than the
+        # sequence it draws from -- a caller sweeping with one fixed batch size must not
+        # crash merely because a given tick finds fewer keys carrying a deadline than
+        # that. one now_ms() read for the whole draw, not one per key, so a caller
+        # checking many keys does not spend its budget re-reading a clock that has not moved
+        sample = random.sample(self._expiry_keys, min(count, len(self._expiry_keys)))
+        now = self.now_ms()
+        expired = 0
+        for key in sample:
+            if self._has_passed(self._expiry.get(key), now):
+                self.remove(key)
+                self._effects.append([b"DEL", key])
+                expired += 1
+        return len(sample), expired
 
     def deadline(self, key: bytes) -> int | None:
         # no expiry check here -- every caller has already been through lookup()
@@ -145,6 +199,42 @@ class Store:
             if not self._has_passed(deadline, now):
                 yield key
 
+    def snapshot_items(self) -> Iterator[tuple[bytes, bytes, object, int]]:
+        # walks _data directly rather than live_keys(): the same deliberate lookup()
+        # bypass live_count() and live_keys() already are, for the opposite reason --
+        # those hide an expired key from a client asking what exists, and a save doing
+        # the same would lose data a restart could still legitimately expire. removes
+        # nothing and queues nothing, so a save never mutates the store it is reading
+        for key, value in self._data.items():
+            # -1 marks "no deadline" here rather than None, since the field is a plain
+            # int and every real deadline this store ever holds is a non-negative Unix-ms
+            # timestamp. 0 could not serve that role: it is itself a legal, already-past
+            # deadline
+            deadline = self._expiry.get(key, -1)
+            yield key, self.kind_of(value), value, deadline
+
+    @classmethod
+    def from_items(cls, items: Iterator[tuple[bytes, bytes, object, int]]) -> "Store":
+        # a classmethod rather than a function returning Store(): FrozenStore.from_items(...)
+        # must return a FrozenStore, or a frozen-clock caller is handed a wall-clock store
+        # and a deadline test that passes for the wrong reason
+        store = cls()
+        for key, kind, value, expiry in items:
+            if kind == KIND_STRING:
+                store.write(key, value, keep_ttl=False)
+            elif kind == KIND_LIST:
+                # wrapped in deque regardless of what container the source actually used:
+                # kind_of() only recognizes bytes and deque, so a plain list surviving
+                # from here would make every later list command against this key raise a
+                # bare TypeError instead of the WrongTypeError dispatch catches, closing
+                # the connection rather than answering it
+                store.write(key, deque(value), keep_ttl=False)
+            else:
+                raise ValueError("not a snapshot kind this store recognizes: %r" % (kind,))
+            if expiry != -1:
+                store.expire_at(key, expiry)
+        return store
+
     def flush(self) -> int:
         # every key, expired or not -- FLUSHALL empties the keyspace rather than reporting
         # on what was still live in it, which is why this walks _data directly instead of
@@ -177,3 +267,24 @@ class Store:
             raise AssertionError(
                 "expiry index holds keys absent from the keyspace: %r" % (orphans,)
             )
+        # this size comparison catches what the per-key loop below cannot: a key present
+        # in _expiry but missing from _expiry_keys would never be visited by that loop,
+        # since it only walks the sampling index and has nothing there to compare against
+        if (len(self._expiry_keys) != len(self._expiry)
+                or len(self._expiry_slots) != len(self._expiry)):
+            raise AssertionError(
+                "the sampling index disagrees with _expiry on size: %d keys, %d slots, "
+                "%d deadlines" % (len(self._expiry_keys), len(self._expiry_slots),
+                                   len(self._expiry))
+            )
+        for slot, key in enumerate(self._expiry_keys):
+            if key not in self._expiry:
+                raise AssertionError(
+                    "the sampling index holds a key with no deadline: %r" % (key,)
+                )
+            if self._expiry_slots.get(key) != slot:
+                raise AssertionError(
+                    "the sampling index disagrees with itself about %r's slot: "
+                    "_expiry_keys has it at %d, _expiry_slots says %r"
+                    % (key, slot, self._expiry_slots.get(key))
+                )

@@ -1,7 +1,8 @@
 """EXPIRE, PEXPIRE, PEXPIREAT, TTL, PTTL: absolute deadlines and lazy expiry.
 
-A key whose deadline has passed is gone on access before any sweep exists to run, and
-the deadline it was given is an absolute timestamp rather than an offset.
+A key whose deadline has passed is gone on access, and the deadline it was given is an
+absolute timestamp rather than an offset. The active sweep that also collects expired
+keys is exercised in test_periodic_tasks.py, not here.
 """
 
 import pytest

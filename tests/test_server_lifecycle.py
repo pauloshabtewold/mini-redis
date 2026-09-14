@@ -457,7 +457,9 @@ def test_the_default_port_is_the_one_every_client_assumes():
 def test_the_loop_is_built_with_a_bounded_select_timeout():
     # the value the loop is constructed with rather than a measured wall clock, which goes red on a
     # loaded machine for reasons that have nothing to do with the timeout: this bounds how long a
-    # stop signal waits to be noticed and floors every periodic interval this design will have
+    # stop signal waits to be noticed and is the granularity at which the periodic intervals --
+    # the expiry sweep and the snapshot save -- are checked, with the default sweep interval
+    # equal to it
     server = Server(0)
     try:
         assert server._loop._timeout == 0.1

@@ -10,8 +10,11 @@ inline commands, well-formed or not — and its command set is complete: twenty-
 commands — `PING`, `ECHO`, `HELLO`, `SET`, `GET`, `DEL`, `EXISTS`, `TYPE`, `EXPIRE`,
 `PEXPIRE`, `PEXPIREAT`, `TTL`, `PTTL`, `INCR`, `DECR`, `LPUSH`, `RPUSH`, `LPOP`, `RPOP`,
 `LRANGE`, `LLEN`, `DBSIZE`, `KEYS`, `FLUSHALL`, `INFO`, `CONFIG`. Keys expire lazily, on
-lookup — there is no active sweep yet, so an expired key nobody has asked about stays in
-memory until something does.
+lookup, and on a sampled active sweep: `--expiry-sweep-interval` bounds how often that
+sweep runs, not how long any one expired key stays resident. Each pass samples a few of
+the keys that carry a TTL and deletes the expired ones, so nothing bounds when a
+particular key is reclaimed — which is why expiry on lookup is still the load-bearing
+half: a key you ask for is never served stale, whatever the sweep has reached.
 
 One consequence of that command list is worth knowing before you reach for a client
 library. `INCRBY` and `DECRBY` are not among them, and `redis-py` defines `.incr()` and
@@ -56,8 +59,39 @@ and documents it. `INFO`'s `used_memory` is peak resident memory rather than cur
 any platform without `/proc`: it reads `/proc/self/statm` where that exists and falls
 back to `resource.getrusage(...).ru_maxrss`, a high-water mark, so the two figures agree
 right after a bulk load and diverge for a server that has since freed memory back to the
-allocator. Three modules are still declared and empty: `persistence.py`, `ratelimit.py`,
-`replication.py`.
+allocator. `ratelimit.py` and `replication.py` are still declared and empty.
+
+**Four more flags cover persistence and the active sweep.** Persistence is on by
+default. `--snapshot-path` names the file a snapshot is written to and read back from
+and defaults to `./dump.mrdb`, resolved against the directory the server was started
+in; a file that is present but will not decode refuses startup rather than starting
+empty over it. `--snapshot-interval` (seconds, default `60`) and
+`--expiry-sweep-interval` (milliseconds, default `100`, the same span as the run
+loop's own `select()` timeout of `0.1` seconds) both follow the same rule as the caps
+above: `0` turns the periodic task off, and a negative value is refused at the CLI and
+again in `Server.__init__`. `--ignore-snapshot` takes no value of its own: passed, the
+file at `--snapshot-path` is never read, whether or not it is readable, so a good
+snapshot is discarded as readily as a corrupt one. The server starts with an empty
+keyspace, and the file itself stays on disk untouched until the next save writes the
+keyspace as it then stands over it -- unless `--snapshot-interval` is 0, in which case
+nothing ever overwrites it. It is the escape hatch for a file that refuses to load. Left set permanently -- in a
+unit file, say -- it starts every restart with an empty keyspace, not just the first,
+because it never reads the file.
+
+**A clean stop can still lose recent writes.** Snapshots save on `--snapshot-interval`
+and not on the way out, so a `SIGINT` or `SIGTERM` can lose up to one interval's worth
+of writes; lowering `--snapshot-interval` bounds how much a restart can lose. The save
+also blocks: it runs on the one thread that answers commands, so while a snapshot is
+being serialized and written the server answers nobody. Real Redis forks and lets a
+copy-on-write child pay that cost, which is the right answer at scale and the one given
+up here — every non-tearing alternative needs a point-in-time copy of the keyspace and
+there is no cheap pure-Python equivalent, so the pause is priced and published rather
+than hidden. A snapshot of 100,000 keys — 16-byte keys and 100-byte values — costs
+about 59.9 ms to serialize and about 75.2 ms to deserialize, a
+12.7 MiB payload, and about 116.2 MiB of peak resident memory in the
+process that builds it (`resource.getrusage(RUSAGE_CHILDREN).ru_maxrss`). The fixture
+is stated because the payload is a function of it, and the figures come from measuring
+the tree that ships.
 
 ## Quickstart
 
@@ -126,9 +160,10 @@ event_loop.py   selectors readiness dispatch (on_readable / on_writable / on_acc
 connection.py   per-connection socket, read/write buffers, lifecycle
 resp.py         RESP2 parser and serializer
 store.py        keyspace, expiry index, pending-effects queue
+persistence.py  versioned snapshot format, atomic save/load
 commands/       __init__.py, registry.py, server.py, string.py and list.py; twenty-six commands total
 tests/          pytest suite, run in CI against Python 3.11 and 3.13
 ```
 
-[Design notes](docs/DESIGN.md) cover why each of these is shaped the way it is, and
-twenty-two deliberate differences from real Redis.
+[Design notes](docs/DESIGN.md) cover why each of these is shaped the way it is, and the
+deliberate differences from real Redis.

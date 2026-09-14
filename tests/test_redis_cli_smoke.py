@@ -13,10 +13,13 @@ NO_REDIS_CLI_REASON = "redis-cli not found on PATH"
 
 
 @pytest.mark.skipif(shutil.which("redis-cli") is None, reason=NO_REDIS_CLI_REASON)
-def test_redis_cli_ping_answers_pong():
+def test_redis_cli_ping_answers_pong(tmp_path):
     port = free_port()
     proc = subprocess.Popen(
-        [sys.executable, str(REPO_ROOT / "server.py"), "--port", str(port)],
+        # tmp_path, not the default ./dump.mrdb: this test's snapshot has no reason to
+        # outlive it or to land in the repository's own working directory
+        [sys.executable, str(REPO_ROOT / "server.py"), "--port", str(port),
+         "--snapshot-path", str(tmp_path / "dump.mrdb")],
         stdout=subprocess.DEVNULL,
     )
     try:

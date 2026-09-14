@@ -349,11 +349,15 @@ def info(store, conn, argv: list[bytes]) -> Reply:
 
 
 # The configuration this server actually has. Every value is a true statement about this
-# process -- nothing is written to disk, nothing evicts, nothing bounds the keyspace, and
-# there is one keyspace rather than sixteen -- and three of the five happen to equal the
-# reference's own default because those defaults are "off" as well. `save` is not one of
-# them: a default-configured reference answers `3600 1 300 100 60 10000` there, and `""`
-# is what a server with no snapshots honestly reports.
+# process -- nothing evicts, nothing bounds the keyspace, and there is one keyspace
+# rather than sixteen -- and three of the five happen to equal the reference's own
+# default because those defaults are "off" as well. `save` is not one of them: a
+# default-configured reference answers `3600 1 300 100 60 10000` there, a three-tier
+# changes-based policy, and `""` is what the reference's own format means by no `save`
+# directives configured -- which is what this server, with one flat interval and no
+# directive syntax of its own, honestly has. That emptiness is about the directive
+# syntax alone: a snapshot still runs, on `--snapshot-interval`, which this table has no
+# field to report either way.
 #
 # A table rather than an echo of whatever was asked for. Echoing meant a name this server
 # has never heard of came back as a parameter that exists with an empty value, which is a

@@ -120,14 +120,17 @@ def set_(store, conn, argv: list[bytes]) -> Reply:
     if deadline is not None:
         if deadline <= store.now_ms():
             # a deadline already past deletes here rather than being written into the
-            # index, for the reason EXPIRE's own path deletes: lazy expiry runs only when
-            # something looks the key up again, and with no sweep nothing guarantees that
-            # ever happens. EXAT and PXAT reach this from a valid argument by naming a past
-            # instant outright, and EX and PX reach it too, rarely: the deadline is computed
-            # from one clock read and compared against a second taken after lookup() and
-            # write(), so a small enough relative TTL can be overtaken in between -- measured,
-            # 6 of 20,000 back-to-back `SET k v PX 1` calls took this branch with nothing
-            # injected. Either way it is the same key nothing would otherwise collect
+            # index, for the reason EXPIRE's own path deletes: a follower has no license
+            # to remove a key on its own initiative, and the leader -- which already
+            # considers this key gone -- would never send a DEL to tell it to. The active
+            # sweep is no substitute for this: a sampled pass over the keyspace promises
+            # nothing about any one key, only about the keyspace as a whole. EXAT and
+            # PXAT reach this from a valid argument by naming a past instant outright,
+            # and EX and PX reach it too, rarely: the deadline is computed from one clock
+            # read and compared against a second taken after lookup() and write(), so a
+            # small enough relative TTL can be overtaken in between -- measured, 6 of
+            # 20,000 back-to-back `SET k v PX 1` calls took this branch with nothing
+            # injected
             store.remove(key)
             # the DEL alone, not a SET/DEL pair: the follower needs the end state, and
             # store.remove's own comment gives the reason a redundant pair is worse

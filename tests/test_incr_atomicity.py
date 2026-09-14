@@ -11,9 +11,11 @@ counter value rather than asserting on them.
 """
 
 import pathlib
+import shutil
 import socket
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 
@@ -210,8 +212,13 @@ def _run_burst_against_a_fresh_server(n):
     # not the mini_redis_server fixture: pytest refuses a fixture called outside a
     # test, so this builds its own server from the same two helpers the fixture uses
     port = free_port()
+    # a scratch directory of its own, cleaned up below: this function also runs from
+    # __main__, where there is no tmp_path fixture, and a snapshot left at the default
+    # ./dump.mrdb would land in the repository's own working directory
+    scratch = tempfile.mkdtemp()
     proc = subprocess.Popen(
-        [sys.executable, str(REPO_ROOT / "server.py"), "--port", str(port)],
+        [sys.executable, str(REPO_ROOT / "server.py"), "--port", str(port),
+         "--snapshot-path", str(pathlib.Path(scratch) / "dump.mrdb")],
         stdout=subprocess.DEVNULL,
     )
     try:
@@ -229,6 +236,7 @@ def _run_burst_against_a_fresh_server(n):
         except subprocess.TimeoutExpired:
             proc.kill()
             proc.wait(timeout=5)
+        shutil.rmtree(scratch, ignore_errors=True)
 
 
 if __name__ == "__main__":

@@ -53,7 +53,7 @@ class EventLoop:
             self._selector.modify(conn, new_events, conn)
 
     def run_once(self) -> None:
-        # bounded so that periodic work, once server.py has any, runs on an idle server too: an unbounded select() would tie it to whenever client traffic happened to arrive.
+        # bounded so that periodic work in server.py -- the expiry sweep, the snapshot save -- runs on an idle server too: an unbounded select() would tie it to whenever client traffic happened to arrive. Checked every pass either way, not fired on every pass: each still waits out its own configured interval before it runs.
         events = self._selector.select(self._timeout)
         for key, mask in events:
             data = key.data
