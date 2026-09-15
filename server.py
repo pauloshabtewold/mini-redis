@@ -20,7 +20,7 @@ from store import Store
 DEFAULT_PORT = 6379
 # the replication sync command is unauthenticated and is safe only bound to loopback.
 LISTEN_HOST = "127.0.0.1"
-# bounds how long a stop signal waits to be noticed, and floors both --expiry-sweep-interval and --snapshot-interval: the default sweep interval is equal to it, and either deadline is checked only when run_once() returns -- see Server._tick -- so it can be noticed up to one timeout late.
+# bounds how long a stop signal waits to be noticed, and on an idle loop floors both --expiry-sweep-interval and --snapshot-interval: either deadline is checked only when run_once() returns -- see Server._tick -- so with no traffic a deadline can be noticed up to one timeout late, and the default sweep interval is equal to it. under traffic run_once() returns as soon as a socket is ready, so a shorter interval is honoured.
 SELECT_TIMEOUT_SECONDS = 0.1
 # 0 is unlimited, which is what the reference defaults to for an ordinary client. see
 # Server._flush for why exceeding this closes the connection instead of slowing it down.
@@ -51,9 +51,11 @@ DEFAULT_IGNORE_SNAPSHOT = False
 # actually supplies
 DEFAULT_EXPIRY_SWEEP_INTERVAL_MS = 100
 # the sweep's own constants -- 20 sampled keys, a re-loop past a quarter expired, a
-# 1 ms budget -- are real Redis SOURCE-CODE constants inside activeExpireCycle rather
-# than CONFIG GET values: a running server does not expose them through CONFIG GET, so
-# they cannot be read off one
+# 1 ms budget -- are a local choice and not the reference's. its activeExpireCycle, in
+# 7.2.7's source, also samples 20 keys a pass, but re-samples only while more than 10 per
+# cent of a sample was stale at its default effort, and its 1 ms limit is the fast
+# cycle's alone: the slow cycle on hz's 100 ms cadence may take a quarter of it. none of
+# the three is a CONFIG GET value, so only the reference's source can confirm them
 SWEEP_SAMPLE_SIZE = 20
 SWEEP_RELOOP_THRESHOLD = 0.25
 SWEEP_BUDGET_SECONDS = 0.001

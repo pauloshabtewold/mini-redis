@@ -84,9 +84,10 @@ of writes; lowering `--snapshot-interval` bounds how much a restart can lose. Th
 also blocks: it runs on the one thread that answers commands, so while a snapshot is
 being serialized and written the server answers nobody. Real Redis forks and lets a
 copy-on-write child pay that cost, which is the right answer at scale and the one given
-up here — every non-tearing alternative needs a point-in-time copy of the keyspace and
-there is no cheap pure-Python equivalent, so the pause is priced and published rather
-than hidden. A snapshot of 100,000 keys — 16-byte keys and 100-byte values — costs
+up here — every non-tearing alternative needs a point-in-time view of the keyspace, and
+a pure-Python copy, cheaper in memory than it sounds (`docs/DESIGN.md` measures it),
+still leaves every list to copy element by element and the encode on this one thread,
+so the pause is priced and published rather than hidden. A snapshot of 100,000 keys — 16-byte keys and 100-byte values — costs
 about 59.9 ms to serialize and about 75.2 ms to deserialize, a
 12.7 MiB payload, and about 116.2 MiB of peak resident memory in the
 process that builds it (`resource.getrusage(RUSAGE_CHILDREN).ru_maxrss`). The fixture
