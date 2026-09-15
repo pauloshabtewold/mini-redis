@@ -3,9 +3,10 @@
 A blob is `MAGIC`, a little-endian `uint32` version, a little-endian `uint32` key count,
 then one entry per key -- a `uint32` key length, the key bytes, one type byte, a signed
 little-endian `int64` absolute expiry in milliseconds (`-1` for none), and the value: a
-string as a `uint32` length plus bytes, a list as a `uint32` element count then a
-`uint32` length plus bytes per element -- and closes with a little-endian `uint32`
-`zlib.crc32` of every byte before it.
+string as a `uint32` length plus bytes, a list as a `uint32` element count -- never
+zero, because no command leaves an empty list behind: popping the last element removes
+the key -- then a `uint32` length plus bytes per element -- and closes with a
+little-endian `uint32` `zlib.crc32` of every byte before it.
 
 `decode()` checks in this order and no other: the blob is at least sixteen bytes, the
 magic matches, the trailer's checksum matches `zlib.crc32` of everything before it, the
@@ -80,6 +81,12 @@ def _encode_entry(key: bytes, kind: bytes, value: object, expiry: int) -> bytes:
     ]
     if kind == KIND_LIST:
         elements = list(value)
+        if not elements:
+            # refusing here keeps a store that has somehow broken the no-empty-list
+            # rule from writing a file the next start would refuse -- the save fails
+            # loudly instead, and save() encodes before it creates the temporary file,
+            # so nothing on disk changes
+            raise ValueError("cannot snapshot an empty list at key %r" % (key,))
         parts.append(struct.pack("<I", len(elements)))
         for element in elements:
             parts.append(struct.pack("<I", len(element)))
@@ -133,6 +140,10 @@ def _decode(blob: bytes) -> Store:
             kind = KIND_LIST
             (element_count,) = struct.unpack_from("<I", blob, offset)
             offset += 4
+            if element_count == 0:
+                # this server's own save can never write one, and loading one hands
+                # LPOP/RPOP a container they pop from unguarded
+                raise SnapshotError("empty list at key %r" % (key,))
             elements = []
             for _ in range(element_count):
                 (element_len,) = struct.unpack_from("<I", blob, offset)

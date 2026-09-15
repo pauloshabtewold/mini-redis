@@ -2,11 +2,13 @@
 both kinds and an exact absolute deadline, the version field at its own offset, a save
 observed writing through a temporary file, and every refusal this module names -- an
 unsupported version, a blob under the sixteen-byte header, a wrong magic, a trailing
-byte past the trailer, truncation at every offset, an unrecognised kind byte, a rename
-that fails once, and the two paths `load()` tells apart, a missing one and a corrupt
-one, entries that stop short of the trailer with a correct checksum, and the two type
-bytes pinned against their literal values. test_persistence_properties.py covers the
-refusal contract over inputs this module does not choose.
+byte past the trailer, truncation at every offset, an unrecognised kind byte, a list
+entry whose element count is zero, an empty list refused at encode with the save
+leaving nothing on disk, a rename that fails once, and the two paths `load()` tells
+apart, a missing one and a corrupt one, entries that stop short of the trailer with a
+correct checksum, and the two type bytes pinned against their literal values.
+test_persistence_properties.py covers the refusal contract over inputs this module does
+not choose.
 """
 
 import os
@@ -252,6 +254,48 @@ def test_an_unrecognised_kind_byte_is_refused_as_snapshot_error():
     blob[-4:] = struct.pack("<I", zlib.crc32(bytes(blob[:-4])))
     with pytest.raises(persistence.SnapshotError):
         persistence.decode(bytes(blob))
+
+
+def test_a_list_with_no_elements_is_refused_as_snapshot_error():
+    store = Store()
+    store.write(b"l", deque([b"a"]), keep_ttl=False)
+    blob = persistence.encode(store)
+    loaded = persistence.decode(blob)
+    assert list(loaded._data[b"l"]) == [b"a"], (
+        "the control blob does not hold the one element the byte surgery below targets"
+    )
+
+    # magic, version and key count are four bytes each, then a four-byte key length and
+    # the key itself, one type byte and an eight-byte expiry, and the list's own element
+    # count is next
+    count_at = 4 + 4 + 4 + 4 + len(b"l") + 1 + 8
+    body = bytearray(blob[:-4])
+    # the element's own length prefix and bytes sit right after the count -- stripped
+    # out along with it so a decoder with no check for this reads the shortened body as
+    # a complete, trailing-byte-free zero-element list rather than stumbling onto the
+    # refusal by accident
+    element_at = count_at + 4
+    element_end = element_at + 4 + len(b"a")
+    del body[element_at:element_end]
+    struct.pack_into("<I", body, count_at, 0)
+    spliced = bytes(body) + struct.pack("<I", zlib.crc32(bytes(body)))
+
+    with pytest.raises(persistence.SnapshotError, match="empty list"):
+        persistence.decode(spliced)
+
+
+def test_a_store_holding_an_empty_list_is_refused_at_encode_and_the_save_writes_nothing(
+    tmp_path
+):
+    store = Store()
+    store.write(b"l", deque(), keep_ttl=False)
+    with pytest.raises(ValueError, match="empty list"):
+        persistence.encode(store)
+    with pytest.raises(ValueError, match="empty list"):
+        persistence.save(store, str(tmp_path / "dump.mrdb"))
+    assert not list(tmp_path.iterdir()), (
+        "save left something behind in tmp_path after refusing to encode"
+    )
 
 
 def _make_rename_failing_once(real_rename, calls):
