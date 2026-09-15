@@ -95,15 +95,25 @@ def test_save_writes_through_a_temporary_file_and_renames_it(tmp_path, monkeypat
     store = Store()
     store.write(b"k", b"v", keep_ttl=False)
 
+    # one shared list rather than two separate ones, so the order fsync and rename
+    # actually ran in is read back from the list itself instead of assumed from the
+    # order the code below happens to call them in
+    events = []
     synced = []
     renamed = []
     real_fsync, real_rename = os.fsync, os.rename
 
     def recording_fsync(fd):
+        # the size on disk at the moment fsync is called, before real_fsync runs --
+        # bytes still sitting in handle's own userspace buffer have not reached the
+        # file this descriptor names yet, so a deleted flush() shows up here as a short
+        # size rather than only in a size read back after save() has already returned
+        events.append(("fsync", os.fstat(fd).st_size))
         synced.append(fd)
         return real_fsync(fd)
 
     def recording_rename(a, b):
+        events.append(("rename", None))
         renamed.append((a, b))
         return real_rename(a, b)
 
@@ -121,6 +131,20 @@ def test_save_writes_through_a_temporary_file_and_renames_it(tmp_path, monkeypat
     )
     assert pathlib.Path(src).parent == path.parent, (
         "the temporary file must share the directory, or the rename crosses devices"
+    )
+
+    assert len(synced) == 1 and len(renamed) == 1, (
+        "save must fsync exactly once and rename exactly once: %r" % (events,)
+    )
+    # the order first, so a rename that ran ahead of the fsync is reported as that rather
+    # than as a size mismatch read off the wrong event
+    assert [kind for kind, _ in events] == ["fsync", "rename"], (
+        "fsync must come before rename, or a power loss right after the rename can leave "
+        "the real path naming a file whose bytes never reached the disk: %r" % (events,)
+    )
+    (fsync_size,) = [size for kind, size in events if kind == "fsync"]
+    assert fsync_size == len(persistence.encode(store)), (
+        "the bytes were still in a userspace buffer when the fsync ran", fsync_size
     )
 
 

@@ -1,10 +1,11 @@
 """The snapshot format's contract over bit-flipped inputs rather than chosen ones: a
 fixture snapshot holding a string, a list and a TTL, corrupted one bit at a random
-offset, must always refuse as `SnapshotError` and never load a store that differs from
-the original. Two companions keep the corpus honest: one asserting the flips actually
-reach every region the format has, and one measuring directly what a format with no
-checksum at all would accept over this same corpus: some fraction of those same flips,
-accepted with data that differs from the original.
+offset, must always refuse as `SnapshotError` and never load a store whose values or
+deadlines differ from the original. Two companions keep the corpus honest: one
+asserting the flips actually reach every region the format has, and one measuring
+directly what a format with no checksum at all would accept over this same corpus:
+some fraction of those same flips, accepted with values or deadlines that differ from
+the original.
 
 The corpus is built from a fixed seed, matching test_store_properties.py's shape (there
 is no `hypothesis` dependency in this project and none is added here). A failure names
@@ -29,7 +30,10 @@ def _fixture_blob():
     store.write(b"beta", deque([b"x", b"y"]), keep_ttl=False)
     store.write(b"gamma", b"v", keep_ttl=False)
     store.expire_at(b"gamma", 1_700_000_000_000)
-    return persistence.encode(store), dict(store._data)
+    # the whole store, not only its values -- key, kind, value and absolute expiry --
+    # or a flip that lands on a deadline and nowhere else has nothing here to disagree
+    # with and goes uncounted by both tests below
+    return persistence.encode(store), list(store.snapshot_items())
 
 
 def test_every_single_bit_flip_is_refused_as_snapshot_error():
@@ -87,7 +91,9 @@ def test_no_single_bit_flip_loads_a_store_that_differs_from_the_original():
             loaded = persistence.decode(bytes(flipped))
         except persistence.SnapshotError:
             continue
-        assert dict(loaded._data) == original, (
+        # snapshot_items() rather than _data alone, so a flip that lands on a deadline
+        # and changes nothing else still counts as a store that differs
+        assert list(loaded.snapshot_items()) == original, (
             "round %d offset %d bit %d loaded a store that differs from the original"
             % (round_index, offset, bit)
         )
@@ -120,8 +126,10 @@ def test_without_the_checksum_some_flips_are_accepted_with_wrong_data():
     # would accept: the same corpus, with the trailer recomputed to agree with each
     # flip, is what a decoder with no checksum to check would be handed
     blob, original = _fixture_blob()
+    original_values = {key: value for key, _, value, _ in original}
     rnd = random.Random(SEED)
     accepted_without_checksum = 0
+    accepted_with_only_a_deadline_changed = 0
     for _ in range(ROUNDS):
         offset = rnd.randrange(len(blob))
         bit = rnd.randrange(8)
@@ -132,9 +140,20 @@ def test_without_the_checksum_some_flips_are_accepted_with_wrong_data():
             loaded = persistence.decode(bytes(flipped))
         except persistence.SnapshotError:
             continue
-        if dict(loaded._data) != original:
+        items = list(loaded.snapshot_items())
+        if items != original:
             accepted_without_checksum += 1
+            # isolates a flip that reached only a deadline: every value still matches
+            # by key, so the whole-store difference asserted above owes entirely to
+            # the expiry field none of this loop's other bookkeeping looks at
+            loaded_values = {key: value for key, _, value, _ in items}
+            if loaded_values == original_values:
+                accepted_with_only_a_deadline_changed += 1
     assert accepted_without_checksum > 0, (
         "with the trailer made to agree, no flip was ever accepted with wrong data -- "
         "this corpus does not demonstrate what the checksum is for"
+    )
+    assert accepted_with_only_a_deadline_changed > 0, (
+        "every accepted flip changed some value too, so a comparison over values alone "
+        "would never have been shown a flip that reached only a deadline"
     )
