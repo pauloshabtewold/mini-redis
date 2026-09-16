@@ -121,10 +121,10 @@ def set_(store, conn, argv: list[bytes]) -> Reply:
         if deadline <= store.now_ms():
             # a deadline already past deletes here rather than being written into the
             # index, for the reason EXPIRE's own path deletes: a follower has no license
-            # to remove a key on its own initiative, and the leader -- which already
-            # considers this key gone -- would never send a DEL to tell it to. The active
-            # sweep is no substitute for this: a sampled pass over the keyspace promises
-            # nothing about any one key, only about the keyspace as a whole. EXAT and
+            # to remove a key on its own initiative, and a past deadline left in the index
+            # would reach it as a DEL only when this server's own lookup or sweep got to
+            # the key, and a sampled sweep promises nothing about any one key. Deleting
+            # here sends the DEL with the command that made the key dead. EXAT and
             # PXAT reach this from a valid argument by naming a past instant outright,
             # and EX and PX reach it too, rarely: the deadline is computed from one clock
             # read and compared against a second taken after lookup() and write(), so a
@@ -204,8 +204,9 @@ def _apply_expiry(store, key: bytes, deadline_ms: int) -> Reply:
     # a reply and an effect, so the three cannot drift apart. a deadline at or before now
     # deletes the key here, in the handler, rather than being written into the index and
     # left for the next lookup to clean up: a past-dated deadline on a follower would be
-    # an entry the follower has no license to remove on its own initiative, and the leader
-    # -- which already considers the key gone -- would never send a DEL to tell it to
+    # an entry the follower has no license to remove on its own initiative, and the DEL
+    # that grants one would come only once the leader's own lookup or sweep reached the
+    # key, which nothing bounds -- deleting here sends it with this command instead
     if store.lookup(key) is None:
         return resp.encode_integer(0), []
     if deadline_ms <= store.now_ms():

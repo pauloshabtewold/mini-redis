@@ -47,15 +47,17 @@ DEFAULT_SNAPSHOT_INTERVAL_SECONDS = 60
 # explicit escape hatch for bringing a server back up past one anyway
 DEFAULT_IGNORE_SNAPSHOT = False
 # matches the reference's own cadence: hz is 10 on redis-server 7.2.7, so its
-# background cycle runs every 100 ms too -- the one number on this page the reference
-# actually supplies
+# background cycle runs every 100 ms too
 DEFAULT_EXPIRY_SWEEP_INTERVAL_MS = 100
 # the sweep's own constants -- 20 sampled keys, a re-loop past a quarter expired, a
-# 1 ms budget -- are a local choice and not the reference's. its activeExpireCycle, in
-# 7.2.7's source, also samples 20 keys a pass, but re-samples only while more than 10 per
-# cent of a sample was stale at its default effort, and its 1 ms limit is the fast
-# cycle's alone: the slow cycle on hz's 100 ms cadence may take a quarter of it. none of
-# the three is a CONFIG GET value, so only the reference's source can confirm them
+# 1 ms budget -- are not 7.2.7's: they are the loop redis shipped through 5.0, whose
+# activeExpireCycle draws 20 random keys a pass, repeats while more than 5 of them had
+# expired, and holds its fast cycle to 1000 microseconds. 7.2.7 walks the expiry table
+# with a cursor instead, aims at 20 keys a pass, re-samples while a pass sampled nothing
+# or its stale percentage is above 10 at the default effort, and keeps 1 ms for its fast
+# cycle alone: the slow cycle on hz's 100 ms cadence may take a quarter of each 100 ms.
+# each of those is a compiled-in constant scaled by active-expire-effort, which CONFIG
+# GET does answer, so a running server shows the effort and not the values themselves
 SWEEP_SAMPLE_SIZE = 20
 SWEEP_RELOOP_THRESHOLD = 0.25
 SWEEP_BUDGET_SECONDS = 0.001

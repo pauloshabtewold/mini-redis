@@ -469,8 +469,9 @@ def test_info_reports_zero_connected_clients_with_no_server_attached():
 
 
 def test_config_get_answers_a_real_parameter_from_the_table(store, conn):
-    # every value in the table is a true statement about this server, and three of the
-    # five equal redis-server 7.2.7's own default because those defaults are "off" too
+    # every value in the table but save's is a true statement about this server -- save's
+    # "" is the reference's snapshotting-off answer, true only with saving off -- and
+    # three of the five equal redis-server 7.2.7's own default because those are "off" too
     assert commands.dispatch(store, conn, [b"CONFIG", b"GET", b"save"]) == (
         b"*2\r\n$4\r\nsave\r\n$0\r\n\r\n", [])
     assert commands.dispatch(store, conn, [b"CONFIG", b"GET", b"appendonly"]) == (

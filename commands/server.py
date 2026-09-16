@@ -348,22 +348,27 @@ def info(store, conn, argv: list[bytes]) -> Reply:
     return resp.encode_bulk_string(body), []
 
 
-# The configuration this server actually has. Every value is a true statement about this
-# process -- nothing evicts, nothing bounds the keyspace, and there is one keyspace
-# rather than sixteen -- and three of the five happen to equal the reference's own
-# default because those defaults are "off" as well. `save` is not one of them: a
-# default-configured reference answers `3600 1 300 100 60 10000` there, a three-tier
-# changes-based policy, and `""` is what the reference's own format means by no `save`
-# directives configured -- which is what this server, with one flat interval and no
-# directive syntax of its own, honestly has. That emptiness is about the directive
-# syntax alone: a snapshot still runs, on `--snapshot-interval`, which this table has no
-# field to report either way.
+# The configuration this server actually has. Every value but `save` is a true statement
+# about this process -- nothing is appended to a log, nothing evicts, nothing bounds the
+# keyspace, and there is one keyspace rather than sixteen -- and three of the five happen
+# to equal the reference's own default because those defaults are "off" as well. `save`
+# is true only of a server that never saves: one started with `--snapshot-interval 0`,
+# or one built with no snapshot path at all. A default-configured reference answers
+# `3600 1 300 100 60 10000` there, a three-tier changes-based policy that a
+# configuration with no save line at all gets as well, and `""` is its explicit
+# spelling of snapshotting switched off. Its syntax comes close to this server's flat
+# interval -- `59 0` asks for a save once its whole-second clock is more than 59
+# seconds past the last completed save, changed or not, which is about every 60
+# seconds -- but this table is fixed and answers `""` however the server was started,
+# so while saving is on a client reading `save` to learn whether this server persists
+# is told that it does not. docs/DESIGN.md lists it among the differences.
 #
 # A table rather than an echo of whatever was asked for. Echoing meant a name this server
 # has never heard of came back as a parameter that exists with an empty value, which is a
 # reply a client acts on -- `redis-py`'s config_get() sends `CONFIG GET *` and got back a
 # single parameter named `*`. Answering from a table makes an unknown name answer the
-# empty array the reference answers, and makes the values that are returned true
+# empty array the reference answers, and makes every value returned one this table
+# chose -- true of this process for all but `save`, as above
 _CONFIG: dict[bytes, bytes] = {
     b"appendonly": b"no",
     b"databases": b"1",

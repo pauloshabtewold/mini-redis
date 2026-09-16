@@ -431,10 +431,10 @@ def test_keepttl_is_carried_into_the_effect_so_a_replay_keeps_the_deadline_too(c
                          ids=["exat", "pxat"])
 def test_an_absolute_deadline_already_past_deletes_rather_than_scheduling(conn, token, argument):
     # EXAT and PXAT are the only options that resolve a valid argument to an instant
-    # already gone. A follower has no license to remove a key on its own initiative, and
-    # the leader -- which already considers this key gone -- would never send a DEL to
-    # tell it to, and the active sweep is no help either: a sampled pass promises
-    # nothing about this one key. EXPIRE's own path deletes on the spot for this reason too
+    # already gone. A follower has no license to remove a key on its own initiative, and a
+    # key written into the index would reach the follower as a DEL only once the leader's
+    # own lookup or sweep got to the key -- a sampled pass promises nothing about this one
+    # key, so nothing bounds when. EXPIRE's own path deletes on the spot for this reason too
     store = FrozenStore()
     response, effects = commands.dispatch(store, conn, [b"SET", b"k", b"v", token, argument])
     assert response == b"+OK\r\n"

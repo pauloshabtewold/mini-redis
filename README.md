@@ -63,26 +63,25 @@ allocator. `ratelimit.py` and `replication.py` are still declared and empty.
 
 **Four more flags cover persistence and the active sweep.** Persistence is on by
 default. `--snapshot-path` names the file a snapshot is written to and read back from
-and defaults to `./dump.mrdb`, resolved against the directory the server was started
-in; a file that is present but will not decode refuses startup rather than starting
-empty over it, and so does a directory standing where the file should be. Whenever
-saving is on, so does a path a save could not write as things stand at startup, such
-as one whose directory is missing or read-only. A save writes a
-temporary file beside the snapshot, named after it, and renames it into place; a file
-left under that name, as a process killed mid-save leaves one, is never read or removed,
-and every start over the same path names it in a warning, so long as the directory can
-be listed. `--snapshot-interval` (seconds, default `60`) and
-`--expiry-sweep-interval` (milliseconds, default `100`, the same span as the run
-loop's own `select()` timeout of `0.1` seconds) both follow the same rule as the caps
-above: `0` turns the periodic task off, and a negative value is refused at the CLI and
-again in `Server.__init__`. `--ignore-snapshot` takes no value of its own: passed, the
-file at `--snapshot-path` is never read, whether or not it is readable, so a good
-snapshot is discarded as readily as a corrupt one. The server starts with an empty
-keyspace, and the file itself stays on disk untouched until the next save writes the
-keyspace as it then stands over it -- unless `--snapshot-interval` is 0, in which case
-nothing ever overwrites it. It is the escape hatch for a file that refuses to load. Left set permanently -- in a
-unit file, say -- it starts every restart with an empty keyspace, not just the first,
-because it never reads the file.
+and defaults to `./dump.mrdb`, resolved against the directory the server was started in;
+a file that is present but will not decode refuses startup rather than starting empty
+over it, and so does a directory standing where the file should be. Whenever saving is
+on, so does a path a save could not write as things stand at startup, such as one whose
+directory is missing or read-only. A save writes a temporary file beside the snapshot,
+named after it, and renames it into place; a file left under that name, as a process
+killed mid-save leaves one, is never read or removed, and every start over the same path
+names it in a warning, so long as the directory can be listed. `--snapshot-interval`
+(seconds, default `60`) and `--expiry-sweep-interval` (milliseconds, default `100`, the
+same span as the run loop's own `select()` timeout of `0.1` seconds) both follow the
+same rule as the caps above: `0` turns the periodic task off, and a negative value is
+refused at the CLI and again in `Server.__init__`. `--ignore-snapshot` takes no value of
+its own: passed, the file at `--snapshot-path` is never read, whether or not it is
+readable, so a good snapshot is discarded as readily as a corrupt one. The server starts
+with an empty keyspace, and the file itself stays on disk untouched until the next save
+writes the keyspace as it then stands over it -- unless `--snapshot-interval` is 0, in
+which case nothing ever overwrites it. It is the escape hatch for a file that refuses to
+load. Left set permanently -- in a unit file, say -- it starts every restart with an
+empty keyspace, not just the first, because it never reads the file.
 
 **A clean stop can still lose recent writes.** Snapshots save on `--snapshot-interval`
 and not on the way out, so a `SIGINT` or `SIGTERM` can lose up to one interval's worth
@@ -92,13 +91,14 @@ being serialized and written the server answers nobody. Real Redis forks and let
 copy-on-write child pay that cost, which is the right answer at scale and the one given
 up here — every non-tearing alternative needs a point-in-time view of the keyspace, and
 a pure-Python copy, cheaper in memory than it sounds (`docs/DESIGN.md` measures it),
-still leaves every list to copy element by element and the encode on this one thread,
-so the pause is priced and published rather than hidden. A snapshot of 100,000 keys — 16-byte keys and 100-byte values — costs
-about 59.9 ms to serialize and about 75.2 ms to deserialize, a
-12.7 MiB payload, and about 116.2 MiB of peak resident memory in the
-process that builds it (`resource.getrusage(RUSAGE_CHILDREN).ru_maxrss`). The fixture
-is stated because the payload is a function of it, and the figures come from measuring
-the tree that ships.
+still leaves every list to copy element by element and the encode on this one thread, so
+the pause is priced and published rather than hidden. A snapshot of 100,000 keys —
+16-byte keys and 100-byte values — costs about 59.9 ms to serialize and about 75.2 ms to
+deserialize, a 12.7 MiB payload, and about 116.2 MiB of peak resident memory in a
+process that builds the keyspace, serializes it and then decodes the payload back into a
+second copy (`resource.getrusage(RUSAGE_CHILDREN).ru_maxrss`). The fixture is stated
+because the payload is a function of it, and the figures come from measuring the tree
+that ships.
 
 ## Quickstart
 
