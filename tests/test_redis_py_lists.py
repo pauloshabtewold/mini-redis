@@ -85,9 +85,12 @@ def test_info_with_a_section_name_filters_to_it(redis_client):
     assert r.info("replication") == {"role": "master"}
 
 
-def test_config_get_echoes_the_parameter_with_an_empty_value(redis_client):
+def test_config_get_save_reports_the_servers_own_interval(redis_client):
+    # the fixture's server gets a snapshot path and the CLI's default interval, so it saves
+    # every 60 seconds -- `59 0` in the reference's syntax, and not `""`, which is that
+    # syntax's spelling of a server that never saves
     r = redis_client
-    assert r.config_get("save") == {"save": ""}
+    assert r.config_get("save") == {"save": "59 0"}
 
 
 def test_config_get_answers_an_unknown_parameter_with_an_empty_mapping(redis_client):
@@ -105,7 +108,7 @@ def test_config_get_with_no_argument_reports_every_parameter(redis_client):
         "databases": "1",
         "maxmemory": "0",
         "maxmemory-policy": "noeviction",
-        "save": "",
+        "save": "59 0",
     }
     assert config["maxmemory"] == "0"
 

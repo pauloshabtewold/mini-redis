@@ -786,11 +786,15 @@ sys.path.insert(0, sys.argv[1])
 from server import Server
 
 ticks = []
+armed = []
 
 
 class Counting(Server):
     def _tick(self):
         ticks.append(1)
+        # read inside the loop rather than after run() returns, because run() disarms both
+        # on its way out
+        armed.append((self._next_sweep_at is not None, self._next_snapshot_at is not None))
         super()._tick()
 
 
@@ -813,8 +817,9 @@ threading.Thread(target=stop_later, daemon=True).start()
 server.run()
 
 print("ticks=%d" % len(ticks))
-print("sweep-armed=%s" % (server._next_sweep_at is not None))
-print("snapshot-armed=%s" % (server._next_snapshot_at is not None))
+print("sweep-armed=%s" % (bool(armed) and all(sweep for sweep, _ in armed)))
+print("snapshot-armed=%s" % (bool(armed) and all(snapshot for _, snapshot in armed)))
+print("disarmed-after=%s" % (server._next_sweep_at is None and server._next_snapshot_at is None))
 print("swept=%s" % (b"forgotten" not in server._store._data))
 print("saved=%s" % pathlib.Path(sys.argv[2]).exists())
 """
@@ -837,8 +842,11 @@ def test_run_arms_both_deadlines_and_ticks_from_its_own_loop(tmp_path):
         "run()'s loop body never called _tick(), so neither arm can fire however the two "
         "of them are written", probe.stdout, probe.stderr)
     assert seen["sweep-armed"] == "True" and seen["snapshot-armed"] == "True", (
-        "run() did not arm both deadlines, and _tick() cannot fire an arm whose deadline "
-        "is still None", probe.stdout)
+        "run() did not arm both deadlines for every tick, and _tick() cannot fire an arm "
+        "whose deadline is still None", probe.stdout)
+    assert seen["disarmed-after"] == "True", (
+        "run() returned with a deadline still set, so a stopped server goes on reporting a "
+        "save schedule through CONFIG GET save", probe.stdout)
     assert seen["swept"] == "True", (
         "two seconds of a running loop at a 50 ms sweep interval reclaimed nothing -- the "
         "interval was armed as seconds, which is a sweep every fifty seconds", probe.stdout)

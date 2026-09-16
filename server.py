@@ -309,7 +309,8 @@ class Server:
         # None means "not scheduled": a Server constructed and left unrun fires neither
         # arm, and an arm whose interval is 0 -- or, for the snapshot, with no path --
         # never gets a deadline in the first place. _arm_periodic_tasks() sets these
-        # from time.monotonic() once run() actually starts it
+        # from time.monotonic() once run() actually starts it, and run() sets both back
+        # to None on its way out
         self._next_sweep_at: float | None = None
         self._next_snapshot_at: float | None = None
 
@@ -322,6 +323,17 @@ class Server:
         # method because the connection's own slot for this object grants attribute reads
         # and nothing else -- no calls -- so what it exposes has to already be shaped as one
         return len(self._connections)
+
+    @property
+    def armed_snapshot_interval(self) -> int:
+        # the interval saves are scheduled at: snapshot_interval while run() has the save
+        # armed, and 0 before run() arms it, after run() returns, and throughout when
+        # _arm_periodic_tasks() arms nothing -- an interval of 0, or no snapshot path.
+        # CONFIG GET answers `save` from this rather than from the two settings, so a Server
+        # whose loop is driven without run(), as the tests drive one, or one that has
+        # stopped, says it saves nothing. A property for the reason connected_clients is
+        # one: the slot grants attribute reads
+        return self.snapshot_interval if self._next_snapshot_at is not None else 0
 
     def _open_listener(self) -> socket.socket:
         listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -599,13 +611,16 @@ class Server:
             raise RuntimeError("this Server has already run; construct a new one")
         # raised before the handlers exist, because a signal delivered between installing them and this line would be cleared by the handler and then overwritten here.
         self._running = True
-        self._arm_periodic_tasks()
         # restored on the way out: run() is also called in-process, and a handler left pointing at a discarded Server swallows every later signal in that process
         restore = [
             (signal.SIGINT, signal.signal(signal.SIGINT, self._request_stop)),
             (signal.SIGTERM, signal.signal(signal.SIGTERM, self._request_stop)),
         ]
         try:
+            # inside the try, so every way out of run() -- a stop, a failed bind, a raise --
+            # passes the finally below that disarms both again. still ahead of the listener,
+            # so no connection is ever accepted before the save it may ask about is armed
+            self._arm_periodic_tasks()
             listener = self._open_listener()
             # set once the listener is open, because what a second run must not reuse is the selector, and nothing has touched it yet -- a failed bind leaves this instance usable
             self._ran = True
@@ -624,6 +639,12 @@ class Server:
             finally:
                 self._shutdown(listener)
         finally:
+            # nothing is scheduled once run() is on its way out, however it got here, and
+            # armed_snapshot_interval reads the save deadline: left set, CONFIG GET save
+            # would go on answering a schedule for a server that will never save again. a
+            # run() retried after a failed bind arms both afresh
+            self._next_sweep_at = None
+            self._next_snapshot_at = None
             # unwound rather than looped: a signal delivered during one restore raises out of a flat loop's body, and every handler after it stays bound to a discarded Server -- the exact leak the restore exists to prevent. ExitStack runs all of them and still re-raises the first, with no except clause of its own
             with contextlib.ExitStack() as stack:
                 for signum, handler in restore:

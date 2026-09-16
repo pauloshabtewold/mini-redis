@@ -1,6 +1,6 @@
 """DBSIZE, KEYS, FLUSHALL, INFO, CONFIG: the introspection and admin commands, KEYS's
-hand-written glob grammar, and the connected-client count INFO reads through the
-connection's third slot.
+hand-written glob grammar, and the two things read through the connection's third slot:
+the connected-client count INFO reports and the save rule CONFIG GET answers.
 """
 
 import resource
@@ -14,6 +14,7 @@ from redis._parsers.helpers import parse_info
 import commands
 from commands.server import _glob_match
 from connection import Connection
+from server import Server
 from store import Store
 from tests.conftest import FROZEN, FrozenStore
 from tests.test_server_lifecycle import listening, pump
@@ -469,9 +470,11 @@ def test_info_reports_zero_connected_clients_with_no_server_attached():
 
 
 def test_config_get_answers_a_real_parameter_from_the_table(store, conn):
-    # every value in the table but save's is a true statement about this server -- save's
-    # "" is the reference's snapshotting-off answer, true only with saving off -- and
-    # three of the five equal redis-server 7.2.7's own default because those are "off" too
+    # every value is a true statement about the server answering it. conn here was built
+    # rather than accepted, so no server is attached and nothing saves, which makes save's
+    # "" -- the reference's own snapshotting-off answer -- the true one; a server that
+    # does save is below. three of the five equal redis-server 7.2.7's own default because
+    # those are "off" too
     assert commands.dispatch(store, conn, [b"CONFIG", b"GET", b"save"]) == (
         b"*2\r\n$4\r\nsave\r\n$0\r\n\r\n", [])
     assert commands.dispatch(store, conn, [b"CONFIG", b"GET", b"appendonly"]) == (
@@ -587,6 +590,112 @@ def test_config_get_answers_every_pattern_it_is_given_and_never_twice(store, con
 def test_config_subcommand_is_matched_case_insensitively(store, conn):
     assert commands.dispatch(store, conn, [b"CONFIG", b"get", b"save"])[0] == (
         b"*2\r\n$4\r\nsave\r\n$0\r\n\r\n")
+
+
+def _config_get_through(server, *names):
+    # a connection holding server in its third slot, which is what Server._on_accept
+    # leaves on every connection it accepts -- test_the_server_slot_is_filled_on_accept_
+    # and_cleared_on_close proves that half, so these tests need no listener of their own.
+    # run() arms the save before it opens the listener, so every connection a running
+    # server accepts sees the save already armed; the tests below arm it the same way,
+    # through _arm_periodic_tasks(), rather than running a loop
+    a, b = socket.socketpair()
+    try:
+        conn = Connection(a, ("127.0.0.1", 0))
+        conn.server = server
+        return commands.dispatch(Store(), conn, [b"CONFIG", b"GET", *names])
+    finally:
+        a.close()
+        b.close()
+
+
+@pytest.mark.parametrize("interval, with_path, expected", [
+    # a reference rule fires once its whole-second clock is MORE than the rule's seconds
+    # past the last completed save, so a save every N seconds is `N-1 0`: measured on
+    # redis-server 7.2.7, `save "1 0"` saved every 2 seconds and `save "3 0"` every 4
+    (60, True, b"*2\r\n$4\r\nsave\r\n$4\r\n59 0\r\n"),
+    (3, True, b"*2\r\n$4\r\nsave\r\n$3\r\n2 0\r\n"),
+    # a rule 7.2.7's own parser refuses -- its seconds must be at least 1 -- and still the
+    # one spelling of a save every second; `1 0` would claim every two
+    (1, True, b"*2\r\n$4\r\nsave\r\n$3\r\n0 0\r\n"),
+    # the two servers _arm_periodic_tasks() arms no save for, both answered with the
+    # reference's own snapshotting-off value
+    (0, True, b"*2\r\n$4\r\nsave\r\n$0\r\n\r\n"),
+    (60, False, b"*2\r\n$4\r\nsave\r\n$0\r\n\r\n"),
+], ids=["cli-default", "three-seconds", "one-second", "interval-zero", "no-path"])
+def test_config_get_save_spells_the_attached_servers_own_rule(
+    tmp_path, interval, with_path, expected
+):
+    path = str(tmp_path / "dump.mrdb") if with_path else None
+    server = Server(0, snapshot_path=path, snapshot_interval=interval)
+    try:
+        server._arm_periodic_tasks()
+        assert _config_get_through(server, b"save") == (expected, [])
+    finally:
+        server._loop.close()
+
+
+def test_config_get_save_is_the_off_value_until_the_save_is_armed(tmp_path):
+    # the reply follows the save arm, not the two settings that feed it: a Server whose
+    # loop is driven without run() -- as this suite drives one -- has a path and an
+    # interval and will never save, and answering `59 0` there would promise saves that
+    # never come. the settings alone are identical on both sides of this test
+    server = Server(0, snapshot_path=str(tmp_path / "dump.mrdb"), snapshot_interval=60)
+    try:
+        assert _config_get_through(server, b"save") == (
+            b"*2\r\n$4\r\nsave\r\n$0\r\n\r\n", [])
+        server._arm_periodic_tasks()
+        assert _config_get_through(server, b"save") == (
+            b"*2\r\n$4\r\nsave\r\n$4\r\n59 0\r\n", [])
+    finally:
+        server._loop.close()
+
+
+def test_config_get_save_follows_a_run_from_armed_to_returned(tmp_path):
+    # the other end of the unarmed test above: run() arms the save before it opens the
+    # listener and disarms it on the way out, so the reply read inside the running loop
+    # promises saves and the same server read once run() has returned does not. a deadline
+    # left set at shutdown went on answering `59 0` for a server that would never save again
+    during = []
+
+    class StopsAfterOneTick(Server):
+        def _tick(self):
+            during.append(_config_get_through(self, b"save"))
+            self._running = False
+            super()._tick()
+
+    server = StopsAfterOneTick(0, snapshot_path=str(tmp_path / "dump.mrdb"),
+                               snapshot_interval=60)
+    server.run()
+    assert during == [(b"*2\r\n$4\r\nsave\r\n$4\r\n59 0\r\n", [])], during
+    assert _config_get_through(server, b"save") == (b"*2\r\n$4\r\nsave\r\n$0\r\n\r\n", [])
+
+
+def test_config_get_answers_save_alike_through_a_pattern_and_an_exact_name(tmp_path):
+    # the two branches of the handler both have to read the per-call table. redis-py's
+    # config_get() sends `CONFIG GET *`, so a glob branch left reading a fixed table would
+    # go on telling that client persistence is off while `CONFIG GET save` did not
+    server = Server(0, snapshot_path=str(tmp_path / "dump.mrdb"), snapshot_interval=60)
+    try:
+        server._arm_periodic_tasks()
+        for names, name in (([b"*"], b"save"), ([b"sa?e"], b"save"), ([b"[s]ave"], b"save"),
+                            ([b"SAVE"], b"SAVE"), ([b"save", b"*"], b"save")):
+            reply, effects = _config_get_through(server, *names)
+            flat = reply.split(b"\r\n")[2:-1:2]
+            assert effects == []
+            assert dict(zip(flat[::2], flat[1::2])).get(name) == b"59 0", (names, flat)
+            # and the name is answered once, however many of the patterns reach it
+            assert flat[::2].count(name) == 1, (names, flat)
+    finally:
+        server._loop.close()
+
+
+def test_config_get_save_is_the_off_value_with_no_server_attached():
+    # conn=None is this project's convention for driving a handler with no socket at all
+    # -- tests/conftest.py's r() helper does it -- and it has no slot to read: a guard that
+    # reached for conn.server before asking whether conn exists raises here instead
+    assert commands.dispatch(Store(), None, [b"CONFIG", b"GET", b"save"]) == (
+        b"*2\r\n$4\r\nsave\r\n$0\r\n\r\n", [])
 
 
 # --- error cases -----------------------------------------------------------------------

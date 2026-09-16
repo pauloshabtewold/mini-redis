@@ -530,6 +530,9 @@ def test_a_failed_bind_leaves_the_server_usable():
             server.run()
         assert server._ran is False
         assert (signal.getsignal(signal.SIGINT), signal.getsignal(signal.SIGTERM)) == before
+        # armed before the bind was tried, and disarmed again by the same way out: a retry
+        # arms afresh, and until then nothing is scheduled
+        assert (server._next_sweep_at, server._next_snapshot_at) == (None, None)
     finally:
         squatter.close()
 

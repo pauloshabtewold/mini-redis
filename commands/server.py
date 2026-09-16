@@ -348,38 +348,52 @@ def info(store, conn, argv: list[bytes]) -> Reply:
     return resp.encode_bulk_string(body), []
 
 
-# The configuration this server actually has. Every value but `save` is a true statement
-# about this process -- nothing is appended to a log, nothing evicts, nothing bounds the
-# keyspace, and there is one keyspace rather than sixteen -- and three of the five happen
-# to equal the reference's own default because those defaults are "off" as well. `save`
-# is true only of a server that never saves: one started with `--snapshot-interval 0`,
-# or one built with no snapshot path at all. A default-configured reference answers
-# `3600 1 300 100 60 10000` there, a three-tier changes-based policy that a
-# configuration with no save line at all gets as well, and `""` is its explicit
-# spelling of snapshotting switched off. Its syntax comes close to this server's flat
-# interval -- `59 0` asks for a save once its whole-second clock is more than 59
-# seconds past the last completed save, changed or not, which is about every 60
-# seconds -- but this table is fixed and answers `""` however the server was started,
-# so while saving is on a client reading `save` to learn whether this server persists
-# is told that it does not. docs/DESIGN.md lists it among the differences.
+# The configuration this server actually has, every value a true statement about this
+# process: nothing is appended to a log, nothing evicts, nothing bounds the keyspace, and
+# there is one keyspace rather than sixteen. Three of these happen to equal the
+# reference's own default because those defaults are "off" as well. `save` is the fifth
+# parameter and the one missing here, because its truth depends on whether this server's
+# save is scheduled -- _save_rule() below reads that off the server each time it is asked.
 #
 # A table rather than an echo of whatever was asked for. Echoing meant a name this server
 # has never heard of came back as a parameter that exists with an empty value, which is a
 # reply a client acts on -- `redis-py`'s config_get() sends `CONFIG GET *` and got back a
 # single parameter named `*`. Answering from a table makes an unknown name answer the
-# empty array the reference answers, and makes every value returned one this table
-# chose -- true of this process for all but `save`, as above
+# empty array the reference answers, and makes every value returned one this module chose
 _CONFIG: dict[bytes, bytes] = {
     b"appendonly": b"no",
     b"databases": b"1",
     b"maxmemory": b"0",
     b"maxmemory-policy": b"noeviction",
-    b"save": b"",
 }
 
 # the three bytes that make an argument a pattern rather than a name, which is the
 # distinction the reference draws before it decides how to answer
 _GLOB_METACHARACTERS = b"*?["
+
+
+def _save_rule(conn) -> bytes:
+    # the rule this server saves by, in the reference's own syntax. There each
+    # `<seconds> <changes>` rule fires once a whole-second clock is MORE than <seconds>
+    # past the last completed save and at least <changes> writes have landed, so a save
+    # every N seconds, changed or not, is `N-1 0` -- `save "1 0"` on redis-server 7.2.7
+    # saves every two seconds, not every one. At N = 1 that is `0 0`, a rule 7.2.7's own
+    # parser refuses, since a rule's seconds must be at least 1; it is answered anyway,
+    # because it is the one spelling that says what this server does and `1 0` would say
+    # every two seconds.
+    #
+    # `""` is the reference's spelling of snapshotting switched off, answered whenever no
+    # save is scheduled. The interval comes from Server.armed_snapshot_interval, which is
+    # non-zero only while run() has the save armed, so this reply agrees with the saves
+    # before a run, during it and after it has returned. conn is None whenever dispatch is
+    # driven with no socket, and conn.server is None on a connection built rather than
+    # accepted; checking conn.server first would raise on the first of those. Only a
+    # public attribute is read through the slot, as its contract in connection.py requires
+    server = None if conn is None else conn.server
+    interval = 0 if server is None else server.armed_snapshot_interval
+    if not interval:
+        return b""
+    return b"%d 0" % (interval - 1)
 
 
 @command(b"CONFIG", arity=-2, kind=Kind.OTHER)
@@ -395,6 +409,11 @@ def config(store, conn, argv: list[bytes]) -> Reply:
         # and it is the only arity error in this server that has a subcommand to name --
         # so the name is spelt out here instead of coming from cmd.name like every other
         return wrong_arity(b"CONFIG|GET"), []
+    # built per call: save's value belongs to the server this connection was accepted by,
+    # and both branches below have to answer from the same table or `CONFIG GET save` and
+    # `CONFIG GET *` could disagree about it. appended last, where the fixed table used to
+    # carry it, so a pattern still answers the five names in the order it always has
+    table = {**_CONFIG, b"save": _save_rule(conn)}
     pairs = []
     seen = set()
     for pattern in patterns:
@@ -403,12 +422,12 @@ def config(store, conn, argv: list[bytes]) -> Reply:
             # an exact name is looked up, not matched, and the reply carries the spelling
             # the client used rather than the canonical one -- `CONFIG GET MAXMEMORY`
             # answers `MAXMEMORY` on the reference, and the lookup itself ignores case
-            if lowered in _CONFIG and lowered not in seen:
+            if lowered in table and lowered not in seen:
                 seen.add(lowered)
                 pairs.append(resp.encode_bulk_string(pattern))
-                pairs.append(resp.encode_bulk_string(_CONFIG[lowered]))
+                pairs.append(resp.encode_bulk_string(table[lowered]))
             continue
-        for name, value in _CONFIG.items():
+        for name, value in table.items():
             # the matcher is told to ignore case rather than the pattern being lowered
             # before it: the two differ wherever the comparison is order-sensitive, and a
             # class range is, so a lowered pattern matches ranges the reference refuses.

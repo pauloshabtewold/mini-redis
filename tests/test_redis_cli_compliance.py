@@ -166,8 +166,10 @@ def _case_info(port):
 
 
 def _case_config(port):
+    # the shared server saves every 60 seconds, the CLI default, which the reference's
+    # syntax spells `59 0`
     result = _cli(port, "CONFIG", "GET", "save")
-    assert result.stdout.splitlines() == ["save", ""]
+    assert result.stdout.splitlines() == ["save", "59 0"]
 
 
 CASES = {
