@@ -21,7 +21,8 @@ same whatever it was read from, because neither function touches a path. Decodin
 proceeds field by field rather than through `pickle` or `marshal`, because a snapshot is
 untrusted input -- a file on disk can be corrupted or replaced, and the byte layer takes
 bytes from any source -- and unpickling untrusted bytes executes arbitrary code.
-`save()`/`load()` are the thin filesystem layer above them.
+`save()`/`load()` are the thin filesystem layer above them, and `check_writable()` refuses
+a path a `save()` could not complete as things stand, before a server starts over it.
 """
 
 import os
@@ -48,12 +49,14 @@ TYPE_LIST = 1
 
 
 class SnapshotError(Exception):
-    """A snapshot could not be decoded or read.
+    """A snapshot could not be decoded or read, or its path failed the startup check.
 
     The one exception any caller catches: corrupt bytes, a checksum mismatch, an
-    unsupported version, or a path that exists but cannot be read. A missing path is
-    not one of these -- see `load()` -- because absent and corrupt are different
-    answers to the caller and `Server.__init__` acts on them differently.
+    unsupported version, a path that exists but cannot be read, or a path
+    `check_writable()` refuses. A `save()` that fails raises `OSError` instead, and a
+    missing file raises `FileNotFoundError` -- see `load()` -- because absent and
+    corrupt are different answers to the caller and `Server.__init__` acts on them
+    differently.
     """
 
 
@@ -174,6 +177,13 @@ def _decode(blob: bytes) -> Store:
     return Store.from_items(items)
 
 
+def _directory_of(path: str) -> str:
+    # one definition for save() and check_writable(), so the directory a startup check
+    # approves is the directory the save then writes into. a bare filename lives in the
+    # current directory, which os.path.dirname spells as ""
+    return os.path.dirname(path) or "."
+
+
 def save(store: Store, path: str) -> None:
     """Write `store` to `path` atomically: encode first, then a temporary file in
     `path`'s own directory, `flush()`, `os.fsync()`, close, `os.rename()` over `path`.
@@ -181,7 +191,7 @@ def save(store: Store, path: str) -> None:
     was there byte-identical.
     """
     blob = encode(store)
-    directory = os.path.dirname(path) or "."
+    directory = _directory_of(path)
     # the temporary file has to share path's own directory: os.rename() below is
     # atomic only within one filesystem, and the platform's default temp directory
     # is not guaranteed to sit on the same one as path
@@ -198,6 +208,32 @@ def save(store: Store, path: str) -> None:
         except OSError:
             pass
         raise
+
+
+def check_writable(path: str) -> None:
+    """Refuse, as `SnapshotError`, a `path` a `save()` could not complete as things
+    stand: one naming no file, one where a directory already stands, and one whose
+    directory is missing, is not a directory, or cannot be written. A server started
+    over such a path answers every write and loses all of them, with a traceback per
+    interval as the only sign, so the refusal belongs before it starts. This sees the
+    directory as it is at the call, and its permissions only -- a directory removed or
+    made read-only afterwards, or a disk that fills up later, is met by the save itself.
+    """
+    if not os.path.basename(path):
+        raise SnapshotError("cannot write snapshot %r: the path names no file" % (path,))
+    if os.path.isdir(path):
+        raise SnapshotError("cannot write snapshot %s: a directory stands at that path" % path)
+    directory = _directory_of(path)
+    if not os.path.isdir(directory):
+        raise SnapshotError(
+            "cannot write snapshot %s: %s does not exist or is not a directory"
+            % (path, directory))
+    # W_OK to create the temporary file and rename it into place, X_OK to reach names
+    # inside the directory at all -- os.rename() needs both, and the file's own mode
+    # needs neither
+    if not os.access(directory, os.W_OK | os.X_OK):
+        raise SnapshotError(
+            "cannot write snapshot %s: %s is not writable" % (path, directory))
 
 
 def load(path: str) -> Store:

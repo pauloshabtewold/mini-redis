@@ -4,8 +4,9 @@ observed writing through a temporary file, and every refusal this module names -
 unsupported version, a blob under the sixteen-byte header, a wrong magic, a trailing
 byte past the trailer, truncation at every offset, an unrecognised kind byte, a list
 entry whose element count is zero, an empty list refused at encode with the save
-leaving nothing on disk, a rename that fails once, and the two paths `load()` tells
-apart, a missing one and a corrupt one, entries that stop short of the trailer with a
+leaving nothing on disk, a rename that fails once, the two paths `load()` tells
+apart, a missing one and a corrupt one, every shape of path the first save could not
+write refused by `check_writable()`, entries that stop short of the trailer with a
 correct checksum, a checksummed blob whose layout runs past its own end -- once through
 each of the two bounds errors the decoder translates -- and the two type bytes pinned
 against their literal values.
@@ -424,3 +425,40 @@ def test_load_on_an_unreadable_path_raises_snapshot_error(tmp_path):
     directory.mkdir()
     with pytest.raises(persistence.SnapshotError):
         persistence.load(str(directory))
+
+
+def test_check_writable_refuses_every_path_the_first_save_could_not_complete(
+    tmp_path, monkeypatch
+):
+    (tmp_path / "in-the-way.mrdb").mkdir()
+    a_file = tmp_path / "a-file"
+    a_file.write_bytes(b"")
+    refused = [
+        ("", "names no file"),
+        (str(tmp_path) + os.sep, "names no file"),
+        (str(tmp_path / "in-the-way.mrdb"), "a directory stands at that path"),
+        (str(tmp_path / "missing" / "dump.mrdb"), "does not exist or is not a directory"),
+        (str(a_file / "dump.mrdb"), "does not exist or is not a directory"),
+    ]
+    for path, reason in refused:
+        with pytest.raises(persistence.SnapshotError, match=reason):
+            persistence.check_writable(path)
+
+    # a read-only directory is stood in for through os.access rather than a chmod: a
+    # test running as root writes into a mode-0555 directory, and would prove nothing
+    monkeypatch.setattr(os, "access", lambda path, mode: False)
+    with pytest.raises(persistence.SnapshotError, match="is not writable"):
+        persistence.check_writable(str(tmp_path / "dump.mrdb"))
+    monkeypatch.undo()
+
+    # the control: a writable directory, a bare filename -- whose directory is the current
+    # one, spelled "" by os.path.dirname -- and a snapshot already there are all accepted,
+    # and the check itself writes nothing
+    before = sorted(p.name for p in tmp_path.iterdir())
+    persistence.check_writable(str(tmp_path / "dump.mrdb"))
+    persistence.check_writable("dump.mrdb")
+    good = Store()
+    good.write(b"k", b"v", keep_ttl=False)
+    persistence.save(good, str(tmp_path / "saved.mrdb"))
+    persistence.check_writable(str(tmp_path / "saved.mrdb"))
+    assert sorted(p.name for p in tmp_path.iterdir()) == sorted(before + ["saved.mrdb"])

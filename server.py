@@ -101,6 +101,14 @@ def _load_initial_store(
 ) -> Store:
     if snapshot_path is None:
         return Store()
+    if snapshot_interval:
+        # ahead of both the load and --ignore-snapshot: a path no save could write as
+        # things stand would otherwise start a server that answers every write and loses
+        # them at the next restart, and --ignore-snapshot's warning would promise a
+        # replacement no save can make. with saving off nothing is written there, so this
+        # check has nothing to refuse -- a directory at the path is still refused, by the
+        # load, unless --ignore-snapshot skips the load as well
+        persistence.check_writable(snapshot_path)
     if ignore_snapshot:
         if os.path.exists(snapshot_path):
             if snapshot_interval:
@@ -192,8 +200,10 @@ def build_arg_parser() -> argparse.ArgumentParser:
         default=DEFAULT_SNAPSHOT_PATH,
         metavar="PATH",
         help="load a snapshot from PATH on startup and save to it every "
-             "--snapshot-interval; refuses to start if the file is corrupt unless "
-             "--ignore-snapshot is given",
+             "--snapshot-interval; refuses to start if what is at PATH cannot be loaded, "
+             "unless --ignore-snapshot is given, and, whenever saving is on, if a save "
+             "could not write PATH as things stand at startup -- a missing or read-only "
+             "directory, or a directory standing at PATH",
     )
     parser.add_argument(
         "--snapshot-interval",
@@ -272,7 +282,8 @@ class Server:
         self.ignore_snapshot = ignore_snapshot
         # the last validation before self._loop below: every refusal in this constructor
         # lands before the selector opens, so a refused construction -- here, a corrupt
-        # snapshot -- leaks no descriptor for the caller to close
+        # snapshot or a path no save could write -- leaks no descriptor for the caller
+        # to close
         self._store = _load_initial_store(snapshot_path, ignore_snapshot, snapshot_interval)
         self._connections: set[Connection] = set()
         self._loop = EventLoop(

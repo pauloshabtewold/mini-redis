@@ -573,6 +573,58 @@ def test_a_corrupt_snapshot_refuses_construction_and_opens_no_selector(tmp_path)
         server_mod.EventLoop = real_loop
 
 
+def test_a_path_the_first_save_could_not_write_refuses_construction_and_opens_no_selector(
+    tmp_path
+):
+    missing = str(tmp_path / "missing" / "dump.mrdb")
+    (tmp_path / "in-the-way.mrdb").mkdir()
+    in_the_way = str(tmp_path / "in-the-way.mrdb")
+
+    built = []
+    real_loop = server_mod.EventLoop
+
+    def counting_event_loop(*args, **kwargs):
+        built.append(1)
+        return real_loop(*args, **kwargs)
+
+    server_mod.EventLoop = counting_event_loop
+    try:
+        # --ignore-snapshot is refused as well: a replacement at the next interval is
+        # exactly what its warning promises, and neither path could take one as it stands
+        for path in (missing, in_the_way):
+            for ignore in (False, True):
+                with pytest.raises(persistence.SnapshotError, match="cannot write snapshot"):
+                    Server(0, snapshot_path=path, ignore_snapshot=ignore)
+        # with saving off the directory at the path is still refused, by the load rather
+        # than by the write check: without --ignore-snapshot the refusal never depends on
+        # the interval, only which of the two reasons it gives does. with the flag and
+        # saving off, nothing reads or writes the path at all and the server starts
+        with pytest.raises(persistence.SnapshotError, match="cannot read snapshot"):
+            Server(0, snapshot_path=in_the_way, snapshot_interval=0)
+        assert built == [], ("a refused construction opened a selector", built)
+
+        # the control: with saving off nothing is ever written there, so the same missing
+        # directory constructs -- the refusal is about saves, not about the path as such
+        off = Server(0, snapshot_path=missing, snapshot_interval=0)
+        try:
+            assert built == [1], built
+            assert off._store.live_count() == 0
+        finally:
+            off._loop.close()
+    finally:
+        server_mod.EventLoop = real_loop
+
+    err = io.StringIO()
+    try:
+        with contextlib.redirect_stderr(err):
+            server_mod.main(["--port", "0", "--snapshot-path", missing])
+        pytest.fail("main() started over a path the first save could not write")
+    except SystemExit as exc:
+        assert exc.code == 1, ("refused like a corrupt snapshot, not argparse's 2", exc.code)
+    assert err.getvalue().startswith("error: cannot write snapshot %s" % missing), (
+        err.getvalue())
+
+
 def test_ignore_snapshot_starts_empty_and_warns_naming_the_path(tmp_path):
     seed = Store()
     seed.write(b"k", b"v", keep_ttl=False)
