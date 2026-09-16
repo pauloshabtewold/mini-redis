@@ -573,6 +573,69 @@ def test_a_corrupt_snapshot_refuses_construction_and_opens_no_selector(tmp_path)
         server_mod.EventLoop = real_loop
 
 
+def test_startup_names_a_temporary_file_an_interrupted_save_left_and_leaves_it_alone(
+    tmp_path
+):
+    path = tmp_path / "dump.mrdb"
+    good = Store()
+    good.write(b"k", b"v", keep_ttl=False)
+    persistence.save(good, str(path))
+    stranded = tmp_path / "dump.mrdb.x1y2z3w4.tmp.mrdb"
+    stranded.write_bytes(b"left by a killed save")
+
+    def warnings_while(step):
+        records = []
+        handler = logging.Handler()
+        handler.emit = records.append
+        logging.getLogger("server").addHandler(handler)
+        try:
+            step()
+        finally:
+            logging.getLogger("server").removeHandler(handler)
+        return [r.getMessage() for r in records if r.levelno >= logging.WARNING]
+
+    def construct(interval):
+        server = Server(0, snapshot_path=str(path), snapshot_interval=interval)
+        try:
+            assert server._store.lookup(b"k") == b"v", "the snapshot itself was not loaded"
+        finally:
+            server._loop.close()
+
+    # saving on and saving off: such a file belongs to the path, not to the interval
+    for interval in (60, 0):
+        warned = warnings_while(lambda: construct(interval))
+        assert [m for m in warned if stranded.name in m and str(path) in m], (interval, warned)
+        assert stranded.read_bytes() == b"left by a killed save", (
+            "startup touched a file that may hold the only copy of a newer save", interval)
+
+    # before the load, not after it: a start refused over a corrupt snapshot is the one
+    # moment that file may be the way back, so its name has to be out by then
+    blob = bytearray(path.read_bytes())
+    blob[len(blob) // 2] ^= 0x01
+    path.write_bytes(bytes(blob))
+
+    def refused():
+        with pytest.raises(persistence.SnapshotError):
+            Server(0, snapshot_path=str(path))
+
+    warned = warnings_while(refused)
+    assert [m for m in warned if stranded.name in m], warned
+    assert stranded.read_bytes() == b"left by a killed save"
+
+    # and ahead of the writability check as well: a start refused because the first save
+    # could not write the path names the file just the same. a read-only directory is stood
+    # in for through os.access, since a test run as root can write a mode-0555 one
+    def unwritable():
+        with pytest.MonkeyPatch.context() as patch:
+            patch.setattr(os, "access", lambda *args, **kwargs: False)
+            with pytest.raises(persistence.SnapshotError, match="not writable"):
+                Server(0, snapshot_path=str(path))
+
+    warned = warnings_while(unwritable)
+    assert [m for m in warned if stranded.name in m], warned
+    assert stranded.read_bytes() == b"left by a killed save"
+
+
 def test_a_path_the_first_save_could_not_write_refuses_construction_and_opens_no_selector(
     tmp_path
 ):

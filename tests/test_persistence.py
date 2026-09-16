@@ -4,7 +4,9 @@ observed writing through a temporary file, and every refusal this module names -
 unsupported version, a blob under the sixteen-byte header, a wrong magic, a trailing
 byte past the trailer, truncation at every offset, an unrecognised kind byte, a list
 entry whose element count is zero, an empty list refused at encode with the save
-leaving nothing on disk, a rename that fails once, the two paths `load()` tells
+leaving nothing on disk, a rename that fails once, an interrupt mid-save leaving no
+temporary file, the temporary file's name and the report that finds that name and no
+other, the two paths `load()` tells
 apart, a missing one and a corrupt one, every shape of path the first save could not
 write refused by `check_writable()`, entries that stop short of the trailer with a
 correct checksum, a checksummed blob whose layout runs past its own end -- once through
@@ -414,6 +416,71 @@ def test_a_save_after_the_injection_is_undone_replaces_the_file(tmp_path):
     )
 
 
+def test_an_interrupt_mid_save_leaves_no_temporary_file(tmp_path, monkeypatch):
+    # a KeyboardInterrupt is a BaseException and no Exception, so a cleanup that caught
+    # only Exception let it unwind past the removal and strand a file the size of the
+    # snapshot beside it
+    def interrupted(fd):
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(os, "fsync", interrupted)
+    store = Store()
+    store.write(b"k", b"v", keep_ttl=False)
+    with pytest.raises(KeyboardInterrupt):
+        persistence.save(store, str(tmp_path / "dump.mrdb"))
+    assert list(tmp_path.iterdir()) == [], sorted(p.name for p in tmp_path.iterdir())
+
+
+def test_a_save_names_its_temporary_file_after_the_snapshot_and_only_that_name_is_reported(
+    tmp_path, monkeypatch
+):
+    path = tmp_path / "dump.mrdb"
+    renamed = []
+    real_rename = os.rename
+
+    def recording_rename(src, dst):
+        renamed.append(pathlib.Path(src).name)
+        return real_rename(src, dst)
+
+    monkeypatch.setattr(os, "rename", recording_rename)
+    store = Store()
+    store.write(b"k", b"v", keep_ttl=False)
+    persistence.save(store, str(path))
+    monkeypatch.undo()
+    (temporary,) = renamed
+    # ending in the snapshot extension is what lets whatever ignores snapshots ignore a
+    # stranded one too
+    assert temporary.startswith("dump.mrdb.") and temporary.endswith(".mrdb"), temporary
+
+    # the very name a real save used, left behind the way a kill leaves it, is what
+    # stale_temporaries() finds -- so if tempfile's own naming ever moves, this is where the
+    # two stop agreeing. beside it, names no save to this path makes -- a random part one
+    # character short and one character long among them -- and a directory and a link
+    # with the right name, none of which it may report
+    stranded = tmp_path / temporary
+    stranded.write_bytes(b"left by a killed save")
+    near_misses = [
+        "dump.mrdb.tmp.mrdb",
+        "dump.mrdb.abcd1234.tmp",
+        "dump.mrdb.abcd12345.tmp.mrdb",
+        "dump.mrdb.abcd123.tmp.mrdb",
+        "other.mrdb.abcd1234.tmp.mrdb",
+        "dump.mrdb.ab-d1234.tmp.mrdb",
+    ]
+    for name in near_misses:
+        (tmp_path / name).write_bytes(b"not a temporary file a save made")
+    (tmp_path / "dump.mrdb.dir12345.tmp.mrdb").mkdir()
+    (tmp_path / "link-target").write_bytes(b"a file some link of the right name points at")
+    (tmp_path / "dump.mrdb.link1234.tmp.mrdb").symlink_to(tmp_path / "link-target")
+    assert persistence.stale_temporaries(str(path)) == [temporary]
+    # and finding them touches nothing: every entry is still there, the snapshot included
+    assert sorted(p.name for p in tmp_path.iterdir()) == sorted(
+        ["dump.mrdb", temporary, "dump.mrdb.dir12345.tmp.mrdb", "link-target",
+         "dump.mrdb.link1234.tmp.mrdb"] + near_misses)
+    assert stranded.read_bytes() == b"left by a killed save"
+    assert sorted(persistence.load(str(path))._data) == [b"k"]
+
+
 def test_load_on_a_missing_path_raises_file_not_found_rather_than_snapshot_error(tmp_path):
     missing = tmp_path / "absent.mrdb"
     with pytest.raises(FileNotFoundError):
@@ -439,6 +506,9 @@ def test_check_writable_refuses_every_path_the_first_save_could_not_complete(
         (str(tmp_path / "in-the-way.mrdb"), "a directory stands at that path"),
         (str(tmp_path / "missing" / "dump.mrdb"), "does not exist or is not a directory"),
         (str(a_file / "dump.mrdb"), "does not exist or is not a directory"),
+        # the temporary file a save writes beside this one carries its name plus
+        # eighteen bytes, which is what runs past the filesystem's limit here
+        (str(tmp_path / ("s" * 245 + ".mrdb")), "past the"),
     ]
     for path, reason in refused:
         with pytest.raises(persistence.SnapshotError, match=reason):
@@ -457,6 +527,7 @@ def test_check_writable_refuses_every_path_the_first_save_could_not_complete(
     before = sorted(p.name for p in tmp_path.iterdir())
     persistence.check_writable(str(tmp_path / "dump.mrdb"))
     persistence.check_writable("dump.mrdb")
+    persistence.check_writable(str(tmp_path / ("s" * 200 + ".mrdb")))
     good = Store()
     good.write(b"k", b"v", keep_ttl=False)
     persistence.save(good, str(tmp_path / "saved.mrdb"))

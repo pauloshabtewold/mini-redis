@@ -21,11 +21,14 @@ same whatever it was read from, because neither function touches a path. Decodin
 proceeds field by field rather than through `pickle` or `marshal`, because a snapshot is
 untrusted input -- a file on disk can be corrupted or replaced, and the byte layer takes
 bytes from any source -- and unpickling untrusted bytes executes arbitrary code.
-`save()`/`load()` are the thin filesystem layer above them, and `check_writable()` refuses
-a path a `save()` could not complete as things stand, before a server starts over it.
+`save()`/`load()` are the thin filesystem layer above them; `check_writable()` refuses a
+path a `save()` could not complete as things stand, and `stale_temporaries()` finds the
+files an interrupted save may have left, by the name `save()` gives its temporary file.
 """
 
 import os
+import re
+import stat
 import struct
 import tempfile
 import zlib
@@ -46,6 +49,12 @@ SNAPSHOT_VERSION = 1
 # of a literal 0, which goes stale silently if these numbers ever move
 TYPE_STRING = 0
 TYPE_LIST = 1
+
+# a save's temporary file is the snapshot's own name, a dot, tempfile's eight random
+# characters and this suffix: one a killed process strands is recognisably that
+# snapshot's, and it ends in the snapshot extension, so whatever already ignores
+# snapshots ignores it too
+_TEMPORARY_SUFFIX = ".tmp.mrdb"
 
 
 class SnapshotError(Exception):
@@ -195,14 +204,19 @@ def save(store: Store, path: str) -> None:
     # the temporary file has to share path's own directory: os.rename() below is
     # atomic only within one filesystem, and the platform's default temp directory
     # is not guaranteed to sit on the same one as path
-    descriptor, temp_path = tempfile.mkstemp(dir=directory)
+    descriptor, temp_path = tempfile.mkstemp(
+        dir=directory, prefix=os.path.basename(path) + ".", suffix=_TEMPORARY_SUFFIX)
     try:
         with os.fdopen(descriptor, "wb") as handle:
             handle.write(blob)
             handle.flush()
             os.fsync(handle.fileno())
         os.rename(temp_path, path)
-    except Exception:
+    except BaseException:
+        # BaseException rather than Exception: a KeyboardInterrupt or SystemExit arriving
+        # mid-write unwinds through here too, and would strand the file otherwise. a kill
+        # never reaches this line at all, and the file it strands is left for
+        # stale_temporaries() to name at the next start
         try:
             os.remove(temp_path)
         except OSError:
@@ -234,6 +248,53 @@ def check_writable(path: str) -> None:
     if not os.access(directory, os.W_OK | os.X_OK):
         raise SnapshotError(
             "cannot write snapshot %s: %s is not writable" % (path, directory))
+    # the temporary file's name is the snapshot's own plus eighteen bytes, so a name a
+    # filesystem takes for the snapshot can still be too long for the file a save has to
+    # write beside it -- and that refusal would otherwise arrive once an interval, from
+    # a running server, rather than here
+    longest = len(os.fsencode(os.path.basename(path))) + 1 + 8 + len(_TEMPORARY_SUFFIX)
+    try:
+        name_max = os.pathconf(directory, "PC_NAME_MAX")
+    except (OSError, ValueError):
+        # a filesystem that does not answer: take the limit nearly all of them have
+        name_max = 255
+    if longest > name_max:
+        raise SnapshotError(
+            "cannot write snapshot %s: its temporary file would need a %d byte name, "
+            "past the %d %s allows" % (path, longest, name_max, directory))
+
+
+def stale_temporaries(path: str) -> list[str]:
+    """Return, sorted, the names of the files beside `path` whose names have exactly the
+    shape `save()` gives its temporary file for `path`. A process killed mid-save never
+    reaches `save()`'s own cleanup, so such a file stays beside the snapshot for good --
+    and one killed after the fsync but before the rename leaves a complete snapshot there,
+    newer than the one at `path`. So nothing here removes one: what it holds is the
+    operator's to judge, and its name is the only evidence of where it came from. Empty
+    when the directory cannot be listed, which is all a directory with no read
+    permission can answer.
+    """
+    directory = _directory_of(path)
+    # tempfile's random part exactly -- eight characters of lowercase letters, digits and
+    # the underscore -- rather than anything between the right prefix and suffix, so the
+    # shape matched is no wider than the names a save actually produces
+    stale = re.compile(
+        re.escape(os.path.basename(path) + ".") + "[a-z0-9_]{8}" + re.escape(_TEMPORARY_SUFFIX))
+    try:
+        names = os.listdir(directory)
+    except OSError:
+        return []
+    return sorted(name for name in names
+                  if stale.fullmatch(name) and _is_regular_file(os.path.join(directory, name)))
+
+
+def _is_regular_file(path: str) -> bool:
+    # lstat rather than os.path.isfile: a temporary file a save made is a regular file and
+    # never a link, and isfile would follow a link of the right name to whatever it names
+    try:
+        return stat.S_ISREG(os.lstat(path).st_mode)
+    except OSError:
+        return False
 
 
 def load(path: str) -> Store:

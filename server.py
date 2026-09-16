@@ -101,6 +101,19 @@ def _load_initial_store(
 ) -> Store:
     if snapshot_path is None:
         return Store()
+    # a process killed mid-save strands its temporary file where no later save looks
+    # for it, and one killed after the fsync may have left a complete snapshot newer than
+    # the one about to be loaded, so each is named here and left alone. first, ahead of
+    # every refusal below -- a path no save could write, a corrupt snapshot -- so the
+    # name is already out when the start is refused, which is when that file is likeliest
+    # to be the way back. whether or not saving is on: such files belong to the path and
+    # not to the interval, and a directory this process cannot list reports none
+    for name in persistence.stale_temporaries(snapshot_path):
+        logger.warning(
+            "found %s beside %s: it has the name a save there gives its temporary file, "
+            "so a save was likely interrupted, and it may hold that save's snapshot; "
+            "nothing reads or removes it", name, snapshot_path,
+        )
     if snapshot_interval:
         # ahead of both the load and --ignore-snapshot: a path no save could write as
         # things stand would otherwise start a server that answers every write and loses

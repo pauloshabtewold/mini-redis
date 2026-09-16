@@ -67,7 +67,11 @@ and defaults to `./dump.mrdb`, resolved against the directory the server was sta
 in; a file that is present but will not decode refuses startup rather than starting
 empty over it, and so does a directory standing where the file should be. Whenever
 saving is on, so does a path a save could not write as things stand at startup, such
-as one whose directory is missing or read-only. `--snapshot-interval` (seconds, default `60`) and
+as one whose directory is missing or read-only. A save writes a
+temporary file beside the snapshot, named after it, and renames it into place; a file
+left under that name, as a process killed mid-save leaves one, is never read or removed,
+and every start over the same path names it in a warning, so long as the directory can
+be listed. `--snapshot-interval` (seconds, default `60`) and
 `--expiry-sweep-interval` (milliseconds, default `100`, the same span as the run
 loop's own `select()` timeout of `0.1` seconds) both follow the same rule as the caps
 above: `0` turns the periodic task off, and a negative value is refused at the CLI and
