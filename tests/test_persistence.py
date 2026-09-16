@@ -6,7 +6,9 @@ byte past the trailer, truncation at every offset, an unrecognised kind byte, a 
 entry whose element count is zero, an empty list refused at encode with the save
 leaving nothing on disk, a rename that fails once, and the two paths `load()` tells
 apart, a missing one and a corrupt one, entries that stop short of the trailer with a
-correct checksum, and the two type bytes pinned against their literal values.
+correct checksum, a checksummed blob whose layout runs past its own end -- once through
+each of the two bounds errors the decoder translates -- and the two type bytes pinned
+against their literal values.
 test_persistence_properties.py covers the refusal contract over inputs this module does
 not choose.
 """
@@ -258,6 +260,33 @@ def test_no_refusal_anywhere_leaks_a_struct_error():
             pass
         except Exception as exc:
             pytest.fail("%r leaked %s instead of SnapshotError" % (bad[:8], type(exc).__name__))
+
+
+def test_a_checksummed_blob_that_runs_past_its_own_end_is_refused_through_each_bounds_error():
+    # the checksum is compared first, so no truncation and no flipped bit ever reaches the
+    # parser's bounds errors -- only a blob whose trailer agrees with a layout that runs off
+    # the end does, which is what a peer choosing both the bytes and their checksum can
+    # send. one blob per exception the decoder has to translate: a key whose length
+    # swallows the trailer, so the type byte is read past the end, and a count one larger
+    # than the entries present, so the next key length is read past the end. the cause is
+    # asserted as well as the type, or either blob could be refused by some other check
+    # and prove nothing about the arm it is here for
+    def checksummed(body):
+        return body + struct.pack("<I", zlib.crc32(body))
+
+    version = persistence.SNAPSHOT_VERSION
+    key_over_the_trailer = checksummed(persistence.MAGIC + struct.pack("<III", version, 1, 4))
+    one_entry = (struct.pack("<I", 1) + b"k" + bytes((persistence.TYPE_STRING,))
+                 + struct.pack("<qI", -1, 1) + b"v")
+    count_past_the_entries = checksummed(
+        persistence.MAGIC + struct.pack("<II", version, 2) + one_entry)
+
+    for blob, cause in ((key_over_the_trailer, IndexError), (count_past_the_entries, struct.error)):
+        with pytest.raises(persistence.SnapshotError) as refused:
+            persistence.decode(blob)
+        assert isinstance(refused.value.__cause__, cause), (
+            "refused, but not through the %s the blob was built to reach" % cause.__name__,
+            refused.value.__cause__)
 
 
 def test_an_unrecognised_kind_byte_is_refused_as_snapshot_error():

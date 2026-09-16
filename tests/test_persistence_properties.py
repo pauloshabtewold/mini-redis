@@ -1,8 +1,9 @@
 """The snapshot format's contract over bit-flipped inputs rather than chosen ones: a
 fixture snapshot holding a string, a list and a TTL, corrupted one bit at a random
-offset, must always refuse as `SnapshotError` and never load a store whose values or
-deadlines differ from the original. Two companions keep the corpus honest: one
-asserting the flips actually reach every region the format has, and one measuring
+offset, must always refuse as `SnapshotError`, for its reason -- so none can load a store
+whose values or deadlines differ from the original, and a flip that is accepted is
+reported with whether the store it loaded does. Two companions keep the corpus honest:
+one asserting the flips actually reach every region the format has, and one measuring
 directly what a format with no checksum at all would accept over this same corpus:
 some fraction of those same flips, accepted with values or deadlines that differ from
 the original.
@@ -32,12 +33,12 @@ def _fixture_blob():
     store.expire_at(b"gamma", 1_700_000_000_000)
     # the whole store, not only its values -- key, kind, value and absolute expiry --
     # or a flip that lands on a deadline and nowhere else has nothing here to disagree
-    # with and goes uncounted by both tests below
+    # with, both in the refusal test's report and in the control at the bottom
     return persistence.encode(store), list(store.snapshot_items())
 
 
 def test_every_single_bit_flip_is_refused_as_snapshot_error():
-    blob, _ = _fixture_blob()
+    blob, original = _fixture_blob()
     rnd = random.Random(SEED)
     for round_index in range(ROUNDS):
         offset = rnd.randrange(len(blob))
@@ -45,7 +46,7 @@ def test_every_single_bit_flip_is_refused_as_snapshot_error():
         flipped = bytearray(blob)
         flipped[offset] ^= 1 << bit
         try:
-            persistence.decode(bytes(flipped))
+            loaded = persistence.decode(bytes(flipped))
         except persistence.SnapshotError as exc:
             # the type alone is not proof: checking the version or a length prefix before
             # the checksum would also refuse every flip as SnapshotError, for the wrong
@@ -70,33 +71,18 @@ def test_every_single_bit_flip_is_refused_as_snapshot_error():
                 % (round_index, offset, bit, type(exc).__name__)
             ) from exc
         else:
+            # accepted at all is already the failure, so no flip in the corpus can load
+            # a store that differs without failing here. what the report adds is which of
+            # two different defects it was: a flip loaded as the original store, or one
+            # loaded as wrong data. snapshot_items() rather than _data alone, so a flip
+            # that changed only a deadline reads as wrong data too
+            differs = list(loaded.snapshot_items()) != original
             raise AssertionError(
-                "round %d offset %d bit %d was accepted" % (round_index, offset, bit)
+                "round %d offset %d bit %d was accepted, loading %s" % (
+                    round_index, offset, bit,
+                    "a store that differs from the original" if differs
+                    else "a store identical to the original")
             )
-
-
-def test_no_single_bit_flip_loads_a_store_that_differs_from_the_original():
-    # the test above asserts every flip refuses; this asserts the same corpus never
-    # reaches a decoded store to compare in the first place -- a decoder refusing for
-    # the wrong reason but still occasionally decoding something would pass that test
-    # and fail this one
-    blob, original = _fixture_blob()
-    rnd = random.Random(SEED)
-    for round_index in range(ROUNDS):
-        offset = rnd.randrange(len(blob))
-        bit = rnd.randrange(8)
-        flipped = bytearray(blob)
-        flipped[offset] ^= 1 << bit
-        try:
-            loaded = persistence.decode(bytes(flipped))
-        except persistence.SnapshotError:
-            continue
-        # snapshot_items() rather than _data alone, so a flip that lands on a deadline
-        # and changes nothing else still counts as a store that differs
-        assert list(loaded.snapshot_items()) == original, (
-            "round %d offset %d bit %d loaded a store that differs from the original"
-            % (round_index, offset, bit)
-        )
 
 
 def test_the_flip_corpus_reaches_every_region_of_the_format():

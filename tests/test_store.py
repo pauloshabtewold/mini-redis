@@ -4,6 +4,7 @@ and the WRONGTYPE check. test_store_properties.py covers the same contract over 
 this module does not choose.
 """
 
+import tracemalloc
 from collections import deque
 
 import pytest
@@ -248,11 +249,34 @@ def test_snapshot_items_includes_a_resident_expired_key_with_its_deadline(keyspa
     assert b"gone" in keyspace._data, "snapshot_items() must not remove anything"
 
 
+def test_snapshot_items_reports_a_deadline_of_zero_as_zero_not_as_no_deadline(keyspace):
+    # -1 is the "no deadline" marker and 0 is a legal deadline already past, and falsy: a
+    # `deadline or -1` reads it as absent, and the key comes back from a reload with no
+    # deadline at all -- live forever, where it went into the snapshot expired
+    keyspace.write(b"k", b"v", keep_ttl=False)
+    keyspace.expire_at(b"k", 0)
+    assert list(keyspace.snapshot_items()) == [(b"k", KIND_STRING, b"v", 0)]
+    assert Store.from_items(list(keyspace.snapshot_items())).deadline(b"k") == 0
+
+
 def test_sample_and_expire_on_a_keyspace_with_no_deadlines_reports_nothing(keyspace):
     keyspace.write(b"k", b"v", keep_ttl=False)
     # count of 20 against zero indexed keys -- this is exactly what
     # random.sample would refuse outright without sample_and_expire's own clamp
     assert keyspace.sample_and_expire(20) == (0, 0)
+
+
+def test_sample_and_expire_reclaims_a_key_whose_deadline_equals_now():
+    # the sweep's boundary has to be lookup()'s: a deadline equal to now has already
+    # passed. a sweep comparing with < leaves that key for a later pass while every read
+    # of the same instant already answers that it is gone. a frozen clock, because a
+    # live one can tick between expire_at() and the draw and let < pass for the wrong reason
+    frozen = FrozenStore()
+    frozen.write(b"k", b"v", keep_ttl=False)
+    frozen.expire_at(b"k", frozen.now_ms())
+    assert frozen.sample_and_expire(20) == (1, 1)
+    assert b"k" not in frozen._data
+    frozen.check_invariants()
 
 
 def test_sample_and_expire_never_draws_the_same_key_twice(keyspace):
@@ -279,6 +303,45 @@ def test_sample_and_expire_never_draws_the_same_key_twice(keyspace):
     assert (sampled, expired) == (20, 20)
     drawn = [effect[1] for effect in keyspace.take_effects()]
     assert len(drawn) == len(set(drawn)) == 20
+
+
+def _bytes_allocated_by(call):
+    # the peak over what was already allocated when the call began, so the index built
+    # before it is not counted against it
+    was_tracing = tracemalloc.is_tracing()
+    if not was_tracing:
+        tracemalloc.start()
+    try:
+        tracemalloc.reset_peak()
+        before, _ = tracemalloc.get_traced_memory()
+        call()
+        _, peak = tracemalloc.get_traced_memory()
+        return peak - before
+    finally:
+        if not was_tracing:
+            tracemalloc.stop()
+
+
+def test_a_sample_allocates_nothing_that_grows_with_the_expiry_index(keyspace):
+    # the sampling index exists so a draw costs the same at any size. drawing from a list
+    # rebuilt out of _expiry on every call is the obvious shape and passes every other
+    # test here -- the keys it picks are just as random -- while at a million keys it
+    # spends milliseconds building that list before looking at one. what a draw
+    # allocates is the witness rather than how long it takes, because an allocation does
+    # not change size on a loaded machine
+    now = keyspace.now_ms()
+    for i in range(100_000):
+        key = b"k%d" % i
+        keyspace.write(key, b"v", keep_ttl=False)
+        keyspace.expire_at(key, now + 3_600_000)
+    # the control: the rejected shape, over this same index, has to clear the bound by a
+    # wide margin, or a bound this loose could not tell the two shapes apart
+    rebuilt = _bytes_allocated_by(lambda: list(keyspace._expiry))
+    assert rebuilt > 512 * 1024, rebuilt
+    drawn = _bytes_allocated_by(lambda: keyspace.sample_and_expire(20))
+    assert drawn < 64 * 1024, (
+        "a draw of twenty over 100,000 indexed keys allocated %d bytes -- it is building "
+        "something the size of the index" % drawn)
 
 
 def test_from_items_builds_a_list_value_as_a_deque_not_a_list(keyspace):

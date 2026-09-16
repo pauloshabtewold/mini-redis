@@ -16,6 +16,7 @@ that never returns, which in-process hangs the suite instead of failing it.
 import contextlib
 import io
 import logging
+import os
 import pathlib
 import subprocess
 import sys
@@ -166,9 +167,13 @@ def test_a_periodic_arm_fires_at_most_once_per_tick_not_once_per_missed_interval
             server._loop.close()
 
 
-def test_an_interval_of_zero_arms_nothing_and_never_fires():
+def test_an_interval_of_zero_arms_nothing_and_never_fires(tmp_path):
     with _injected_clock() as clock:
-        server = Server(0, snapshot_path=None, snapshot_interval=0, expiry_sweep_interval=0)
+        # a real path, not None: the CLI always supplies one, so a zero interval is the
+        # only thing between it and a save on every tick. with no path the snapshot arm
+        # stays unarmed for the other reason, and the interval's own check goes untested
+        server = Server(0, snapshot_path=str(tmp_path / "dump.mrdb"), snapshot_interval=0,
+                        expiry_sweep_interval=0)
         try:
             server._arm_periodic_tasks()
             assert (server._next_sweep_at, server._next_snapshot_at) == (None, None)
@@ -368,6 +373,21 @@ def test_the_cli_snapshot_path_default_and_the_constructor_default_differ():
         server._loop.close()
 
 
+def test_the_interval_and_ignore_defaults_are_the_documented_values_at_both_doors():
+    # README.md publishes both interval defaults, and every other test here passes its
+    # intervals explicitly, so a default that moved would move with nothing to notice it
+    args = build_arg_parser().parse_args([])
+    assert (args.snapshot_interval, args.expiry_sweep_interval, args.ignore_snapshot) == (
+        60, 100, False), (args.snapshot_interval, args.expiry_sweep_interval,
+                          args.ignore_snapshot)
+    server = Server(0)
+    try:
+        assert (server.snapshot_interval, server.expiry_sweep_interval,
+                server.ignore_snapshot) == (60, 100, False)
+    finally:
+        server._loop.close()
+
+
 # error
 
 
@@ -443,6 +463,39 @@ def test_an_arm_that_raises_does_not_escape_the_tick(tmp_path):
     assert scratch_calls == [1], "the failing arm was never even attempted"
 
 
+def test_the_save_arm_leaves_the_previous_snapshot_intact_when_its_rename_fails(
+    tmp_path, monkeypatch
+):
+    # persistence.save()'s own tests prove the swap is atomic; this is what proves the save
+    # arm goes through it. an arm that wrote its path in place would pass every test that
+    # only reads the file back afterwards, and would destroy the previous snapshot the
+    # moment anything went wrong partway through the write
+    path = tmp_path / "dump.mrdb"
+    previous = Store()
+    previous.write(b"previous", b"v", keep_ttl=False)
+    persistence.save(previous, str(path))
+    before = path.read_bytes()
+
+    def refused_rename(src, dst):
+        raise OSError("the rename was refused")
+
+    with _injected_clock() as clock:
+        server = Server(0, snapshot_path=str(path), snapshot_interval=60,
+                        expiry_sweep_interval=0)
+        try:
+            server._store.write(b"newer", b"v", keep_ttl=False)
+            server._next_snapshot_at = clock.monotonic() + 60
+            clock.t += 61.0
+            monkeypatch.setattr(os, "rename", refused_rename)
+            server._tick()
+            monkeypatch.undo()
+        finally:
+            server._loop.close()
+    assert path.read_bytes() == before, "the save arm wrote over the previous snapshot"
+    assert [p.name for p in tmp_path.iterdir()] == ["dump.mrdb"], (
+        "the failed save left a temporary file behind", sorted(p.name for p in tmp_path.iterdir()))
+
+
 def test_the_sweep_stops_on_its_time_budget_not_on_an_iteration_count():
     def passes_when_each_sample_costs(cost):
         with _injected_clock() as clock:
@@ -474,6 +527,10 @@ def test_the_sweep_stops_on_its_time_budget_not_on_an_iteration_count():
     assert fast > 10 * slow, (
         "the two arms ran comparable numbers of passes, so this run could not have "
         "distinguished a time budget from an iteration cap", slow, fast)
+    # both arms take their costs from SWEEP_BUDGET_SECONDS itself, so a budget raised a
+    # hundredfold scales them with it and passes. the millisecond the sweep is held to is
+    # pinned here, against the literal
+    assert SWEEP_BUDGET_SECONDS == 0.001, SWEEP_BUDGET_SECONDS
 
 
 def test_a_corrupt_snapshot_refuses_construction_and_opens_no_selector(tmp_path):
@@ -567,6 +624,25 @@ def test_ignore_snapshot_starts_empty_and_warns_naming_the_path(tmp_path):
     assert not any("replaced" in r.getMessage() for r in warned_no_interval), (
         "an interval of 0 arms no save, so the warning must not promise a replacement",
         [r.getMessage() for r in warned_no_interval])
+
+
+def test_ignore_snapshot_warns_about_nothing_when_no_file_is_there(tmp_path):
+    # the warning names a file it is about to discard and says what becomes of it; with
+    # nothing at the path there is no file to discard and no replacement to promise
+    records = []
+    handler = logging.Handler()
+    handler.emit = records.append
+    logging.getLogger("server").addHandler(handler)
+    try:
+        server = Server(0, snapshot_path=str(tmp_path / "absent.mrdb"), ignore_snapshot=True)
+        try:
+            assert server._store.live_count() == 0
+        finally:
+            server._loop.close()
+    finally:
+        logging.getLogger("server").removeHandler(handler)
+    assert not [r for r in records if r.levelno >= logging.WARNING], (
+        [r.getMessage() for r in records])
 
 
 def test_main_exits_one_naming_the_path_when_the_snapshot_is_corrupt(tmp_path):
