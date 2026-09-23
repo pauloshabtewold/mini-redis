@@ -634,21 +634,37 @@ def test_check_writable_refuses_a_basename_whose_temporary_name_the_filesystem_w
         persistence.check_writable(str(tmp_path / long_name))
 
 
-def test_check_writable_accepts_a_two_hundred_character_accented_basename_that_save_writes_and_load_reads_back(
-    tmp_path
-):
-    # this filesystem counts characters against its name limit, not the utf-8 bytes an
-    # arithmetic check would have counted -- two hundred accented characters is twice
-    # that many bytes and yet a real save writes and a real load reads it back with no
-    # trouble
-    basename = "é" * 200 + ".mrdb"
-    path = tmp_path / basename
-    persistence.check_writable(str(path))
+def test_check_writable_accepts_the_longest_accented_basename_this_filesystem_takes(tmp_path):
+    # the limit belongs to the filesystem, and the two the suite runs on disagree about
+    # what it counts: one counts characters, where two hundred accented ones fit, and one
+    # counts utf-8 bytes, where the same name is twice too long. so the name is found by
+    # asking -- the longest one whose temporary file this filesystem actually creates --
+    # and the check is then required to accept exactly that, which is what a byte count
+    # against PC_NAME_MAX got wrong wherever the two differ
+    accepted = None
+    # upward to the first name this filesystem will not take, so what is tested is its
+    # own ceiling rather than a number this test brought with it
+    for characters in range(1, 401):
+        candidate = tmp_path / ("é" * characters + ".mrdb")
+        probe = tmp_path / (candidate.name + ".abcdefgh.tmp.mrdb")
+        try:
+            probe.touch()
+        except OSError:
+            break
+        probe.unlink()
+        accepted = candidate
+    assert accepted is not None, "no accented basename at all could be written here"
+    persistence.check_writable(str(accepted))
     store = Store()
     store.write(b"k", b"v", keep_ttl=False)
-    persistence.save(store, str(path))
-    loaded = persistence.load(str(path))
-    assert loaded._data[b"k"] == b"v"
+    persistence.save(store, str(accepted))
+    loaded = persistence.load(str(accepted))
+    assert loaded.lookup(b"k") == b"v"
+    # and the other side of the same boundary: one character more than this filesystem
+    # takes is refused by the check rather than met by a save that fails every interval
+    too_long = tmp_path / ("é" * (len(accepted.name) - len(".mrdb") + 1) + ".mrdb")
+    with pytest.raises(persistence.SnapshotError):
+        persistence.check_writable(str(too_long))
 
 
 def test_a_failed_removal_after_a_failed_rename_names_the_stranded_temporary_file_in_the_propagating_exceptions_notes(
