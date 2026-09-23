@@ -18,8 +18,10 @@ import io
 import logging
 import os
 import pathlib
+import signal
 import subprocess
 import sys
+import time
 import types
 
 import pytest
@@ -623,11 +625,14 @@ def test_startup_names_a_temporary_file_an_interrupted_save_left_and_leaves_it_a
     assert stranded.read_bytes() == b"left by a killed save"
 
     # and ahead of the writability check as well: a start refused because the first save
-    # could not write the path names the file just the same. a read-only directory is stood
-    # in for through os.access, since a test run as root can write a mode-0555 one
+    # could not write the path names the file just the same. the refusal is stood in for by
+    # failing the check's own probe, since a test run as root can write a mode-0555 directory
     def unwritable():
         with pytest.MonkeyPatch.context() as patch:
-            patch.setattr(os, "access", lambda *args, **kwargs: False)
+            def refuse(*args, **kwargs):
+                raise PermissionError(13, "Permission denied")
+
+            patch.setattr(persistence.tempfile, "mkstemp", refuse)
             with pytest.raises(persistence.SnapshotError, match="not writable"):
                 Server(0, snapshot_path=str(path))
 
@@ -953,3 +958,179 @@ def test_the_snapshot_arm_re_arms_a_whole_interval_out(tmp_path):
                 "multiplied by a thousand", saves)
         finally:
             server._loop.close()
+
+
+def test_a_sampling_pass_that_raises_still_drains_what_the_earlier_passes_queued():
+    # the drain is the sweep's last act whatever ends it, because the queue it leaves
+    # behind is read by whoever comes next: _dispatch_batch drains once per dispatched
+    # command, so DELs the sweep queued and did not take back are handed to the next
+    # command as if that command had caused them. a drain written as the loop's last
+    # line instead of a finally is skipped by exactly the case that leaves entries on
+    # the queue -- a pass that raises after an earlier one already removed keys
+    with _injected_clock():
+        server = Server(0)
+        try:
+            store = server._store
+            now = store.now_ms()
+            for i in range(SWEEP_SAMPLE_SIZE * 2):
+                key = b"k%d" % i
+                store.write(key, b"v", keep_ttl=False)
+                store.expire_at(key, now - 1)
+            real_sample = store.sample_and_expire
+            passes = []
+
+            def sample_then_fail(count):
+                passes.append(count)
+                if len(passes) > 1:
+                    raise MemoryError("injected partway through the sweep")
+                return real_sample(count)
+
+            store.sample_and_expire = sample_then_fail
+            with pytest.raises(MemoryError):
+                server._sweep_expired()
+            assert len(passes) > 1, (
+                "the sweep stopped before the raising pass, so this run never reached "
+                "the case the finally exists for", passes)
+            assert store.take_effects() == [], (
+                "the sweep left its own DELs on the queue for the next dispatched "
+                "command to be blamed for")
+        finally:
+            server._loop.close()
+
+
+@pytest.mark.parametrize("flag, keyword", [
+    ("--snapshot-interval", "snapshot_interval"),
+    ("--expiry-sweep-interval", "expiry_sweep_interval"),
+], ids=["snapshot", "sweep"])
+def test_an_interval_past_what_can_be_scheduled_is_refused_at_both_doors(flag, keyword):
+    # the other end of the rule the negative check holds: a value this large reaches the
+    # arithmetic that schedules it -- a clock reading plus the interval, or the interval
+    # divided into seconds -- and leaves as an OverflowError traceback, which is the one
+    # shape of bad value the CLI answered with a crash rather than a refusal
+    too_large = 10 ** 400
+    with pytest.raises(SystemExit):
+        build_arg_parser().parse_args([flag, str(too_large)])
+    with pytest.raises(ValueError, match="cannot be scheduled"):
+        Server(0, **{keyword: too_large})
+
+
+def test_the_snapshot_arm_counts_its_interval_from_when_the_save_finished(tmp_path):
+    # the interval is the gap between saves, not a window a long save eats into, which is
+    # what `CONFIG GET save` claims when it spells the schedule in the reference's syntax:
+    # there a rule fires once the clock is past its seconds counted from the last
+    # completed save. a deadline taken before the save runs charges the save's own
+    # duration against the next interval, so a save longer than its interval runs again
+    # the moment it returns -- back to back, on the one thread that answers commands,
+    # with the reply still advertising a gap between them
+    with _injected_clock() as clock:
+        server = Server(0, snapshot_path=str(tmp_path / "dump.mrdb"),
+                        snapshot_interval=60, expiry_sweep_interval=0)
+        try:
+            saves = []
+
+            def slow_save():
+                saves.append(clock.monotonic())
+                # a keyspace big enough to outlast the interval it is saved on
+                clock.t += 90.0
+
+            server._save_snapshot = slow_save
+            server._next_snapshot_at = clock.monotonic() + 60
+            clock.t += 60.0
+            server._tick()
+            assert len(saves) == 1, ("the first save never fired", saves)
+            clock.t += 59.0
+            server._tick()
+            assert len(saves) == 1, (
+                "a second save fired 59 seconds after the first one returned -- the "
+                "interval was counted from before the save rather than from its end",
+                saves)
+            clock.t += 2.0
+            server._tick()
+            assert len(saves) == 2, (
+                "no save fired 61 seconds after the first one returned", saves)
+        finally:
+            server._loop.close()
+
+
+def test_a_second_run_on_an_already_ran_server_arms_nothing(tmp_path):
+    # run()'s own ordering: the if self._ran: check has to run before
+    # _arm_periodic_tasks(), not after -- swap the two and a server that already ran and
+    # stopped answers CONFIG GET save's schedule again the moment run() is called a
+    # second time, even though the second call never gets past the RuntimeError to open
+    # a listener, tick anything, or reach the finally that would disarm it again
+    server = Server(0, snapshot_path=str(tmp_path / "dump.mrdb"), snapshot_interval=60,
+                    expiry_sweep_interval=0)
+    try:
+        server._ran = True
+        with pytest.raises(RuntimeError):
+            server.run()
+        assert server.armed_snapshot_interval == 0, (
+            "a second run() on an already-ran server left a schedule armed that it will "
+            "never honour")
+    finally:
+        server._loop.close()
+
+
+def test_main_lets_a_non_snapshot_construction_failure_propagate(monkeypatch):
+    # main()'s own comment promises this: only persistence.SnapshotError is turned into
+    # a one-line message and a clean exit. anything else raised while constructing a
+    # Server -- a bug, an unrelated OSError -- is left to crash with its own traceback,
+    # which `except Exception` here would swallow just as readily as the one exception
+    # this is supposed to catch
+    def exploding_server(*args, **kwargs):
+        raise RuntimeError("not a SnapshotError")
+
+    monkeypatch.setattr(server_mod, "Server", exploding_server)
+    with pytest.raises(RuntimeError, match="not a SnapshotError"):
+        server_mod.main(["--port", "0"])
+
+
+def test_a_periodic_task_raising_keyboardinterrupt_escapes_the_tick():
+    # _guard_task's `except Exception` is deliberate, not a stand-in for a broader catch:
+    # a KeyboardInterrupt or SystemExit raised inside a periodic task has to leave the
+    # tick rather than being logged and swallowed, the same rule _guard already follows
+    # for a connection, and what lets an interrupt arriving during a save still end the
+    # process. widening the clause to `except BaseException` passes every other test in
+    # this module, and this one drives _tick() directly so that mutant fails here on the
+    # missing exception rather than on a loop that never ends
+    server = Server(0, snapshot_path=None, snapshot_interval=0, expiry_sweep_interval=1)
+    try:
+        def exploding():
+            raise KeyboardInterrupt()
+
+        server._sweep_expired = exploding
+        server._arm_periodic_tasks()
+        server._next_sweep_at = time.monotonic() - 1
+        with pytest.raises(KeyboardInterrupt):
+            server._tick()
+    finally:
+        server._loop.close()
+
+
+def test_run_unwinds_cleanly_when_a_periodic_task_raises_keyboardinterrupt():
+    # the other half of the rule above, at run()'s own level: an interrupt from inside a
+    # task takes the same way out as any other raise -- the loop closed, both deadlines
+    # disarmed, both signal handlers restored -- rather than leaving a half-stopped
+    # server behind. the task raises once and then stops the loop, so a boundary that
+    # swallowed the interrupt ends this test on the missing exception instead of hanging
+    # the suite on a sweep that raises every interval forever
+    before = (signal.getsignal(signal.SIGINT), signal.getsignal(signal.SIGTERM))
+    server = Server(0, snapshot_path=None, snapshot_interval=0, expiry_sweep_interval=1)
+    raised = []
+
+    def exploding_once():
+        if raised:
+            server._running = False
+            return
+        raised.append(1)
+        raise KeyboardInterrupt()
+
+    server._sweep_expired = exploding_once
+    with pytest.raises(KeyboardInterrupt):
+        server.run()
+    assert server._loop._selector.get_map() is None, (
+        "the selector must still be closed when the tick's own exception escapes run()")
+    assert (server._next_sweep_at, server._next_snapshot_at) == (None, None), (
+        "both deadlines must still be disarmed on the way out")
+    assert (signal.getsignal(signal.SIGINT), signal.getsignal(signal.SIGTERM)) == before, (
+        "the signal handlers must still be restored when run() exits through this path")

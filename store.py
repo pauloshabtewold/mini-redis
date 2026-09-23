@@ -95,8 +95,10 @@ class Store:
         last_key = self._expiry_keys.pop()
         # moving the list's last entry into the vacated slot avoids shifting everything
         # after it, which is what keeps this O(1) rather than O(n). skipped when key is
-        # itself the last entry: last_key then equals key, and running the two lines
-        # below would undo the pop two lines above, reinserting the very key it removed
+        # itself the last entry: last_key then equals key, and slot is now one past the
+        # end of the list the pop above already shortened, so running the two lines
+        # below would raise IndexError: list assignment index out of range rather than
+        # anything more subtle
         if last_key != key:
             self._expiry_keys[slot] = last_key
             self._expiry_slots[last_key] = slot
@@ -219,7 +221,9 @@ class Store:
         # must return a FrozenStore, or a frozen-clock caller is handed a wall-clock store
         # and a deadline test that passes for the wrong reason
         store = cls()
+        loaded = 0
         for key, kind, value, expiry in items:
+            loaded += 1
             if kind == KIND_STRING:
                 store.write(key, value, keep_ttl=False)
             elif kind == KIND_LIST:
@@ -233,6 +237,17 @@ class Store:
                 raise ValueError("not a snapshot kind this store recognizes: %r" % (kind,))
             if expiry != -1:
                 store.expire_at(key, expiry)
+        # two items naming one key would leave the second one's value and deadline in the
+        # keyspace and the first one's nowhere, with nothing said. counted rather than
+        # watched per key: a membership test on every write costs every load a snapshot
+        # with no repeat in it pays for nothing, where the keyspace this just built
+        # already knows how many distinct keys arrived. which key it was is not named
+        # here, because items may be an iterator this has already consumed -- the caller
+        # holding the entries is the one that can still find it
+        if len(store._data) != loaded:
+            raise ValueError(
+                "two of the %d items share one key: they produced %d keys"
+                % (loaded, len(store._data)))
         return store
 
     def flush(self) -> int:

@@ -16,9 +16,12 @@ test_persistence_properties.py covers the refusal contract over inputs this modu
 not choose.
 """
 
+import faulthandler
 import os
 import pathlib
+import stat
 import struct
+import tempfile
 import zlib
 from collections import deque
 
@@ -494,6 +497,39 @@ def test_load_on_an_unreadable_path_raises_snapshot_error(tmp_path):
         persistence.load(str(directory))
 
 
+def test_load_refuses_a_named_pipe_by_type_without_ever_blocking_on_open(tmp_path):
+    # a fifo's open() blocks until a writer shows up -- with no writer coming, the old
+    # load() would hang here forever. the bound below is insurance in case a future
+    # change reopens that hang: it kills the process rather than letting the suite hang
+    # with it, since timeout(1) is not available here
+    fifo_path = tmp_path / "dump.mrdb"
+    os.mkfifo(fifo_path)
+    faulthandler.dump_traceback_later(5, exit=True)
+    try:
+        with pytest.raises(persistence.SnapshotError, match="not a regular file"):
+            persistence.load(str(fifo_path))
+    finally:
+        faulthandler.cancel_dump_traceback_later()
+
+
+def test_load_on_a_dangling_symlink_still_raises_file_not_found(tmp_path):
+    link = tmp_path / "dump.mrdb"
+    link.symlink_to(tmp_path / "gone.mrdb")
+    with pytest.raises(FileNotFoundError):
+        persistence.load(str(link))
+
+
+def test_load_through_a_symlink_to_a_good_snapshot_still_loads(tmp_path):
+    real_path = tmp_path / "real.mrdb"
+    store = Store()
+    store.write(b"k", b"v", keep_ttl=False)
+    persistence.save(store, str(real_path))
+    link = tmp_path / "dump.mrdb"
+    link.symlink_to(real_path)
+    loaded = persistence.load(str(link))
+    assert loaded._data[b"k"] == b"v"
+
+
 def test_check_writable_refuses_every_path_the_first_save_could_not_complete(
     tmp_path, monkeypatch
 ):
@@ -506,26 +542,21 @@ def test_check_writable_refuses_every_path_the_first_save_could_not_complete(
         (str(tmp_path / "in-the-way.mrdb"), "a directory stands at that path"),
         (str(tmp_path / "missing" / "dump.mrdb"), "does not exist or is not a directory"),
         (str(a_file / "dump.mrdb"), "does not exist or is not a directory"),
-        # the temporary file a save writes beside this one carries its name plus
-        # eighteen bytes, which is what runs past the filesystem's limit here
-        (str(tmp_path / ("s" * 245 + ".mrdb")), "past the"),
+        # tried for real rather than measured -- a save's own temporary file, eighteen
+        # bytes longer than this basename, is what this filesystem actually refuses
+        (str(tmp_path / ("s" * 245 + ".mrdb")), "cannot write snapshot"),
     ]
     for path, reason in refused:
         with pytest.raises(persistence.SnapshotError, match=reason):
             persistence.check_writable(path)
 
-    # a read-only directory is stood in for through os.access rather than a chmod: a
-    # test running as root writes into a mode-0555 directory, and would prove nothing
-    monkeypatch.setattr(os, "access", lambda path, mode: False)
-    with pytest.raises(persistence.SnapshotError, match="is not writable"):
-        persistence.check_writable(str(tmp_path / "dump.mrdb"))
-    monkeypatch.undo()
-
-    # the control: a writable directory, a bare filename -- whose directory is the current
-    # one, spelled "" by os.path.dirname -- and a snapshot already there are all accepted,
-    # and the check itself writes nothing
+    # the control: a writable directory, a bare filename -- whose directory is the
+    # current one, spelled "" by os.path.dirname, confirmed here from inside tmp_path
+    # rather than wherever the suite happens to run from -- and a snapshot already
+    # there are all accepted, and the check itself leaves nothing behind
     before = sorted(p.name for p in tmp_path.iterdir())
     persistence.check_writable(str(tmp_path / "dump.mrdb"))
+    monkeypatch.chdir(tmp_path)
     persistence.check_writable("dump.mrdb")
     persistence.check_writable(str(tmp_path / ("s" * 200 + ".mrdb")))
     good = Store()
@@ -533,3 +564,283 @@ def test_check_writable_refuses_every_path_the_first_save_could_not_complete(
     persistence.save(good, str(tmp_path / "saved.mrdb"))
     persistence.check_writable(str(tmp_path / "saved.mrdb"))
     assert sorted(p.name for p in tmp_path.iterdir()) == sorted(before + ["saved.mrdb"])
+
+
+def test_check_writable_needs_both_write_and_search_permission_on_the_directory(tmp_path):
+    # 0600 is writable but not searchable, 0555 is searchable but not writable -- a
+    # directory tried at only 0500 (searchable, not writable) or only 0466-style modes
+    # cannot tell the two permissions apart, since either alone already refuses. both
+    # are needed for os.rename() to land the temporary file at path, and check_writable()
+    # now finds that out by attempting exactly what save() attempts
+    writable_not_searchable = tmp_path / "writable-not-searchable"
+    writable_not_searchable.mkdir()
+    writable_not_searchable.chmod(0o600)
+    searchable_not_writable = tmp_path / "searchable-not-writable"
+    searchable_not_writable.mkdir()
+    searchable_not_writable.chmod(0o555)
+    try:
+        with pytest.raises(persistence.SnapshotError):
+            persistence.check_writable(str(writable_not_searchable / "dump.mrdb"))
+        with pytest.raises(persistence.SnapshotError):
+            persistence.check_writable(str(searchable_not_writable / "dump.mrdb"))
+    finally:
+        writable_not_searchable.chmod(0o700)
+        searchable_not_writable.chmod(0o700)
+
+
+def test_check_writable_refuses_a_directory_that_takes_a_file_but_will_not_let_it_be_removed(
+    tmp_path
+):
+    if not hasattr(os, "chflags"):
+        pytest.skip("no os.chflags on this platform to build an append-only directory")
+    append_only = tmp_path / "append-only"
+    append_only.mkdir()
+    try:
+        os.chflags(str(append_only), stat.UF_APPEND)
+    except OSError:
+        pytest.skip("this filesystem does not honor UF_APPEND on a directory")
+    try:
+        with pytest.raises(persistence.SnapshotError, match="cannot be removed|not removed"):
+            persistence.check_writable(str(append_only / "dump.mrdb"))
+    finally:
+        os.chflags(str(append_only), 0)
+
+
+def test_check_writable_refuses_an_existing_snapshot_whose_flags_would_block_the_rename(
+    tmp_path
+):
+    if not hasattr(os, "chflags") or not hasattr(stat, "UF_IMMUTABLE"):
+        pytest.skip("no chflags/UF_IMMUTABLE on this platform")
+    path = tmp_path / "dump.mrdb"
+    good = Store()
+    good.write(b"k", b"v", keep_ttl=False)
+    persistence.save(good, str(path))
+    try:
+        os.chflags(str(path), stat.UF_IMMUTABLE)
+    except OSError:
+        pytest.skip("this filesystem does not honor UF_IMMUTABLE")
+    try:
+        with pytest.raises(persistence.SnapshotError):
+            persistence.check_writable(str(path))
+    finally:
+        os.chflags(str(path), 0)
+
+
+def test_check_writable_refuses_a_basename_whose_temporary_name_the_filesystem_will_not_accept(
+    tmp_path
+):
+    long_name = "s" * 245 + ".mrdb"
+    with pytest.raises(persistence.SnapshotError):
+        persistence.check_writable(str(tmp_path / long_name))
+
+
+def test_check_writable_accepts_a_two_hundred_character_accented_basename_that_save_writes_and_load_reads_back(
+    tmp_path
+):
+    # this filesystem counts characters against its name limit, not the utf-8 bytes an
+    # arithmetic check would have counted -- two hundred accented characters is twice
+    # that many bytes and yet a real save writes and a real load reads it back with no
+    # trouble
+    basename = "é" * 200 + ".mrdb"
+    path = tmp_path / basename
+    persistence.check_writable(str(path))
+    store = Store()
+    store.write(b"k", b"v", keep_ttl=False)
+    persistence.save(store, str(path))
+    loaded = persistence.load(str(path))
+    assert loaded._data[b"k"] == b"v"
+
+
+def test_a_failed_removal_after_a_failed_rename_names_the_stranded_temporary_file_in_the_propagating_exceptions_notes(
+    tmp_path, monkeypatch
+):
+    path = tmp_path / "dump.mrdb"
+    good = Store()
+    good.write(b"first", b"value", keep_ttl=False)
+    persistence.save(good, str(path))
+    before = path.read_bytes()
+
+    later = Store()
+    later.write(b"second", b"value", keep_ttl=False)
+
+    def failing_rename(a, b):
+        raise OSError("the rename was refused")
+
+    def failing_remove(p):
+        raise OSError("the removal was refused too")
+
+    monkeypatch.setattr(os, "rename", failing_rename)
+    monkeypatch.setattr(os, "remove", failing_remove)
+    with pytest.raises(OSError) as failed:
+        persistence.save(later, str(path))
+    notes = getattr(failed.value, "__notes__", [])
+    assert notes, "the rename-then-remove failure left no note on the propagating exception"
+    assert any(".tmp.mrdb" in note for note in notes), (
+        "no note names the stranded temporary file: %r" % (notes,)
+    )
+    assert path.read_bytes() == before, "the previous snapshot was modified"
+    leftover = [p.name for p in tmp_path.iterdir() if p.name != "dump.mrdb"]
+    assert len(leftover) == 1 and leftover[0].endswith(".tmp.mrdb"), (
+        "the stranded temporary file itself is missing: %r" % (leftover,)
+    )
+
+
+def test_the_temporary_file_is_created_inside_the_guarded_region_so_an_interrupt_as_mkstemp_returns_leaves_nothing_behind(
+    tmp_path, monkeypatch
+):
+    # tempfile.mkstemp() itself now runs inside save()'s guarded try, with temp_path
+    # pre-set to None ahead of it -- so an interrupt at the earliest possible point,
+    # before mkstemp hands back a path at all, finds nothing to clean up rather than
+    # crashing on a name save() was never given
+    def interrupted_mkstemp(*args, **kwargs):
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(tempfile, "mkstemp", interrupted_mkstemp)
+    store = Store()
+    store.write(b"k", b"v", keep_ttl=False)
+    with pytest.raises(KeyboardInterrupt):
+        persistence.save(store, str(tmp_path / "dump.mrdb"))
+    assert list(tmp_path.iterdir()) == []
+
+
+def test_stale_temporaries_names_a_file_in_a_directory_that_is_listable_but_not_searchable(
+    tmp_path
+):
+    directory = tmp_path / "listable-not-searchable"
+    directory.mkdir()
+    stranded_name = "dump.mrdb.abcd1234.tmp.mrdb"
+    (directory / stranded_name).write_bytes(b"left by a killed save")
+    directory.chmod(0o444)
+    try:
+        assert persistence.stale_temporaries(str(directory / "dump.mrdb")) == [stranded_name]
+    finally:
+        directory.chmod(0o755)
+
+
+def test_stale_temporaries_names_the_older_bare_tmpxxxxxxxx_shape(tmp_path):
+    path = tmp_path / "dump.mrdb"
+    legacy = tmp_path / "tmpabcd1234"
+    legacy.write_bytes(b"left by an older build's crash")
+    assert persistence.stale_temporaries(str(path)) == ["tmpabcd1234"]
+
+
+def test_stale_temporaries_still_refuses_a_symlink_and_a_directory_and_escapes_metacharacters_and_sorts_the_result(
+    tmp_path
+):
+    path = tmp_path / "dump.mrdb"
+    current = "dump.mrdb.bbbb2222.tmp.mrdb"
+    legacy = "tmpaaaa1111"
+    (tmp_path / current).write_bytes(b"a real temporary file")
+    (tmp_path / legacy).write_bytes(b"a real legacy temporary file")
+    (tmp_path / "dump.mrdb.cccc3333.tmp.mrdb").mkdir()
+    (tmp_path / "link-target").write_bytes(b"whatever a link of the right name points at")
+    (tmp_path / "dump.mrdb.dddd4444.tmp.mrdb").symlink_to(tmp_path / "link-target")
+    # "." in the snapshot's own basename is a regex metacharacter -- unescaped, it would
+    # also match a literal "X" here, wrongly claiming a file that belongs to a
+    # differently-named snapshot
+    (tmp_path / "dumpXmrdb.eeee5555.tmp.mrdb").write_bytes(b"belongs to a different name")
+    assert persistence.stale_temporaries(str(path)) == sorted([current, legacy])
+
+
+def test_a_snapshot_with_a_repeated_key_is_refused_naming_the_key():
+    store = Store()
+    store.write(b"only", b"first", keep_ttl=False)
+    blob = bytearray(persistence.encode(store))
+    header = bytes(blob[:8])
+    entry = bytes(blob[12:-4])
+    body = header + struct.pack("<I", 2) + entry + entry
+    spliced = body + struct.pack("<I", zlib.crc32(body))
+    with pytest.raises(persistence.SnapshotError, match="only"):
+        persistence.decode(spliced)
+
+
+def test_a_snapshot_version_of_zero_with_a_correct_checksum_is_refused_as_unsupported():
+    # pins != rather than > deciding this: SNAPSHOT_VERSION is 1, so a mutant comparing
+    # with > would let a version of 0 straight through to an empty, otherwise valid blob
+    blob = bytearray(persistence.encode(Store()))
+    blob[4:8] = struct.pack("<I", 0)
+    blob[-4:] = struct.pack("<I", zlib.crc32(bytes(blob[:-4])))
+    with pytest.raises(persistence.SnapshotError, match="unsupported"):
+        persistence.decode(bytes(blob))
+
+
+def test_an_unrecognised_type_byte_laid_out_as_a_list_is_refused():
+    # test_an_unrecognised_kind_byte_is_refused_as_snapshot_error above flips the type
+    # byte on a string entry, which a decoder branching on "!= TYPE_STRING" refuses
+    # exactly as well as one branching on "== TYPE_LIST" does. this flips it on a list
+    # entry instead: the bytes behind the byte are shaped as a genuine list, so a
+    # decoder that takes any byte other than TYPE_STRING for TYPE_LIST would parse it
+    # as one and never refuse it at all
+    store = Store()
+    store.write(b"l", deque([b"a", b"b"]), keep_ttl=False)
+    blob = bytearray(persistence.encode(store))
+    # magic, version and key count are four bytes each, then a four-byte key length and
+    # the key itself, and the type byte is next
+    type_at = 4 + 4 + 4 + 4 + len(b"l")
+    assert blob[type_at] == persistence.TYPE_LIST
+    unknown = 0x7F
+    assert unknown not in (persistence.TYPE_STRING, persistence.TYPE_LIST)
+    blob[type_at] = unknown
+    blob[-4:] = struct.pack("<I", zlib.crc32(bytes(blob[:-4])))
+    with pytest.raises(persistence.SnapshotError):
+        persistence.decode(bytes(blob))
+
+
+class _FakeLengthBytes(bytes):
+    """Stands in for a value long enough to overflow encode()'s uint32 length field,
+    without ever allocating the four gibibytes such a value would actually take: only
+    `__len__` lies, so the guard sees the size it would refuse while the fixture itself
+    holds a handful of real bytes.
+    """
+
+    def __len__(self):
+        return 0x1_0000_0000
+
+
+def test_a_value_too_long_for_the_formats_uint32_length_field_is_refused_naming_the_key(
+    tmp_path
+):
+    store = Store()
+    store.write(b"toolong", _FakeLengthBytes(b"x"), keep_ttl=False)
+    with pytest.raises(ValueError, match="toolong"):
+        persistence.encode(store)
+    # save() must fail before it creates a temporary file, the same guarantee the
+    # empty-list refusal above already gives
+    with pytest.raises(ValueError, match="toolong"):
+        persistence.save(store, str(tmp_path / "dump.mrdb"))
+    assert list(tmp_path.iterdir()) == [], "save left something behind before encoding failed"
+
+
+def test_a_key_too_long_for_the_formats_uint32_length_field_is_refused(tmp_path):
+    store = Store()
+    store.write(_FakeLengthBytes(b"k"), b"v", keep_ttl=False)
+    with pytest.raises(ValueError, match="the key itself"):
+        persistence.encode(store)
+    assert list(tmp_path.iterdir()) == [], "save must not create anything before encode runs"
+
+
+def test_a_list_element_too_long_for_the_formats_uint32_length_field_is_refused(tmp_path):
+    store = Store()
+    store.write(b"l", deque([_FakeLengthBytes(b"x")]), keep_ttl=False)
+    with pytest.raises(ValueError, match="one of its elements"):
+        persistence.encode(store)
+    assert list(tmp_path.iterdir()) == [], "save must not create anything before encode runs"
+
+
+class _FakeLengthDeque(deque):
+    """Stands in for a list with billions of elements, without ever holding that many:
+    only `__len__` lies. `_encode_entry` checks the container's own length before it
+    ever calls `list()` on it, so the handful of real elements this fixture actually
+    holds are never materialized before the refusal fires.
+    """
+
+    def __len__(self):
+        return 0x1_0000_0000
+
+
+def test_a_list_element_count_too_long_for_the_formats_uint32_length_field_is_refused(tmp_path):
+    store = Store()
+    store.write(b"l", _FakeLengthDeque([b"a"]), keep_ttl=False)
+    with pytest.raises(ValueError, match="its element count"):
+        persistence.encode(store)
+    assert list(tmp_path.iterdir()) == [], "save must not create anything before encode runs"

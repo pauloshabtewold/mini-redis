@@ -11,10 +11,14 @@ little-endian `uint32` `zlib.crc32` of every byte before it.
 `decode()` checks in this order and no other: the blob is at least sixteen bytes, the
 magic matches, the trailer's checksum matches `zlib.crc32` of everything before it, the
 version is one this module knows, then the entries parse. The checksum is verified
-before any length prefix in the blob is trusted -- a flip inside a length field meets an
-absurd number and a flip inside a payload byte would otherwise pass every bounds check
-there is, so checking lengths first would refuse some corruption for the wrong reason and
-accept the rest with silently wrong data.
+before any length prefix in the blob is trusted, but not because checking it later would
+let corruption through silently -- moved after the entry loop, it still refuses every
+single-bit flip test_persistence_properties.py's corpus throws at it, just for the wrong
+reason: a flip inside a length field meets an absurd number and is caught there, by a
+bounds error rather than a checksum mismatch, before the checksum is ever read. Checking
+it first names the true cause instead of a coincidental one. What actually accepts
+corruption with silently wrong data, the same corpus measures directly, is having no
+checksum at all.
 
 `encode()`/`decode()` are the byte layer with no filesystem involved: a blob decodes the
 same whatever it was read from, because neither function touches a path. Decoding
@@ -26,6 +30,7 @@ path a `save()` could not complete as things stand, and `stale_temporaries()` fi
 files an interrupted save may have left, by the name `save()` gives its temporary file.
 """
 
+import errno
 import os
 import re
 import stat
@@ -82,9 +87,25 @@ def encode(store: Store) -> bytes:
     return body + struct.pack("<I", zlib.crc32(body))
 
 
+# the width every length prefix in the format is packed at -- struct.pack("<I", ...)
+# raises struct.error past this bound, naming no key and no size, which is silent
+# until the next periodic save dies with a traceback the log cannot connect back to
+# whichever key grew past it. reachable with --max-value-size 0, which turns that cap
+# off entirely
+_UINT32_MAX = 0xFFFFFFFF
+
+
+def _refuse_if_too_long_for_a_uint32(key: bytes, what: str, length: int) -> None:
+    if length > _UINT32_MAX:
+        raise ValueError(
+            "cannot snapshot key %r: %s is %d bytes, past what this format's uint32 "
+            "length field holds" % (key, what, length))
+
+
 def _encode_entry(key: bytes, kind: bytes, value: object, expiry: int) -> bytes:
     # kind is always KIND_STRING or KIND_LIST here -- Store.kind_of() raises for any
     # other value, so the else branch below never has a third case to worry about
+    _refuse_if_too_long_for_a_uint32(key, "the key itself", len(key))
     type_byte = TYPE_LIST if kind == KIND_LIST else TYPE_STRING
     parts = [
         struct.pack("<I", len(key)), key,
@@ -92,6 +113,10 @@ def _encode_entry(key: bytes, kind: bytes, value: object, expiry: int) -> bytes:
         struct.pack("<q", expiry),
     ]
     if kind == KIND_LIST:
+        # checked against value's own length before list() below ever materializes it,
+        # so a container whose real elements are few but whose reported length is not
+        # still refuses here rather than however list() would react to that
+        _refuse_if_too_long_for_a_uint32(key, "its element count", len(value))
         elements = list(value)
         if not elements:
             # refusing here keeps a store that has somehow broken the no-empty-list
@@ -101,9 +126,11 @@ def _encode_entry(key: bytes, kind: bytes, value: object, expiry: int) -> bytes:
             raise ValueError("cannot snapshot an empty list at key %r" % (key,))
         parts.append(struct.pack("<I", len(elements)))
         for element in elements:
+            _refuse_if_too_long_for_a_uint32(key, "one of its elements", len(element))
             parts.append(struct.pack("<I", len(element)))
             parts.append(element)
     else:
+        _refuse_if_too_long_for_a_uint32(key, "its value", len(value))
         parts.append(struct.pack("<I", len(value)))
         parts.append(value)
     return b"".join(parts)
@@ -168,10 +195,14 @@ def _decode(blob: bytes) -> Store:
             # in order
             value = elements
         else:
-            # any byte other than TYPE_LIST reads as a string entry's layout -- an
-            # unrecognised byte still names itself, through Store.from_items()'s own
-            # ValueError below, rather than this decoder guessing a second layout for a
-            # byte it does not know
+            # any byte other than TYPE_LIST is read as a string entry's layout, rather
+            # than this decoder guessing a second layout for a byte it does not know --
+            # but that layout being self-consistent is not guaranteed. bytes actually
+            # written as a list, behind an unrecognised type byte, are read as a string
+            # length instead of an element count and land the offset short of or past
+            # the trailer, refused below as trailing bytes rather than through
+            # Store.from_items()'s ValueError, which only fires when what follows the
+            # byte happens to parse as a legal string entry
             kind = KIND_STRING if type_byte == TYPE_STRING else type_byte
             (value_len,) = struct.unpack_from("<I", blob, offset)
             offset += 4
@@ -183,7 +214,22 @@ def _decode(blob: bytes) -> Store:
     # otherwise be accepted with the extra bytes silently ignored
     if offset != len(blob) - 4:
         raise SnapshotError("trailing bytes after the last entry")
-    return Store.from_items(items)
+    try:
+        return Store.from_items(items)
+    except ValueError:
+        # from_items() refuses two entries naming one key -- reachable only from a
+        # crafted file or a peer's bytes, since our own encoder walks a keyspace whose
+        # keys are unique already -- and cannot say which key it was, because what it
+        # was handed may be an iterator it has consumed. this holds the entries, so it
+        # can: a scan for the first repeat names it, and finding none means the refusal
+        # was about something else this decoder built -- an unrecognised kind byte --
+        # which decode() above turns into the same one exception either way
+        seen = set()
+        for key, _, _, _ in items:
+            if key in seen:
+                raise SnapshotError("snapshot has key %r twice" % (key,)) from None
+            seen.add(key)
+        raise
 
 
 def _directory_of(path: str) -> str:
@@ -197,41 +243,64 @@ def save(store: Store, path: str) -> None:
     """Write `store` to `path` atomically: encode first, then a temporary file in
     `path`'s own directory, `flush()`, `os.fsync()`, close, `os.rename()` over `path`.
     `path` itself is never opened for writing, so a failure at any step leaves whatever
-    was there byte-identical.
+    was there byte-identical. `tempfile.mkstemp()` itself runs inside the guarded region
+    below, with `temp_path` set to `None` ahead of it, so an interrupt at the earliest
+    possible point -- before a temporary file exists at all -- finds nothing to clean up
+    rather than acting on a name this function was never given.
     """
     blob = encode(store)
     directory = _directory_of(path)
-    # the temporary file has to share path's own directory: os.rename() below is
-    # atomic only within one filesystem, and the platform's default temp directory
-    # is not guaranteed to sit on the same one as path
-    descriptor, temp_path = tempfile.mkstemp(
-        dir=directory, prefix=os.path.basename(path) + ".", suffix=_TEMPORARY_SUFFIX)
+    temp_path = None
     try:
-        with os.fdopen(descriptor, "wb") as handle:
+        # the temporary file has to share path's own directory: os.rename() below is
+        # atomic only within one filesystem, and the platform's default temp directory
+        # is not guaranteed to sit on the same one as path
+        descriptor, temp_path = tempfile.mkstemp(
+            dir=directory, prefix=os.path.basename(path) + ".", suffix=_TEMPORARY_SUFFIX)
+        try:
+            handle = os.fdopen(descriptor, "wb")
+        except BaseException:
+            # fdopen failed to take ownership of the descriptor, so nothing else in
+            # this function will ever close it
+            os.close(descriptor)
+            raise
+        with handle:
             handle.write(blob)
             handle.flush()
             os.fsync(handle.fileno())
         os.rename(temp_path, path)
-    except BaseException:
+    except BaseException as original:
         # BaseException rather than Exception: a KeyboardInterrupt or SystemExit arriving
         # mid-write unwinds through here too, and would strand the file otherwise. a kill
         # never reaches this line at all, and the file it strands is left for
         # stale_temporaries() to name at the next start
-        try:
-            os.remove(temp_path)
-        except OSError:
-            pass
+        if temp_path is not None:
+            try:
+                os.remove(temp_path)
+            except OSError as cleanup_exc:
+                # the removal failing must not be silent: it is the only thing that
+                # would otherwise say a full-size copy was left on disk, and the note
+                # rides along on the exception the caller already logs
+                original.add_note(
+                    "left the temporary file %s behind: removing it failed too: %s"
+                    % (temp_path, cleanup_exc))
         raise
 
 
 def check_writable(path: str) -> None:
     """Refuse, as `SnapshotError`, a `path` a `save()` could not complete as things
-    stand: one naming no file, one where a directory already stands, and one whose
-    directory is missing, is not a directory, or cannot be written. A server started
-    over such a path answers every write and loses all of them, with a traceback per
-    interval as the only sign, so the refusal belongs before it starts. This sees the
-    directory as it is at the call, and its permissions only -- a directory removed or
-    made read-only afterwards, or a disk that fills up later, is met by the save itself.
+    stand: one naming no file, one where a directory already stands, one whose
+    directory is missing or is not a directory, one whose directory will create a file
+    but will not let it be removed, and an existing snapshot whose own flags would block
+    the rename that finishes a save -- the one operation a trial below cannot perform
+    without destroying the snapshot, so it is checked separately rather than by trying
+    it. Everything else is checked by trying it: a file made in `path`'s own directory
+    with the same prefix and suffix `save()`'s temporary file uses, then removed. A
+    server started over a path this refuses answers every write and loses all of them,
+    with a traceback per interval as the only sign, so the refusal belongs before it
+    starts. This sees the directory, and the existing snapshot if there is one, as they
+    are at the call -- a directory made read-only afterwards, an ACL changed afterwards,
+    or a disk that fills up later, is met by the save itself, not by this.
     """
     if not os.path.basename(path):
         raise SnapshotError("cannot write snapshot %r: the path names no file" % (path,))
@@ -242,76 +311,131 @@ def check_writable(path: str) -> None:
         raise SnapshotError(
             "cannot write snapshot %s: %s does not exist or is not a directory"
             % (path, directory))
-    # W_OK to create the temporary file and rename it into place, X_OK to reach names
-    # inside the directory at all -- os.rename() needs both, and the file's own mode
-    # needs neither
-    if not os.access(directory, os.W_OK | os.X_OK):
-        raise SnapshotError(
-            "cannot write snapshot %s: %s is not writable" % (path, directory))
-    # the temporary file's name is the snapshot's own plus eighteen bytes, so a name a
-    # filesystem takes for the snapshot can still be too long for the file a save has to
-    # write beside it -- and that refusal would otherwise arrive once an interval, from
-    # a running server, rather than here
-    longest = len(os.fsencode(os.path.basename(path))) + 1 + 8 + len(_TEMPORARY_SUFFIX)
+    # a save's last step is a rename over path itself -- an existing snapshot's own
+    # immutable or append-only flags block exactly that, and no probe file created
+    # beside it below can see a flag standing on a different name
     try:
-        name_max = os.pathconf(directory, "PC_NAME_MAX")
-    except (OSError, ValueError):
-        # a filesystem that does not answer: take the limit nearly all of them have
-        name_max = 255
-    if longest > name_max:
+        flags = getattr(os.stat(path), "st_flags", 0)
+    except OSError:
+        # missing, or standing behind a directory this check cannot even see into --
+        # either way there is no snapshot here for a flag to stand on, and the probe
+        # below is what names the real reason if the directory itself refuses
+        flags = 0
+    if flags & (stat.UF_IMMUTABLE | stat.SF_IMMUTABLE | stat.UF_APPEND | stat.SF_APPEND):
         raise SnapshotError(
-            "cannot write snapshot %s: its temporary file would need a %d byte name, "
-            "past the %d %s allows" % (path, longest, name_max, directory))
+            "cannot write snapshot %s: the existing snapshot's flags would block a "
+            "rename over it" % (path,))
+    # everything left standing -- directory permissions, an ACL, a name the filesystem
+    # will not accept -- is answered by attempting exactly what a save attempts: the
+    # same temporary file, in the same place, removed the same way
+    try:
+        descriptor, probe_path = tempfile.mkstemp(
+            dir=directory, prefix=os.path.basename(path) + ".", suffix=_TEMPORARY_SUFFIX)
+    except OSError as exc:
+        # the two errnos a directory answers when it simply will not take the file name
+        # what they are, because "is not writable" is what an operator can act on, where
+        # the name of a temporary file they never chose reads as an internal detail. any
+        # other errno -- a name too long, bytes the filesystem will not encode -- is left
+        # to say what it is, since that is a fact about the path they typed
+        if exc.errno in (errno.EACCES, errno.EPERM):
+            raise SnapshotError(
+                "cannot write snapshot %s: %s is not writable: %s"
+                % (path, directory, exc)) from exc
+        raise SnapshotError("cannot write snapshot %s: %s" % (path, exc)) from exc
+    try:
+        os.close(descriptor)
+    except OSError:
+        pass
+    try:
+        os.remove(probe_path)
+    except OSError as exc:
+        # the probe file itself is stranded by the same failure that refuses the start,
+        # so the refusal names it: it is empty, it is the operator's to remove, and at
+        # the next start it is reported among the files an interrupted save may have
+        # left, where its name alone cannot say which of the two it is
+        raise SnapshotError(
+            "cannot write snapshot %s: a file can be created in %s but not removed, so "
+            "%s is left there: %s" % (path, directory, os.path.basename(probe_path), exc)
+        ) from exc
 
 
 def stale_temporaries(path: str) -> list[str]:
-    """Return, sorted, the names of the files beside `path` whose names have exactly the
-    shape `save()` gives its temporary file for `path`. A process killed mid-save never
-    reaches `save()`'s own cleanup, so such a file stays beside the snapshot for good --
-    and one killed after the fsync but before the rename leaves a complete snapshot there,
-    newer than the one at `path`. So nothing here removes one: what it holds is the
-    operator's to judge, and its name is the only evidence of where it came from. Empty
-    when the directory cannot be listed, which is all a directory with no read
-    permission can answer.
+    """Return, sorted, the names of the regular files beside `path` that a crashed save
+    -- this build's or an earlier one's -- may have left there. Two shapes are
+    recognised: the name `save()` gives its temporary file now -- `path`'s own basename,
+    a dot, eight random characters, then `.tmp.mrdb` -- and the bare
+    `tempfile.mkstemp()` default an earlier build used before a save named its
+    temporary file after the snapshot, `tmp` followed by the same eight random
+    characters and nothing else, which names nothing about which snapshot it belongs
+    to. A name of either shape is reported unless it is known to name something other
+    than a regular file -- a directory or a link of the right name is excluded, but a
+    name whose type `os.scandir()` cannot determine is still reported rather than
+    dropped, since a directory listable but not searchable answers the listing and then
+    refuses every further lookup inside it, and dropping the name there is silence
+    exactly where the warning matters most. So nothing here removes one: what it holds
+    is the operator's to judge, and its name is the only evidence of where it came
+    from. Empty when the directory itself cannot be listed, which is all a directory
+    with no read permission can answer.
     """
     directory = _directory_of(path)
     # tempfile's random part exactly -- eight characters of lowercase letters, digits and
     # the underscore -- rather than anything between the right prefix and suffix, so the
     # shape matched is no wider than the names a save actually produces
-    stale = re.compile(
+    current_shape = re.compile(
         re.escape(os.path.basename(path) + ".") + "[a-z0-9_]{8}" + re.escape(_TEMPORARY_SUFFIX))
+    legacy_shape = re.compile("tmp[a-z0-9_]{8}")
     try:
-        names = os.listdir(directory)
+        entries = list(os.scandir(directory))
     except OSError:
         return []
-    return sorted(name for name in names
-                  if stale.fullmatch(name) and _is_regular_file(os.path.join(directory, name)))
-
-
-def _is_regular_file(path: str) -> bool:
-    # lstat rather than os.path.isfile: a temporary file a save made is a regular file and
-    # never a link, and isfile would follow a link of the right name to whatever it names
-    try:
-        return stat.S_ISREG(os.lstat(path).st_mode)
-    except OSError:
-        return False
+    stale = []
+    for entry in entries:
+        if not (current_shape.fullmatch(entry.name) or legacy_shape.fullmatch(entry.name)):
+            continue
+        try:
+            # the entry's own cached type rather than a second, separate lstat: a
+            # directory that can be listed but not searched answers the listing and
+            # then refuses exactly the lstat a second call would need
+            is_regular = entry.is_file(follow_symlinks=False)
+        except OSError:
+            # the type could not be determined -- reported anyway, because a name of
+            # the right shape is itself the evidence this function exists to surface
+            stale.append(entry.name)
+            continue
+        if is_regular:
+            stale.append(entry.name)
+    return sorted(stale)
 
 
 def load(path: str) -> Store:
     """Read `path` and decode it. A missing path raises `FileNotFoundError`, unchanged,
     because `Server.__init__` starts empty over that answer and refuses to start over
-    every other one. An unreadable path -- a directory in the snapshot's place, or any
+    every other one. A path naming anything other than a regular file -- a named pipe,
+    most of all, whose `open()` blocks until a writer appears, with nothing said and no
+    way out -- is refused as `SnapshotError` before it is ever opened; a dangling
+    symlink still raises `FileNotFoundError` and a symlink to a regular file still
+    loads, because `os.stat()` follows one and this check reads exactly what `open()`
+    would land on. An unreadable path -- a directory in the snapshot's place, or any
     other `OSError` -- and a corrupt blob both leave as `SnapshotError` naming `path`,
     so the caller has one exception to catch for both.
     """
     try:
-        with open(path, "rb") as handle:
-            blob = handle.read()
+        mode = os.stat(path).st_mode
     except FileNotFoundError:
         # FileNotFoundError is itself an OSError, so this has to be carved out ahead
         # of the broader except below, or a missing path would be wrapped into
         # SnapshotError along with every genuinely unreadable one
         raise
+    except OSError as exc:
+        raise SnapshotError("cannot read snapshot %s: %s" % (path, exc)) from exc
+    if not stat.S_ISREG(mode):
+        # caught here rather than left to open(): a named pipe's open() blocks until a
+        # writer appears, with no error and no way out, so the type has to be known
+        # before the call that would hang
+        raise SnapshotError("cannot read snapshot %s: not a regular file" % (path,))
+    try:
+        with open(path, "rb") as handle:
+            blob = handle.read()
     except OSError as exc:
         raise SnapshotError("cannot read snapshot %s: %s" % (path, exc)) from exc
     try:

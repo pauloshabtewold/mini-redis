@@ -126,6 +126,34 @@ def test_sample_and_expire_removes_only_the_expired_keys_and_queues_one_del_each
     assert sorted(keyspace._data) == sorted(b"k%d" % i for i in range(1, 10, 2))
 
 
+def test_sample_and_expire_reads_the_clock_once_for_the_whole_draw_not_once_per_key(keyspace):
+    # now_ms() is read once and reused for every key in the sample, not re-read inside
+    # the per-key loop -- sample_and_expire's own comment promises this so a caller
+    # sweeping many keys does not spend its budget re-reading a clock that has not
+    # moved. a per-key read passes every other test in this module, since the extra
+    # reads land within the same millisecond as the shared one and expire exactly the
+    # same keys; only counting the calls tells the two apart
+    for i in range(5):
+        key = b"k%d" % i
+        keyspace.write(key, b"v", keep_ttl=False)
+        keyspace.expire_at(key, keyspace.now_ms() + 3_600_000)
+    calls = []
+    real_now_ms = Store.now_ms
+
+    def counting_now_ms(self):
+        calls.append(1)
+        return real_now_ms(self)
+
+    Store.now_ms = counting_now_ms
+    try:
+        keyspace.sample_and_expire(5)
+    finally:
+        Store.now_ms = real_now_ms
+    assert len(calls) == 1, (
+        "sample_and_expire read the clock %d times over a draw of 5 keys, not once"
+        % len(calls))
+
+
 def test_snapshot_items_reports_minus_one_for_a_key_with_no_deadline(keyspace):
     keyspace.write(b"k", b"v", keep_ttl=False)
     assert list(keyspace.snapshot_items()) == [(b"k", KIND_STRING, b"v", -1)]
@@ -142,6 +170,18 @@ def test_from_items_round_trips_both_kinds_and_their_deadlines(keyspace):
     assert list(loaded.lookup(b"l")) == [b"a", b"b"]
     assert loaded.deadline(b"t") == future
     assert loaded.deadline(b"s") is None
+
+
+def test_from_items_refuses_two_items_that_name_one_key():
+    # a snapshot_items() walk can never produce one, since it walks a keyspace whose keys
+    # are already unique, so this only arrives from bytes something else wrote. loading it
+    # would keep the second item's value and deadline and drop the first's with nothing
+    # said, which is the one shape of data loss a length-prefixed format cannot catch for
+    # itself. counted rather than watched per key, so what fails here is the count
+    items = [(b"k", KIND_STRING, b"first", 1_900_000_000_000),
+             (b"k", KIND_STRING, b"second", -1)]
+    with pytest.raises(ValueError, match="share one key"):
+        Store.from_items(items)
 
 
 # edge

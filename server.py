@@ -50,20 +50,37 @@ DEFAULT_IGNORE_SNAPSHOT = False
 # background cycle runs every 100 ms too
 DEFAULT_EXPIRY_SWEEP_INTERVAL_MS = 100
 # the sweep's own constants -- 20 sampled keys, a re-loop past a quarter expired, a
-# 1 ms budget -- are not 7.2.7's: they are the loop redis shipped through 5.0, whose
-# activeExpireCycle draws 20 random keys a pass, repeats while more than 5 of them had
-# expired, and holds its fast cycle to 1000 microseconds. 7.2.7 walks the expiry table
-# with a cursor instead, aims at 20 keys a pass, re-samples while a pass sampled nothing
-# or its stale percentage is above 10 at the default effort, and keeps 1 ms for its fast
-# cycle alone: the slow cycle on hz's 100 ms cadence may take a quarter of each 100 ms.
-# each of those is a compiled-in constant scaled by active-expire-effort, which CONFIG
-# GET does answer, so a running server shows the effort and not the values themselves
+# 1 ms budget -- checked against the tagged sources rather than assumed: 7.2.7's
+# expire.c:109-111 and 5.0.14's server.h:172-174 both compile in the same three numbers,
+# ACTIVE_EXPIRE_CYCLE_KEYS_PER_LOOP 20, ACTIVE_EXPIRE_CYCLE_FAST_DURATION 1000 (one
+# millisecond) and ACTIVE_EXPIRE_CYCLE_SLOW_TIME_PERC 25, so the 20 keys and the 1 ms
+# budget here are both the reference's own numbers in both versions. what is not the
+# reference's own is which cycle each is borrowed from: in both versions the cycle
+# driven from the cron at hz -- 100 ms at hz 10, the cadence --expiry-sweep-interval
+# defaults to -- is the slow one, and gets a quarter of that tick (25 ms), while the 1 ms
+# belongs to a separate fast cycle run from beforeSleep, between event-loop passes.
+# spending the fast cycle's millisecond on the slow cycle's 100 ms cadence, instead of
+# the slow cycle's own 25 ms, is this project's own choice. what actually differs
+# between the two reference versions is the draw -- 5.0 samples random keys, the way
+# this sweep does; 7.2.7 walks the expiry table with a cursor instead -- and the re-loop
+# test: 5.0 repeats while more than a quarter of a sample expired (expired > 20/4), which
+# is SWEEP_RELOOP_THRESHOLD below, while 7.2.7 repeats while a pass sampled nothing or
+# more than 10 percent of it was stale, at the default effort. each reference number is
+# itself scaled by active-expire-effort, which CONFIG GET does answer, so a running
+# server shows the effort and not the values themselves
 SWEEP_SAMPLE_SIZE = 20
 SWEEP_RELOOP_THRESHOLD = 0.25
 SWEEP_BUDGET_SECONDS = 0.001
 # the one site --expiry-sweep-interval's milliseconds are turned into the seconds
 # time.monotonic() deals in
 _MILLISECONDS_PER_SECOND = 1000
+# the ceiling _check_schedulable refuses past: above this, the arithmetic that schedules
+# an interval -- now + value for the snapshot arm, value / 1000 for the sweep -- raises
+# OverflowError from float's own limit (around 10**308) rather than refusing cleanly.
+# 2**63 - 1 is this project's own convention for the largest integer any value here is
+# ever let hold (see commands/registry.py's INT64_MAX), reused as a ceiling that is
+# still far below where the float conversion actually breaks
+MAX_SCHEDULABLE_INTERVAL = 2**63 - 1
 
 # logging.lastResort sends an ERROR record to stderr with no configuration
 logger = logging.getLogger(__name__)
@@ -98,6 +115,20 @@ def _check_not_negative(value: int, label: str) -> None:
             "%s cannot be negative; 0 disables the check, not %d" % (label, value))
 
 
+def _check_schedulable(value: int, label: str, unit: str) -> None:
+    # shared by the CLI validators for --snapshot-interval and --expiry-sweep-interval
+    # and by Server.__init__ for the same two, the only numeric settings the periodic
+    # tick's own arithmetic adds to a clock reading or divides by a constant. a value
+    # past this ceiling reaches that arithmetic as an OverflowError instead of a clean
+    # refusal -- the same failure mode _check_not_negative exists to prevent at the
+    # other end of the range, and the reason this check runs beside it rather than
+    # replacing it
+    if value > MAX_SCHEDULABLE_INTERVAL:
+        raise ValueError(
+            "%s cannot exceed %d %s; a larger value cannot be scheduled, not %d"
+            % (label, MAX_SCHEDULABLE_INTERVAL, unit, value))
+
+
 def _load_initial_store(
     snapshot_path: str | None, ignore_snapshot: bool, snapshot_interval: int
 ) -> Store:
@@ -113,8 +144,9 @@ def _load_initial_store(
     for name in persistence.stale_temporaries(snapshot_path):
         logger.warning(
             "found %s beside %s: it has the name a save there gives its temporary file, "
-            "so a save was likely interrupted, and it may hold that save's snapshot; "
-            "nothing reads or removes it", name, snapshot_path,
+            "now or in an earlier build of this server, so a save was likely interrupted, "
+            "and it may hold that save's snapshot; nothing reads or removes it",
+            name, snapshot_path,
         )
     if snapshot_interval:
         # ahead of both the load and --ignore-snapshot: a path no save could write as
@@ -176,11 +208,21 @@ def _max_multibulk(value: str) -> int:
 
 
 def _snapshot_interval(value: str) -> int:
-    return _numeric_limit(value, "snapshot interval", "seconds")
+    number = _numeric_limit(value, "snapshot interval", "seconds")
+    try:
+        _check_schedulable(number, "snapshot interval", "seconds")
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(str(exc)) from None
+    return number
 
 
 def _expiry_sweep_interval(value: str) -> int:
-    return _numeric_limit(value, "expiry sweep interval", "milliseconds")
+    number = _numeric_limit(value, "expiry sweep interval", "milliseconds")
+    try:
+        _check_schedulable(number, "expiry sweep interval", "milliseconds")
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(str(exc)) from None
+    return number
 
 
 def build_arg_parser() -> argparse.ArgumentParser:
@@ -289,8 +331,10 @@ class Server:
         _check_not_negative(max_multibulk, "max_multibulk")
         self.max_multibulk = max_multibulk
         _check_not_negative(snapshot_interval, "snapshot_interval")
+        _check_schedulable(snapshot_interval, "snapshot_interval", "seconds")
         self.snapshot_interval = snapshot_interval
         _check_not_negative(expiry_sweep_interval, "expiry_sweep_interval")
+        _check_schedulable(expiry_sweep_interval, "expiry_sweep_interval", "milliseconds")
         self.expiry_sweep_interval = expiry_sweep_interval
         self._sweep_interval_seconds = expiry_sweep_interval / _MILLISECONDS_PER_SECOND
         self.snapshot_path = snapshot_path
@@ -538,13 +582,26 @@ class Server:
         # outlasts several sweep intervals, and firing every skipped sweep back to back the
         # moment it returns would land the whole backlog in the p99 the sampling algorithm
         # exists to protect
+        #
+        # the two arms re-arm at different points around their own task for the same reason they
+        # can miss an interval at all: the sweep is bounded by its own millisecond budget, so
+        # re-arming it from this tick's own reading and then running it inside that budget keeps
+        # the two readings within a millisecond of each other either way. a save has no such
+        # bound -- on a keyspace large enough, it blocks this thread for longer than the interval
+        # itself -- so re-arming it from a reading taken before it runs would count the save's own
+        # duration against the next interval, running saves back to back exactly as the reference
+        # does not: redis-server counts a save's interval from its completion (server.c's cron
+        # compares unixtime against lastsave, and rdb.c sets lastsave when the save finishes), and
+        # CONFIG GET save publishes that same schedule. re-arming the snapshot deadline from a
+        # fresh reading taken after the save returns is what keeps this server's schedule honest
+        # against what it claims
         now = time.monotonic()
         if self._next_sweep_at is not None and now >= self._next_sweep_at:
             self._next_sweep_at = now + self._sweep_interval_seconds
             self._guard_task("expiry sweep", self._sweep_expired)
         if self._next_snapshot_at is not None and now >= self._next_snapshot_at:
-            self._next_snapshot_at = now + self.snapshot_interval
             self._guard_task("snapshot save", self._save_snapshot)
+            self._next_snapshot_at = time.monotonic() + self.snapshot_interval
 
     def _sweep_expired(self) -> None:
         # bounded by elapsed time and nothing else -- no iteration cap -- because a
@@ -552,17 +609,23 @@ class Server:
         # cap bounds dict lookups, and if one sampling step ever turns expensive, only a
         # time budget still bounds the stall this puts in the p99
         deadline = time.monotonic() + SWEEP_BUDGET_SECONDS
-        while time.monotonic() < deadline:
-            sampled, expired = self._store.sample_and_expire(SWEEP_SAMPLE_SIZE)
-            # sampled == 0 is checked before the division to its right, not only to stop
-            # on an empty expiry index: without it, an empty index divides zero by zero
-            # on that clause instead of breaking out of the loop
-            if sampled == 0 or expired / sampled <= SWEEP_RELOOP_THRESHOLD:
-                break
-        # drained once per tick rather than once per sampling pass: server.py's other
-        # drain, inside _dispatch_batch, runs once per dispatched command and would
-        # otherwise attribute these DELs to whichever command dispatches next
-        self._store.take_effects()
+        try:
+            while time.monotonic() < deadline:
+                sampled, expired = self._store.sample_and_expire(SWEEP_SAMPLE_SIZE)
+                # sampled == 0 is checked before the division to its right, not only to stop
+                # on an empty expiry index: without it, an empty index divides zero by zero
+                # on that clause instead of breaking out of the loop
+                if sampled == 0 or expired / sampled <= SWEEP_RELOOP_THRESHOLD:
+                    break
+        finally:
+            # in a finally, and not the loop's last line: a later pass raising -- the
+            # sampler itself, or a value the sweep does not otherwise touch -- would
+            # otherwise leave an earlier pass's DELs on the queue for whichever command
+            # dispatches next to be blamed for, exactly the misattribution this drain
+            # running once per tick rather than once per dispatched command exists to
+            # prevent. server.py's other drain, inside _dispatch_batch, runs once per
+            # dispatched command
+            self._store.take_effects()
 
     def _save_snapshot(self) -> None:
         # runs whether or not the keyspace changed since the last save -- no dirty-key
@@ -618,8 +681,12 @@ class Server:
         ]
         try:
             # inside the try, so every way out of run() -- a stop, a failed bind, a raise --
-            # passes the finally below that disarms both again. still ahead of the listener,
-            # so no connection is ever accepted before the save it may ask about is armed
+            # passes the finally below that disarms both again; and below the if self._ran:
+            # check above, so a second run() on an already-ran server hits that raise before
+            # arming anything, rather than announcing a schedule this call will never honour.
+            # ahead of the listener is not itself load-bearing: nothing accepts a connection
+            # until the loop runs, so moving this call after _open_listener() would not be
+            # observable
             self._arm_periodic_tasks()
             listener = self._open_listener()
             # set once the listener is open, because what a second run must not reuse is the selector, and nothing has touched it yet -- a failed bind leaves this instance usable
