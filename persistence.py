@@ -268,6 +268,7 @@ def save(store: Store, path: str) -> None:
             handle.write(blob)
             handle.flush()
             os.fsync(handle.fileno())
+        _carry_over_the_mode(path, temp_path)
         os.rename(temp_path, path)
     except BaseException as original:
         # BaseException rather than Exception: a KeyboardInterrupt or SystemExit arriving
@@ -285,6 +286,21 @@ def save(store: Store, path: str) -> None:
                     "left the temporary file %s behind: removing it failed too: %s"
                     % (temp_path, cleanup_exc))
         raise
+
+
+def _carry_over_the_mode(path: str, temp_path: str) -> None:
+    # a save replaces the snapshot's directory entry rather than its contents, so the
+    # file that survives is the temporary one, carrying mkstemp's own 0600 rather than
+    # whatever the snapshot it replaced had. an operator who widened the old file's mode
+    # -- for a backup reader, say -- would find it narrowed again by a save they did not
+    # think of as touching permissions, and nothing would say so. a snapshot written for
+    # the first time keeps mkstemp's 0600, which is the safe end to start from
+    try:
+        os.chmod(temp_path, stat.S_IMODE(os.stat(path).st_mode))
+    except OSError:
+        # no snapshot there yet, or its mode cannot be read: the save is not the place to
+        # answer for that, and the rename below is what this function exists to precede
+        pass
 
 
 def check_writable(path: str) -> None:
@@ -372,8 +388,13 @@ def stale_temporaries(path: str) -> list[str]:
     name whose type `os.scandir()` cannot determine is still reported rather than
     dropped, since a directory listable but not searchable answers the listing and then
     refuses every further lookup inside it, and dropping the name there is silence
-    exactly where the warning matters most. So nothing here removes one: what it holds
-    is the operator's to judge, and its name is the only evidence of where it came
+    exactly where the warning matters most. A name that matches only once case is
+    ignored is reported only where the filesystem itself agrees the two spellings are
+    one file, which is asked by re-spelling the name and comparing what each spelling
+    lands on -- a start given `DUMP.MRDB` and one given `dump.mrdb` are the same
+    snapshot on one filesystem and two on another, and that answer belongs to the
+    filesystem rather than to a guess made here. So nothing here removes one: what it
+    holds is the operator's to judge, and its name is the only evidence of where it came
     from. Empty when the directory itself cannot be listed, which is all a directory
     with no read permission can answer.
     """
@@ -381,8 +402,12 @@ def stale_temporaries(path: str) -> list[str]:
     # tempfile's random part exactly -- eight characters of lowercase letters, digits and
     # the underscore -- rather than anything between the right prefix and suffix, so the
     # shape matched is no wider than the names a save actually produces
+    basename = os.path.basename(path)
     current_shape = re.compile(
-        re.escape(os.path.basename(path) + ".") + "[a-z0-9_]{8}" + re.escape(_TEMPORARY_SUFFIX))
+        re.escape(basename + ".") + "[a-z0-9_]{8}" + re.escape(_TEMPORARY_SUFFIX))
+    # the same shape once case is ignored, which on a case-insensitive filesystem is how
+    # a save started under another spelling of this very path named its temporary file
+    other_case = re.compile(current_shape.pattern, re.IGNORECASE)
     legacy_shape = re.compile("tmp[a-z0-9_]{8}")
     try:
         entries = list(os.scandir(directory))
@@ -391,7 +416,9 @@ def stale_temporaries(path: str) -> list[str]:
     stale = []
     for entry in entries:
         if not (current_shape.fullmatch(entry.name) or legacy_shape.fullmatch(entry.name)):
-            continue
+            if not (other_case.fullmatch(entry.name)
+                    and _one_file_under_both_spellings(directory, entry.name, basename)):
+                continue
         try:
             # the entry's own cached type rather than a second, separate lstat: a
             # directory that can be listed but not searched answers the listing and
@@ -405,6 +432,23 @@ def stale_temporaries(path: str) -> list[str]:
         if is_regular:
             stale.append(entry.name)
     return sorted(stale)
+
+
+def _one_file_under_both_spellings(directory: str, name: str, basename: str) -> bool:
+    # the name as this path would have spelled it: only the snapshot's own basename can
+    # differ in case, since the eight random characters and the suffix a save appends are
+    # lower case already. if the filesystem folds case, both spellings land on one file
+    # and this temporary file really is this path's; if it does not, the re-spelling
+    # names a file belonging to a differently-named snapshot, or nothing at all
+    respelled = basename + name[len(basename):]
+    if respelled == name:
+        return False
+    try:
+        mine = os.lstat(os.path.join(directory, respelled))
+        theirs = os.lstat(os.path.join(directory, name))
+    except OSError:
+        return False
+    return (mine.st_dev, mine.st_ino) == (theirs.st_dev, theirs.st_ino)
 
 
 def load(path: str) -> Store:

@@ -740,6 +740,48 @@ def test_stale_temporaries_names_the_older_bare_tmpxxxxxxxx_shape(tmp_path):
     assert persistence.stale_temporaries(str(path)) == ["tmpabcd1234"]
 
 
+def test_stale_temporaries_follows_this_filesystem_on_another_spelling_of_the_path(tmp_path):
+    # a save started as DUMP.MRDB and a start given dump.mrdb are one snapshot where the
+    # filesystem folds case and two where it does not, so what is asserted here is that
+    # the report agrees with the filesystem underneath it rather than with either guess.
+    # the same probe the code cannot make for itself is cheap in a test: write one name,
+    # look for the other
+    (tmp_path / "Case.probe").write_bytes(b"")
+    folds_case = (tmp_path / "case.PROBE").exists()
+    path = tmp_path / "dump.mrdb"
+    other_spelling = "DUMP.MRDB.abcd1234.tmp.mrdb"
+    (tmp_path / other_spelling).write_bytes(b"left by a save started under the other spelling")
+    reported = persistence.stale_temporaries(str(path))
+    if folds_case:
+        assert reported == [other_spelling], (
+            "this filesystem folds case, so that file is this path's own temporary file "
+            "and nothing else would ever name it", reported)
+    else:
+        assert reported == [], (
+            "this filesystem keeps the two spellings apart, so that file belongs to a "
+            "snapshot named DUMP.MRDB and claiming it for dump.mrdb would be wrong",
+            reported)
+    # and either way a temporary file whose snapshot name merely differs is not this
+    # path's, which is what keeps the case-folding arm from widening into a guess
+    assert persistence.stale_temporaries(str(tmp_path / "other.mrdb")) == []
+
+
+def test_a_save_keeps_the_mode_of_the_snapshot_it_replaces(tmp_path):
+    # the file that survives a save is the temporary one, renamed over the old snapshot,
+    # so without carrying the mode across, every save quietly narrows a file an operator
+    # widened -- for a backup reader, say -- and nothing reports it. a first save has no
+    # mode to carry and keeps mkstemp's own 0600
+    path = tmp_path / "dump.mrdb"
+    store = Store()
+    store.write(b"k", b"v", keep_ttl=False)
+    persistence.save(store, str(path))
+    assert stat.S_IMODE(path.stat().st_mode) == 0o600, "a first save should stay private"
+    path.chmod(0o644)
+    persistence.save(store, str(path))
+    assert stat.S_IMODE(path.stat().st_mode) == 0o644, (
+        "the save replaced the snapshot's mode with its temporary file's")
+
+
 def test_stale_temporaries_still_refuses_a_symlink_and_a_directory_and_escapes_metacharacters_and_sorts_the_result(
     tmp_path
 ):
