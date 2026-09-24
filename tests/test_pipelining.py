@@ -11,10 +11,15 @@ both, so the witness is that neither drain broke, not that no cap was watching.
 """
 
 import os
+import pathlib
+import random
 import selectors
 import socket
 import time
 
+import pytest
+
+from connection import Connection
 from tests.test_server_lifecycle import listening, pump
 
 # a self-imposed budget per read phase, never pytest.mark.timeout -- consistent with
@@ -35,20 +40,49 @@ def expected_bulk_stream(values):
     return b"".join(b"$%d\r\n%s\r\n" % (len(v), v) for v in values)
 
 
-def assert_stream_matches(assembled, values):
+def assert_stream_matches(assembled, values, capture_dir=None):
     expected = expected_bulk_stream(values)
     if assembled == expected:
         return
+    # a mismatch here has happened three times in this suite's life, only ever under
+    # several suites at once, and never since -- with no cause established and nothing
+    # kept from the runs that failed. so the bytes are kept now, beside the classification
+    # that says which of the three shapes this is, because the next occurrence is the only
+    # evidence there will be and a failure message alone threw away the payload it needed
+    report = [_classify_stream(assembled, expected)]
+    if capture_dir is not None:
+        got_path = pathlib.Path(capture_dir) / "received.bin"
+        want_path = pathlib.Path(capture_dir) / "expected.bin"
+        got_path.write_bytes(assembled)
+        want_path.write_bytes(expected)
+        report.append("received bytes kept at %s, expected at %s" % (got_path, want_path))
+    raise AssertionError("; ".join(report))
+
+
+def _classify_stream(assembled, expected):
+    # the three shapes worth telling apart: the stream slid against what was asked for,
+    # it carries a whole value that was never sent on this connection, or it is simply
+    # short. each points somewhere different, and the first differing byte alone does not
+    # say which
     shared = min(len(assembled), len(expected))
     for i in range(shared):
         if assembled[i] != expected[i]:
-            raise AssertionError(
-                "reply stream differs from the request order at byte %d: got %r, want %r"
+            window = assembled[i:i + 64]
+            shifted_at = expected.find(window) if len(window) == 64 else -1
+            if shifted_at >= 0:
+                return (
+                    "reply stream differs at byte %d, and the bytes there appear at byte "
+                    "%d of what was asked for, so the stream slid rather than changed: "
+                    "got %r, want %r" % (i, shifted_at, assembled[i:i + 8], expected[i:i + 8])
+                )
+            return (
+                "reply stream differs at byte %d with bytes that appear nowhere in what "
+                "was asked for: got %r, want %r"
                 % (i, assembled[i:i + 8], expected[i:i + 8])
             )
-    raise AssertionError(
-        "reply stream length %d differs from the request order's expected length %d"
-        % (len(assembled), len(expected))
+    return (
+        "reply stream length %d differs from the request order's expected length %d, "
+        "with every shared byte equal" % (len(assembled), len(expected))
     )
 
 
@@ -151,7 +185,9 @@ def test_a_thousand_pipelined_gets_come_back_byte_exact_in_request_order(mini_re
     assert_stream_matches(get_reply, values)
 
 
-def test_an_eight_mebibyte_value_round_trips_byte_exact_in_both_directions(mini_redis_server):
+def test_an_eight_mebibyte_value_round_trips_byte_exact_in_both_directions(
+    mini_redis_server, tmp_path
+):
     with socket.create_connection(("127.0.0.1", mini_redis_server)) as sock:
         sock.sendall(_encode_command(b"SET", b"big", LARGE_VALUE))
         sock.settimeout(1.0)
@@ -164,7 +200,76 @@ def test_an_eight_mebibyte_value_round_trips_byte_exact_in_both_directions(mini_
         want_len = len(expected_bulk_stream([LARGE_VALUE]))
         get_reply = _recv_exactly(sock, want_len, time.monotonic() + DEADLINE_SECONDS)
 
-    assert_stream_matches(get_reply, [LARGE_VALUE])
+    assert_stream_matches(get_reply, [LARGE_VALUE], capture_dir=tmp_path)
+
+
+@pytest.mark.parametrize("seed", range(24))
+def test_a_large_value_reassembles_byte_exact_however_its_bytes_are_chunked(seed):
+    # what several suites at once change about this path is nothing the server chooses:
+    # it is the size of each recv(), which the kernel decides under load. so the chunk
+    # boundaries are moved deliberately here -- a byte at a time, a megabyte at a time,
+    # and sizes that land inside the header, inside the body and astride the trailing
+    # CRLF -- and the value the parser hands back has to equal the value that was sent,
+    # whichever boundary each piece fell on
+    rng = random.Random(seed)
+    payload = rng.randbytes(1 << 20)
+    frame = _encode_command(b"SET", b"big", payload)
+    first, second = socket.socketpair()
+    conn = Connection(first, ("127.0.0.1", 1))
+    try:
+        parsed, offset = [], 0
+        while offset < len(frame):
+            size = rng.choice([1, 2, 3, 7, 13, 64, 1500, 8192, 65536, rng.randint(1, 4096)])
+            conn.read_buffer.extend(frame[offset:offset + size])
+            offset += size
+            parsed.extend(conn.take_commands(max_value_size=0, max_multibulk=0))
+        assert len(parsed) == 1, ("the frame parsed as %d commands" % len(parsed))
+        assert parsed[0][:2] == [b"SET", b"big"], parsed[0][:2]
+        assert parsed[0][2] == payload, (
+            "the reassembled value differs from the one sent at byte %d"
+            % next(i for i in range(len(payload)) if parsed[0][2][i] != payload[i]))
+        assert not conn.read_buffer, "bytes were left over after the frame parsed"
+    finally:
+        first.close()
+        second.close()
+
+
+@pytest.mark.parametrize("seed", range(8))
+def test_a_large_reply_drains_byte_exact_however_the_socket_short_writes(seed):
+    # the same question on the way out: the number of bytes each send() takes is the
+    # kernel's to choose, and under load it chooses differently. the reply the peer
+    # assembles has to be the reply that was queued, whatever the split
+    rng = random.Random(seed)
+    reply = b"$%d\r\n%s\r\n" % (1 << 20, rng.randbytes(1 << 20))
+    first, second = socket.socketpair()
+    first.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, rng.choice([4096, 16384, 65536]))
+    second.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, rng.choice([4096, 16384, 65536]))
+    first.setblocking(False)
+    second.setblocking(False)
+    conn = Connection(first, ("127.0.0.1", 1))
+    try:
+        conn.queue(reply)
+        got = bytearray()
+        # bounded by rounds that achieve nothing rather than by a clock: a drain that
+        # loses a byte never reaches the reply's length, and waiting out a wall-clock
+        # deadline to learn that costs a minute per seed where a stalled round says it
+        # at once
+        idle_rounds = 0
+        while len(got) < len(reply) and idle_rounds < 100:
+            before = (len(conn.write_buffer), len(got))
+            assert conn.flush() is True, "the drain reported a dead peer"
+            try:
+                got.extend(second.recv(rng.choice([1, 977, 8192, 65536])))
+            except BlockingIOError:
+                pass
+            idle_rounds = 0 if (len(conn.write_buffer), len(got)) != before else idle_rounds + 1
+        assert bytes(got) == reply, (
+            "the drained reply differs from the one queued at byte %d"
+            % next(i for i in range(min(len(got), len(reply))) if got[i] != reply[i]))
+        assert not conn.write_buffer, "the drain left bytes behind after the peer read them all"
+    finally:
+        first.close()
+        second.close()
 
 
 def test_a_reply_too_large_for_one_send_is_queued_and_drained_across_writable_events():
