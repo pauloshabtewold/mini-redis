@@ -16,7 +16,9 @@ test_persistence_properties.py covers the refusal contract over inputs this modu
 not choose.
 """
 
+import errno
 import faulthandler
+import fcntl
 import os
 import pathlib
 import stat
@@ -109,16 +111,29 @@ def test_save_writes_through_a_temporary_file_and_renames_it(tmp_path, monkeypat
     events = []
     synced = []
     renamed = []
-    real_fsync, real_rename = os.fsync, os.rename
+    real_fsync, real_rename, real_fcntl = os.fsync, os.rename, fcntl.fcntl
 
     def recording_fsync(fd):
-        # the size on disk at the moment fsync is called, before real_fsync runs --
+        # the size on disk at the moment the sync is called, before real_fsync runs --
         # bytes still sitting in handle's own userspace buffer have not reached the
         # file this descriptor names yet, so a deleted flush() shows up here as a short
-        # size rather than only in a size read back after save() has already returned
+        # size rather than only in a size read back after save() has already returned.
+        # directories are recorded separately below: the one that matters here is the
+        # sync of the snapshot's own bytes
+        if stat.S_ISDIR(os.fstat(fd).st_mode):
+            events.append(("sync-directory", None))
+            return real_fsync(fd)
         events.append(("fsync", os.fstat(fd).st_size))
         synced.append(fd)
         return real_fsync(fd)
+
+    def recording_full_sync(fd, command, *rest):
+        # where the platform has it, the file's own sync is a device-level flush rather
+        # than os.fsync, so both have to be watched or this test reads as "never synced"
+        # on one platform and passes on the other
+        if command == getattr(fcntl, "F_FULLFSYNC", object()):
+            return recording_fsync(fd)
+        return real_fcntl(fd, command, *rest)
 
     def recording_rename(a, b):
         events.append(("rename", None))
@@ -126,11 +141,12 @@ def test_save_writes_through_a_temporary_file_and_renames_it(tmp_path, monkeypat
         return real_rename(a, b)
 
     monkeypatch.setattr(os, "fsync", recording_fsync)
+    monkeypatch.setattr(fcntl, "fcntl", recording_full_sync)
     monkeypatch.setattr(os, "rename", recording_rename)
 
     persistence.save(store, str(path))
 
-    assert synced, "os.fsync was never called, so the bytes are not durable"
+    assert synced, "the snapshot's bytes were never synced, so they are not durable"
     assert len(renamed) == 1
     src, dst = renamed[0]
     assert str(dst) == str(path)
@@ -142,18 +158,89 @@ def test_save_writes_through_a_temporary_file_and_renames_it(tmp_path, monkeypat
     )
 
     assert len(synced) == 1 and len(renamed) == 1, (
-        "save must fsync exactly once and rename exactly once: %r" % (events,)
+        "save must sync the file exactly once and rename exactly once: %r" % (events,)
     )
     # the order first, so a rename that ran ahead of the fsync is reported as that rather
     # than as a size mismatch read off the wrong event
-    assert [kind for kind, _ in events] == ["fsync", "rename"], (
-        "fsync must come before rename, or a power loss right after the rename can leave "
-        "the real path naming a file whose bytes never reached the disk: %r" % (events,)
+    assert [kind for kind, _ in events] == ["fsync", "rename", "sync-directory"], (
+        "the file's sync must come before the rename, or a power loss right after the "
+        "rename can leave the real path naming a file whose bytes never reached the "
+        "disk, and the directory's sync must come after it, or the entry that names "
+        "those bytes is itself what the power cut loses: %r" % (events,)
     )
     (fsync_size,) = [size for kind, size in events if kind == "fsync"]
     assert fsync_size == len(persistence.encode(store)), (
         "the bytes were still in a userspace buffer when the fsync ran", fsync_size
     )
+
+
+def test_the_file_sync_falls_back_when_the_device_flush_is_not_supported(tmp_path, monkeypatch):
+    # F_FULLFSYNC exists on the platform but the filesystem under this path refuses it,
+    # which some do -- a network mount, a disk image. the save has to fall back to the
+    # sync every platform has rather than fail, and the file still has to be synced:
+    # treating "not supported" as a failed save would lose every snapshot on those mounts
+    if not hasattr(fcntl, "F_FULLFSYNC"):
+        pytest.skip("this platform has no device-level flush to fall back from")
+    plain_syncs = []
+    real_fsync = os.fsync
+
+    def refusing_full_sync(fd, command, *rest):
+        raise OSError(errno.ENOTSUP, "Operation not supported")
+
+    def counting_fsync(fd):
+        plain_syncs.append(fd)
+        return real_fsync(fd)
+
+    monkeypatch.setattr(fcntl, "fcntl", refusing_full_sync)
+    monkeypatch.setattr(os, "fsync", counting_fsync)
+    store = Store()
+    store.write(b"k", b"v", keep_ttl=False)
+    path = tmp_path / "dump.mrdb"
+    persistence.save(store, str(path))
+    assert plain_syncs, "the save gave up instead of falling back to os.fsync"
+    assert persistence.load(str(path)).lookup(b"k") == b"v"
+
+
+def test_a_device_flush_that_fails_for_any_other_reason_fails_the_save(tmp_path, monkeypatch):
+    # only "not supported" is tolerated: an I/O error from the flush is the drive saying
+    # the bytes are not on it, which is the one thing this call exists to find out, and a
+    # save that swallowed it would report success over a snapshot that may not be there
+    if not hasattr(fcntl, "F_FULLFSYNC"):
+        pytest.skip("this platform has no device-level flush to fail")
+
+    def failing_full_sync(fd, command, *rest):
+        raise OSError(errno.EIO, "Input/output error")
+
+    monkeypatch.setattr(fcntl, "fcntl", failing_full_sync)
+    store = Store()
+    store.write(b"k", b"v", keep_ttl=False)
+    with pytest.raises(OSError) as refused:
+        persistence.save(store, str(tmp_path / "dump.mrdb"))
+    assert refused.value.errno == errno.EIO
+    assert list(tmp_path.iterdir()) == [], "a failed save left its temporary file behind"
+
+
+def test_a_directory_that_cannot_be_synced_does_not_fail_a_save_already_on_disk(
+    tmp_path, monkeypatch
+):
+    # the directory sync runs after the rename, so by the time it can fail the snapshot
+    # is already in place and the old one is already gone. a filesystem that does not
+    # sync directories at all answers this way, and reporting it as a failed save would
+    # log an error every interval about a save that worked
+    real_fsync, real_fcntl = os.fsync, fcntl.fcntl
+
+    def refuse_for_directories(fd, *rest):
+        if stat.S_ISDIR(os.fstat(fd).st_mode):
+            raise OSError(errno.EINVAL, "Invalid argument")
+        return real_fsync(fd) if not rest else real_fcntl(fd, *rest)
+
+    monkeypatch.setattr(os, "fsync", refuse_for_directories)
+    monkeypatch.setattr(fcntl, "fcntl", refuse_for_directories)
+    store = Store()
+    store.write(b"k", b"v", keep_ttl=False)
+    path = tmp_path / "dump.mrdb"
+    persistence.save(store, str(path))
+    assert persistence.load(str(path)).lookup(b"k") == b"v"
 
 
 # error
@@ -423,10 +510,12 @@ def test_an_interrupt_mid_save_leaves_no_temporary_file(tmp_path, monkeypatch):
     # a KeyboardInterrupt is a BaseException and no Exception, so a cleanup that caught
     # only Exception let it unwind past the removal and strand a file the size of the
     # snapshot beside it
-    def interrupted(fd):
+    def interrupted(*args, **kwargs):
         raise KeyboardInterrupt
 
+    # both, since which one syncs the file is the platform's choice
     monkeypatch.setattr(os, "fsync", interrupted)
+    monkeypatch.setattr(fcntl, "fcntl", interrupted)
     store = Store()
     store.write(b"k", b"v", keep_ttl=False)
     with pytest.raises(KeyboardInterrupt):

@@ -31,6 +31,7 @@ files an interrupted save may have left, by the name `save()` gives its temporar
 """
 
 import errno
+import fcntl
 import os
 import re
 import stat
@@ -241,12 +242,21 @@ def _directory_of(path: str) -> str:
 
 def save(store: Store, path: str) -> None:
     """Write `store` to `path` atomically: encode first, then a temporary file in
-    `path`'s own directory, `flush()`, `os.fsync()`, close, `os.rename()` over `path`.
+    `path`'s own directory, `flush()`, a device-level sync of that file, close,
+    `os.rename()` over `path`, and a sync of the directory the rename wrote into.
     `path` itself is never opened for writing, so a failure at any step leaves whatever
     was there byte-identical. `tempfile.mkstemp()` itself runs inside the guarded region
     below, with `temp_path` set to `None` ahead of it, so an interrupt at the earliest
     possible point -- before a temporary file exists at all -- finds nothing to clean up
     rather than acting on a name this function was never given.
+
+    The two syncs answer two different halves of a power cut. The first makes the bytes
+    durable, the second makes the name that reaches them durable: they are separate
+    writes the drive may commit in either order, so a snapshot whose data survived under
+    a directory entry that did not is the previous snapshot, and one whose entry survived
+    over data that did not is a file the checksum then refuses. A killed process needs
+    neither, because the page cache outlives it -- that is what the rename alone already
+    covered.
     """
     blob = encode(store)
     directory = _directory_of(path)
@@ -267,9 +277,10 @@ def save(store: Store, path: str) -> None:
         with handle:
             handle.write(blob)
             handle.flush()
-            os.fsync(handle.fileno())
+            _sync_to_the_device(handle.fileno())
         _carry_over_the_mode(path, temp_path)
         os.rename(temp_path, path)
+        _sync_the_directory(directory)
     except BaseException as original:
         # BaseException rather than Exception: a KeyboardInterrupt or SystemExit arriving
         # mid-write unwinds through here too, and would strand the file otherwise. a kill
@@ -286,6 +297,54 @@ def save(store: Store, path: str) -> None:
                     "left the temporary file %s behind: removing it failed too: %s"
                     % (temp_path, cleanup_exc))
         raise
+
+
+# the errnos a filesystem answers when a sync is not a thing it does, rather than when
+# one failed: a directory on a filesystem that keeps no directory to sync says so this
+# way, and a save that treated it as a failure would report an error every interval for
+# a snapshot that is already in place
+_SYNC_NOT_SUPPORTED = frozenset(
+    code for code in (getattr(errno, name, None)
+                      for name in ("EINVAL", "ENOTSUP", "EOPNOTSUPP", "ENOTTY"))
+    if code is not None
+)
+
+
+def _sync_to_the_device(descriptor: int) -> None:
+    # os.fsync() returns once the data reaches the drive, which on macOS means it can
+    # still be sitting in the drive's own write cache -- lost by the same power cut this
+    # sync exists for. F_FULLFSYNC asks the drive to flush that cache too, and macOS is
+    # where it exists; everywhere else os.fsync is already what the platform offers, and
+    # a filesystem that has the call but will not honour it says so rather than lying
+    full_sync = getattr(fcntl, "F_FULLFSYNC", None)
+    if full_sync is not None:
+        try:
+            fcntl.fcntl(descriptor, full_sync)
+            return
+        except OSError as exc:
+            if exc.errno not in _SYNC_NOT_SUPPORTED:
+                raise
+    os.fsync(descriptor)
+
+
+def _sync_the_directory(directory: str) -> None:
+    # the rename above wrote a directory entry, and that entry is durable only once the
+    # directory itself is synced -- without this the bytes survive a power cut under a
+    # name that still points at the snapshot before them. opened read-only, which is all
+    # a directory can be opened as, and closed whatever happens
+    try:
+        descriptor = os.open(directory, os.O_RDONLY)
+    except OSError as exc:
+        if exc.errno in _SYNC_NOT_SUPPORTED:
+            return
+        raise
+    try:
+        _sync_to_the_device(descriptor)
+    except OSError as exc:
+        if exc.errno not in _SYNC_NOT_SUPPORTED:
+            raise
+    finally:
+        os.close(descriptor)
 
 
 def _carry_over_the_mode(path: str, temp_path: str) -> None:
