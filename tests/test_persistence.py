@@ -21,6 +21,8 @@ import faulthandler
 import fcntl
 import logging
 import os
+import subprocess
+import getpass
 import pathlib
 import stat
 import struct
@@ -1378,3 +1380,98 @@ def test_stale_temporaries_reports_a_name_whose_type_scandir_cannot_determine(
         "a name whose type os.scandir() cannot determine must still be reported -- "
         "dropping it is silence exactly where the warning matters most"
     )
+
+
+def _deny_delete_or_skip(path, user_denied):
+    # asked of the platform by trying it, not of the platform's name: chmod +a is macOS's
+    # ACL syntax and every other system refuses the flag outright, which is the only
+    # answer this needs
+    done = subprocess.run(["chmod", "+a", "%s deny delete" % user_denied, str(path)],
+                          capture_output=True, text=True)
+    if done.returncode != 0:
+        pytest.skip("this platform will not set an ACL denying delete: %s" % done.stderr.strip())
+
+
+def _clear_deny_delete(path, user_denied):
+    subprocess.run(["chmod", "-a", "%s deny delete" % user_denied, str(path)],
+                   capture_output=True, text=True)
+
+
+def test_check_writable_refuses_a_snapshot_an_acl_will_not_let_a_rename_replace(tmp_path):
+    # the flags field says what chflags can express and nothing about an ACL, and the
+    # probe that follows makes a NEW file, whose permissions are the directory's. A
+    # snapshot under `deny delete` passed the whole check and then failed every save,
+    # once an interval, forever -- which is the failure this check exists to move to
+    # startup rather than a fact about the path it cannot see
+    path = tmp_path / "dump.mrdb"
+    store = Store()
+    store.write(b"k", b"v", keep_ttl=False)
+    persistence.save(store, str(path))
+    before = path.read_bytes()
+    user = getpass.getuser()
+    _deny_delete_or_skip(path, user)
+    try:
+        with pytest.raises(persistence.SnapshotError, match="cannot be removed"):
+            persistence.check_writable(str(path))
+        # and the refusal is right about the save: the rename really is denied
+        with pytest.raises(OSError):
+            persistence.save(store, str(path))
+        assert path.read_bytes() == before, "the refused save changed the snapshot"
+    finally:
+        _clear_deny_delete(path, user)
+        for left in tmp_path.iterdir():
+            if left != path:
+                left.unlink()
+
+
+def test_the_delete_rehearsal_leaves_nothing_behind_on_a_path_it_accepts(tmp_path):
+    path = tmp_path / "dump.mrdb"
+    store = Store()
+    store.write(b"k", b"v", keep_ttl=False)
+    persistence.save(store, str(path))
+    persistence.check_writable(str(path))
+    assert [entry.name for entry in tmp_path.iterdir()] == ["dump.mrdb"], (
+        "the rehearsal left a second name for the snapshot behind on a path it accepted"
+    )
+
+
+def test_a_stranded_link_probe_is_cleared_by_the_start_that_can_remove_it(tmp_path):
+    # self-healing is the point: a refused start leaves the link, and once the operator
+    # clears what refused it the next start tidies up rather than refusing forever over
+    # the evidence of the last refusal
+    path = tmp_path / "dump.mrdb"
+    store = Store()
+    store.write(b"k", b"v", keep_ttl=False)
+    persistence.save(store, str(path))
+    stranded = tmp_path / "dump.mrdb.linkprobe"
+    os.link(str(path), str(stranded))
+    assert stranded.exists()
+    persistence.check_writable(str(path))
+    assert not stranded.exists(), "the stranded second name was not cleared"
+    assert path.read_bytes(), "the snapshot itself was removed instead"
+
+
+def test_the_link_probe_is_not_reported_as_a_stranded_save(tmp_path):
+    # it is a second name for the operator's own data, not a temporary file, and telling
+    # them to weigh it as one would invite them to read it as a newer snapshot
+    path = tmp_path / "dump.mrdb"
+    store = Store()
+    store.write(b"k", b"v", keep_ttl=False)
+    persistence.save(store, str(path))
+    os.link(str(path), str(tmp_path / "dump.mrdb.linkprobe"))
+    (tmp_path / "dump.mrdb.abcd1234.tmp.mrdb").write_bytes(b"a real stranded save")
+    assert persistence.stale_temporaries(str(path)) == ["dump.mrdb.abcd1234.tmp.mrdb"]
+    assert not persistence.is_legacy_temporary_name("dump.mrdb.linkprobe")
+
+
+def test_a_key_repeated_three_times_is_refused_with_its_own_count():
+    # "twice" whatever the count is a claim about the file an operator may act on
+    def entry(key, value):
+        return (struct.pack("<I", len(key)) + key + bytes((persistence.TYPE_STRING,))
+                + struct.pack("<q", -1) + struct.pack("<I", len(value)) + value)
+
+    body = (persistence.MAGIC + struct.pack("<II", persistence.SNAPSHOT_VERSION, 3)
+            + entry(b"triple", b"a") + entry(b"triple", b"b") + entry(b"triple", b"c"))
+    blob = body + struct.pack("<I", zlib.crc32(body))
+    with pytest.raises(persistence.SnapshotError, match=r"3 times"):
+        persistence.decode(blob)

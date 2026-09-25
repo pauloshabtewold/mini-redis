@@ -34,6 +34,7 @@ after the rename has already put the new snapshot at the path, so it is a warnin
 not an exception the caller would report as a failed save.
 """
 
+import collections
 import errno
 import fcntl
 import logging
@@ -237,11 +238,13 @@ def _decode(blob: bytes) -> Store:
         # the cause whenever a blob carried both a repeat and an unrecognised kind byte,
         # where the kind byte is what from_items() had actually raised on -- and it raised
         # on it before the repeated entries were reached at all
-        seen = set()
+        counts = collections.Counter(key for key, _, _, _ in items)
         for key, _, _, _ in items:
-            if key in seen:
-                raise SnapshotError("snapshot has key %r twice" % (key,)) from None
-            seen.add(key)
+            if counts[key] > 1:
+                # the count, not the word "twice": three entries naming one key were
+                # reported as two, which is a fact about the file an operator may act on
+                raise SnapshotError(
+                    "snapshot has key %r %d times" % (key, counts[key])) from None
         # a repeat is the only thing DuplicateKeyError is raised for, so the scan above
         # finds one; reaching here means from_items() counted a difference this decoder
         # cannot explain, which is a bug in one of the two and not a fact about the file
@@ -424,8 +427,10 @@ def check_writable(path: str) -> None:
     # lstat, not isdir: the save finishes with os.rename() over path, and rename does
     # not follow a symlink in its final component -- it replaces the link itself. A path
     # that is a symlink to a directory is therefore one a save writes without complaint,
-    # and following the link here refused it, which stops a server whose --snapshot-path
-    # is the "current -> dump-<date>.mrdb" arrangement people actually use
+    # and following the link here refused a path that works. What it must not be read as
+    # is support for keeping a symlink there: the first save through one replaces it with
+    # a plain file, so a rotation scheme built on a link at this path does not survive an
+    # interval. This check predicts what rename does, and that is all it does
     try:
         path_mode = os.lstat(path).st_mode
     except OSError:
@@ -458,6 +463,8 @@ def check_writable(path: str) -> None:
         raise SnapshotError(
             "cannot write snapshot %s: the existing snapshot's flags would block a "
             "rename over it" % (path,))
+    if path_mode is not None and stat.S_ISREG(path_mode):
+        _refuse_if_the_snapshot_cannot_be_replaced(path)
     # everything left standing -- directory permissions, an ACL, a name the filesystem
     # will not accept -- is answered by attempting exactly what a save attempts: the
     # same temporary file, in the same place, removed the same way
@@ -490,6 +497,60 @@ def check_writable(path: str) -> None:
             "cannot write snapshot %s: a file can be created in %s but not removed, so "
             "%s is left there: %s" % (path, directory, os.path.basename(probe_path), exc)
         ) from exc
+
+
+# the name the delete-right rehearsal below gives its hard link. Deliberately not the
+# shape stale_temporaries() matches: it is a second name for the snapshot itself, not a
+# temporary file, and reporting it as one would tell an operator to weigh a file that is
+# their own data under another name
+_LINK_PROBE_SUFFIX = ".linkprobe"
+
+
+def _refuse_if_the_snapshot_cannot_be_replaced(path: str) -> None:
+    """Rehearse the one permission a `save()`'s final `os.rename()` needs and nothing
+    above can see: the right to remove the existing snapshot's directory entry.
+
+    The flags check above catches `chflags`, which is what a flags field can express. It
+    cannot see an ACL -- `chmod +a "<user> deny delete"` on the snapshot blocks the same
+    rename for a different reason, and the probe that follows creates a *new* file, whose
+    permissions are the directory's and say nothing about this one's. A path like that
+    passed the startup check and then failed every save, once an interval, forever, which
+    is the failure this whole function exists to move to startup.
+
+    Rehearsed on a hard link rather than on the snapshot, so nothing is ever moved or
+    removed: a second name for the same inode carries the same ACL, so unlinking it needs
+    the same right the rename needs. A filesystem without hard links, or any other reason
+    the link cannot be made, leaves this unchecked rather than guessing -- that is where
+    it stood before.
+    """
+    link = path + _LINK_PROBE_SUFFIX
+    try:
+        os.link(path, link)
+    except FileExistsError:
+        # a refused start left one here. Removing it first is what keeps this
+        # self-healing: once the operator clears the ACL, the next start tidies up and
+        # passes, rather than refusing forever over the evidence of the last refusal
+        try:
+            os.unlink(link)
+            os.link(path, link)
+        except OSError as exc:
+            raise SnapshotError(
+                "cannot write snapshot %s: %s is a second name for it left by an earlier "
+                "refused start and cannot be removed, which is the same permission a save "
+                "needs to replace the snapshot: %s"
+                % (path, os.path.basename(link), exc)) from exc
+    except OSError:
+        # no hard links here, or the directory will not take one. The probe below already
+        # answers for the directory; this one has nothing left to add
+        return
+    try:
+        os.unlink(link)
+    except OSError as exc:
+        raise SnapshotError(
+            "cannot write snapshot %s: the existing snapshot cannot be removed, so the "
+            "rename that finishes a save would be refused, and %s is left beside it as a "
+            "second name for the same file -- deleting it loses nothing: %s"
+            % (path, os.path.basename(link), exc)) from exc
 
 
 def stale_temporaries(path: str) -> list[str]:
