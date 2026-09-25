@@ -1562,3 +1562,39 @@ def test_a_directory_sync_that_raises_outright_does_not_claim_a_stranded_file(
                        for note in getattr(raised, "__notes__", [])), (
             "a save whose snapshot is on disk claimed it stranded a temporary file",
             getattr(raised, "__notes__", []))
+
+
+def test_the_rehearsal_will_not_remove_a_file_that_is_merely_named_like_its_link(tmp_path):
+    # the self-healing removal is safe only for what a refused start leaves: a second name
+    # for the snapshot as it stands, where unlinking destroys nothing because the
+    # snapshot's own entry still points at the bytes. Anything else under that name is the
+    # operator's -- an unrelated file, or a link to a snapshot this path no longer holds,
+    # which may be their only copy of it. Removing whatever it found made a startup check
+    # into something that deletes data in order to run
+    path = tmp_path / "dump.mrdb"
+    store = Store()
+    store.write(b"k", b"v", keep_ttl=False)
+    persistence.save(store, str(path))
+    theirs = tmp_path / "dump.mrdb.linkprobe"
+    theirs.write_bytes(b"not a link, and not this check's to remove")
+
+    with pytest.raises(persistence.SnapshotError, match="not a second name"):
+        persistence.check_writable(str(path))
+    assert theirs.read_bytes() == b"not a link, and not this check's to remove", (
+        "the startup check destroyed a file it did not create"
+    )
+
+    # a link to an OLDER snapshot is the same answer: this path no longer holds those
+    # bytes, so the link is the only name left for them
+    theirs.unlink()
+    older = tmp_path / "older.mrdb"
+    other = Store()
+    other.write(b"older", b"value", keep_ttl=False)
+    persistence.save(other, str(older))
+    os.link(str(older), str(theirs))
+    older.unlink()
+    with pytest.raises(persistence.SnapshotError, match="not a second name"):
+        persistence.check_writable(str(path))
+    assert sorted(persistence.load(str(theirs))._data) == [b"older"], (
+        "the only remaining name for an older snapshot was removed"
+    )

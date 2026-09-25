@@ -506,6 +506,18 @@ def check_writable(path: str) -> None:
 _LINK_PROBE_SUFFIX = ".linkprobe"
 
 
+def _is_a_second_name_for(path: str, other: str) -> bool:
+    # one inode under two names, asked of the filesystem rather than assumed from the
+    # name. A hard link to the snapshot can be removed without destroying anything,
+    # because the snapshot's own entry still points at the same bytes; nothing else can
+    try:
+        mine = os.lstat(path)
+        theirs = os.lstat(other)
+    except OSError:
+        return False
+    return (mine.st_dev, mine.st_ino) == (theirs.st_dev, theirs.st_ino)
+
+
 def _refuse_if_the_snapshot_cannot_be_replaced(path: str) -> None:
     """Rehearse the one permission a `save()`'s final `os.rename()` needs and nothing
     above can see: the right to remove the existing snapshot's directory entry.
@@ -527,9 +539,20 @@ def _refuse_if_the_snapshot_cannot_be_replaced(path: str) -> None:
     try:
         os.link(path, link)
     except FileExistsError:
-        # a refused start left one here. Removing it first is what keeps this
-        # self-healing: once the operator clears the ACL, the next start tidies up and
-        # passes, rather than refusing forever over the evidence of the last refusal
+        # something already holds the name. Removing it is only safe when it is what a
+        # refused start leaves -- a second name for the snapshot that is there right now,
+        # where unlinking it destroys nothing. Anything else at that name is the
+        # operator's: an unrelated file, or a link to a snapshot this path no longer
+        # holds, which may be their only copy of it. This removed whatever it found,
+        # which is a start that deletes data to run a check
+        if not _is_a_second_name_for(path, link):
+            raise SnapshotError(
+                "cannot write snapshot %s: %s is in the way and is not a second name for "
+                "the snapshot, so it is not this check's to remove; move it aside"
+                % (path, os.path.basename(link)))
+        # self-healing from here: once the operator clears whatever refused the start, the
+        # next one tidies up and passes rather than refusing forever over the evidence of
+        # the last refusal
         try:
             os.unlink(link)
             os.link(path, link)
