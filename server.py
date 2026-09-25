@@ -73,12 +73,16 @@ DEFAULT_EXPIRY_SWEEP_INTERVAL_MS = 100
 # fraction below is of the sample actually drawn. the two agree only on a full pass of
 # twenty: over a keyspace with eight keys carrying a TTL, 5.0 re-loops at six expired and
 # this sweep at three. 7.2.7 instead repeats while a pass sampled nothing or more than
-# 10 per cent of it was stale, at the default effort.
+# 10 per cent of it was stale -- integer division, so three of twenty-eight is 10 and
+# does not re-loop -- at the default effort.
 #
-# that effort is 7.2.7's alone: active-expire-effort scales each of its numbers and
-# CONFIG GET answers it, so a running 7.2.7 shows the effort and not the values
-# themselves. 5.0.14 has no such option anywhere in its sources and uses the three
-# constants raw
+# that effort is 7.2.7's alone, and it does not do one thing to the four numbers it
+# moves: the keys per loop and the fast cycle's microseconds each grow by a quarter of
+# themselves per step, the slow cycle's percentage by a flat two points not derived from
+# the 25, and the stale percentage above shrinks by one per step -- so the 10 is the
+# value at the default effort and also its largest. CONFIG GET answers the effort, so a
+# running 7.2.7 shows that and not the values it derives. 5.0.14 has no such option
+# anywhere in its sources and uses the three constants raw
 SWEEP_SAMPLE_SIZE = 20
 SWEEP_RELOOP_THRESHOLD = 0.25
 SWEEP_BUDGET_SECONDS = 0.001
