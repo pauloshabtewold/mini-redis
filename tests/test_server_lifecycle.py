@@ -1252,3 +1252,83 @@ def test_launch_server_gives_up_rather_than_returning_someone_elses_server(
             conftest.launch_server(tmp_path / "dump.mrdb")
     finally:
         squatter.close()
+
+
+def _fake_server_root(tmp_path, body, listen=False):
+    """A stand-in for `server.py` that behaves however a test needs on its stdout.
+
+    launch_server() reads the bind line the real server prints, so what it does when that
+    line is late, partial, wrong or followed by an exit is a property of the helper and
+    not of the server. Driving the real one cannot reach those paths: it prints the whole
+    line in a single flushed write under PIPE_BUF and then serves, so every one of them
+    would be untested against it.
+    """
+    root = tmp_path / "fake"
+    root.mkdir()
+    (root / "server.py").write_text(
+        "import socket, sys, time\n"
+        "port = sys.argv[sys.argv.index('--port') + 1]\n"
+        "if %r:\n"
+        "    _listener = socket.socket()\n"
+        "    _listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)\n"
+        "    _listener.bind(('127.0.0.1', int(port)))\n"
+        "    _listener.listen(1)\n" % (listen,)
+        + body
+    )
+    return root
+
+
+def test_launch_server_gives_up_on_a_server_that_prints_half_a_line_and_stalls(
+    tmp_path, monkeypatch
+):
+    # select() bounds the wait for readiness, not the read that follows it. A readline()
+    # entered on one available byte has no deadline of its own, so a line that never
+    # finishes held launch_server past every bound it advertises -- and the retry loop
+    # above it never got control back either
+    root = _fake_server_root(tmp_path, "sys.stdout.write('listening on 127.0.0.1:')\n"
+                                       "sys.stdout.flush()\n"
+                                       "time.sleep(60)\n")
+    monkeypatch.setattr(conftest, "REPO_ROOT", root)
+    started = time.monotonic()
+    with pytest.raises(AssertionError, match="no server could be started"):
+        conftest.launch_server(tmp_path / "dump.mrdb", attempts=1)
+    elapsed = time.monotonic() - started
+    assert elapsed < 30, (
+        "launch_server ran past its own five-second deadline on a partial line", elapsed)
+
+
+def test_launch_server_refuses_a_port_that_nothing_is_serving(tmp_path, monkeypatch):
+    # the bind line says the port belongs to this process; it does not say anything is
+    # listening on it. A caller handed a port nobody serves meets a refused connect
+    # somewhere deep inside its own body, with nothing saying the launch was what failed.
+    # No check can promise a server stays up, so what is pinned here is the pair that is
+    # knowable at the moment the port is handed back: this process's port, and serving
+    root = _fake_server_root(tmp_path, "print('listening on 127.0.0.1:' + port, flush=True)\n"
+                                       "time.sleep(60)\n")
+    monkeypatch.setattr(conftest, "REPO_ROOT", root)
+    with pytest.raises(AssertionError, match="no server could be started"):
+        conftest.launch_server(tmp_path / "dump.mrdb", attempts=1)
+
+
+def test_launch_server_reads_past_a_line_that_is_not_the_bind_line(tmp_path, monkeypatch):
+    # stopping at the first line read an unrelated one as a failure to bind, and the
+    # message then blamed a port nobody had taken
+    root = _fake_server_root(tmp_path, "print('starting up', flush=True)\n"
+                                       "time.sleep(0.1)\n"
+                                       "print('listening on 127.0.0.1:' + port, flush=True)\n"
+                                       "time.sleep(60)\n", listen=True)
+    monkeypatch.setattr(conftest, "REPO_ROOT", root)
+    proc, port = conftest.launch_server(tmp_path / "dump.mrdb", attempts=1)
+    try:
+        assert proc.poll() is None, "the server was not left running"
+        assert isinstance(port, int)
+    finally:
+        conftest.stop_server(proc)
+
+
+def test_launch_server_rejects_a_bind_line_naming_a_different_port(tmp_path, monkeypatch):
+    root = _fake_server_root(tmp_path, "print('listening on 127.0.0.1:1', flush=True)\n"
+                                       "time.sleep(60)\n")
+    monkeypatch.setattr(conftest, "REPO_ROOT", root)
+    with pytest.raises(AssertionError, match="no server could be started"):
+        conftest.launch_server(tmp_path / "dump.mrdb", attempts=1)

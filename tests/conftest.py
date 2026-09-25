@@ -2,6 +2,7 @@
 subprocess, and a RESP2 redis-py client already pointed at it.
 """
 
+import os
 import pathlib
 import select
 import socket
@@ -65,12 +66,36 @@ def _bound_this_port(proc, port, deadline):
     # the winner is listening, and its tests run against the other one's server and read
     # values they never wrote. That is the shape the 8 MiB round trip's own failure
     # message describes, and nothing here could see it
+    #
+    # Read through os.read on the raw descriptor rather than readline(): select() bounds
+    # only the wait for readiness, so a readline() entered on one available byte blocks
+    # with no deadline of its own if the rest of the line never comes, and the retry loop
+    # above never gets control back. Today's server prints the whole line in one flushed
+    # write well under PIPE_BUF, so it arrives atomically -- but the bound has to hold on
+    # the path, not on the current server's good manners. Lines are consumed until the one
+    # that matches, because stopping at the first means an unrelated line ahead of it
+    # reads as a failure to bind.
+    expected = b"listening on "
+    wanted_tail = (":%d" % port).encode()
+    buffered = b""
     while time.monotonic() < deadline:
         ready, _, _ = select.select([proc.stdout], [], [], 0.05)
         if ready:
-            line = proc.stdout.readline()
-            return line.startswith("listening on ") and line.rstrip().endswith(":%d" % port)
-        if proc.poll() is not None:
+            chunk = os.read(proc.stdout.fileno(), 4096)
+            if not chunk:
+                # EOF: the child closed stdout without ever naming this port
+                return False
+            buffered += chunk
+            while b"\n" in buffered:
+                line, buffered = buffered.split(b"\n", 1)
+                if line.startswith(expected) and line.rstrip().endswith(wanted_tail):
+                    # the line proves the port is this process's; a connect proves
+                    # something is serving on it now. Neither alone is enough -- a connect
+                    # answers for whoever holds the port, and a line a child printed before
+                    # dying answers for nothing -- and no check can promise a server stays
+                    # up, so this is the pair that is actually knowable here
+                    return proc.poll() is None and wait_until_listening(port, deadline)
+        elif proc.poll() is not None:
             # exited without ever printing the line: the bind failed
             return False
     return False
@@ -85,20 +110,28 @@ def launch_server(snapshot_path, extra_args=(), attempts=5):
     signal as one that silently uses the wrong server. `stdout` is a pipe rather than
     `DEVNULL` for the same reason the redirection existed: the bind line stays out of the
     transcript under `-s`, and now it is also read.
+
+    Everything here is bounded: five attempts, each with its own five-second deadline that
+    holds on every path through the read, so a server that says nothing, says half a line,
+    or says the wrong thing costs one attempt rather than the run.
     """
     for _ in range(attempts):
         port = free_port()
         proc = subprocess.Popen(
             [sys.executable, str(REPO_ROOT / "server.py"), "--port", str(port),
              "--snapshot-path", str(snapshot_path), *extra_args],
-            stdout=subprocess.PIPE, text=True,
+            stdout=subprocess.PIPE,
         )
         if _bound_this_port(proc, port, time.monotonic() + 5):
             return proc, port
         stop_server(proc)
+    # the reason is not knowable from here -- a port taken, a server that died before it
+    # bound, one too slow to answer inside the deadline -- so the message says what was
+    # observed rather than naming a cause. An earlier wording blamed a taken port every
+    # time, including when none had been
     raise AssertionError(
-        "no server could be started: %d ports in a row were taken before it bound one"
-        % attempts)
+        "no server could be started: %d attempts in a row neither printed a bind line "
+        "for the port they were given nor stayed alive to" % attempts)
 
 
 @pytest.fixture
