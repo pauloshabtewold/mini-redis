@@ -51,23 +51,34 @@ DEFAULT_IGNORE_SNAPSHOT = False
 DEFAULT_EXPIRY_SWEEP_INTERVAL_MS = 100
 # the sweep's own constants -- 20 sampled keys, a re-loop past a quarter expired, a
 # 1 ms budget -- checked against the tagged sources rather than assumed: 7.2.7's
-# expire.c:109-111 and 5.0.14's server.h:172-174 both compile in the same three numbers,
-# ACTIVE_EXPIRE_CYCLE_KEYS_PER_LOOP 20, ACTIVE_EXPIRE_CYCLE_FAST_DURATION 1000 (one
-# millisecond) and ACTIVE_EXPIRE_CYCLE_SLOW_TIME_PERC 25, so the 20 keys and the 1 ms
-# budget here are both the reference's own numbers in both versions. what is not the
-# reference's own is which cycle each is borrowed from: in both versions the cycle
-# driven from the cron at hz -- 100 ms at hz 10, the cadence --expiry-sweep-interval
-# defaults to -- is the slow one, and gets a quarter of that tick (25 ms), while the 1 ms
-# belongs to a separate fast cycle run from beforeSleep, between event-loop passes.
-# spending the fast cycle's millisecond on the slow cycle's 100 ms cadence, instead of
-# the slow cycle's own 25 ms, is this project's own choice. what actually differs
-# between the two reference versions is the draw -- 5.0 samples random keys, the way
-# this sweep does; 7.2.7 walks the expiry table with a cursor instead -- and the re-loop
-# test: 5.0 repeats while more than a quarter of a sample expired (expired > 20/4), which
-# is SWEEP_RELOOP_THRESHOLD below, while 7.2.7 repeats while a pass sampled nothing or
-# more than 10 percent of it was stale, at the default effort. each reference number is
-# itself scaled by active-expire-effort, which CONFIG GET does answer, so a running
-# server shows the effort and not the values themselves
+# expire.c:109-111 and 5.0.14's server.h:172-174 compile in the same three numbers, 20
+# keys a pass, a 1000-microsecond fast cycle and 25 per cent for the slow one. the names
+# are not shared: 7.2.7 spells the first ACTIVE_EXPIRE_CYCLE_KEYS_PER_LOOP and 5.0.14
+# spells it ACTIVE_EXPIRE_CYCLE_LOOKUPS_PER_LOOP, and neither name appears in the other
+# version. so the 20 keys and the 1 ms budget here are both the reference's own numbers
+# in both versions. what is not the reference's own is which cycle each is borrowed from:
+# in both versions the cycle driven from the cron at hz -- 100 ms at hz 10, the cadence
+# --expiry-sweep-interval defaults to -- is the slow one, and gets a quarter of that tick
+# (25 ms), while the 1 ms belongs to a separate fast cycle run from beforeSleep, between
+# event-loop passes. spending the fast cycle's millisecond on the slow cycle's 100 ms
+# cadence, instead of the slow cycle's own 25 ms, is this project's own choice.
+#
+# two further differences, neither of them cosmetic. the draw: 5.0 takes random keys one
+# at a time with replacement, min(20, however many carry a TTL) of them, where 7.2.7
+# walks the expiry table with a cursor and can overshoot 20, since one dictScan step
+# drains a whole bucket -- and this sweep draws without replacement, which is neither.
+# and the re-loop test, where SWEEP_RELOOP_THRESHOLD below is NOT 5.0's rule: 5.0 repeats
+# while expired > ACTIVE_EXPIRE_CYCLE_LOOKUPS_PER_LOOP/4, a comparison against the
+# constant -- more than five -- however few keys the pass actually drew, while the
+# fraction below is of the sample actually drawn. the two agree only on a full pass of
+# twenty: over a keyspace with eight keys carrying a TTL, 5.0 re-loops at six expired and
+# this sweep at three. 7.2.7 instead repeats while a pass sampled nothing or more than
+# 10 per cent of it was stale, at the default effort.
+#
+# that effort is 7.2.7's alone: active-expire-effort scales each of its numbers and
+# CONFIG GET answers it, so a running 7.2.7 shows the effort and not the values
+# themselves. 5.0.14 has no such option anywhere in its sources and uses the three
+# constants raw
 SWEEP_SAMPLE_SIZE = 20
 SWEEP_RELOOP_THRESHOLD = 0.25
 SWEEP_BUDGET_SECONDS = 0.001

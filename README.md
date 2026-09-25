@@ -61,36 +61,48 @@ back to `resource.getrusage(...).ru_maxrss`, a high-water mark, so the two figur
 right after a bulk load and diverge for a server that has since freed memory back to the
 allocator. `ratelimit.py` and `replication.py` are still declared and empty.
 
-**Four more flags cover persistence and the active sweep.** Persistence is on by default.
-`--snapshot-path` names the file a snapshot is written to and read back from and defaults
-to `./dump.mrdb`, resolved against the directory the server was started in; a file that is
-present but will not decode refuses startup rather than starting empty over it, and so
-does anything else at that path that is not a regular file -- a directory, a named pipe.
-Whenever saving is on, the startup check tries the write it guards against rather than
-only inspecting the path: it creates and removes a temporary file shaped like the one a
-save writes, in the snapshot's own directory, so a directory that cannot take that file, a
-name the filesystem will not accept, and a directory that will not let the file be removed
-are all refused before the server starts, and an existing snapshot whose file flags would
-block a rename over it is refused too. It still cannot see a disk that fills later or a
-directory changed after startup. A save writes a temporary file beside the snapshot, named
-after it, and renames it into place; a file left under that name, as a process killed
-mid-save leaves one, is never read or removed, and every start over the same path names it
-in a warning, so long as the directory can be listed. `--snapshot-interval` (seconds,
-default `60`) and `--expiry-sweep-interval` (milliseconds, default `100`, the same span as
-the run loop's own `select()` timeout of `0.1` seconds) both follow the same rule as the
+**Four more flags cover persistence and the active sweep.** Persistence is on by
+default. `--snapshot-path` names the file a snapshot is written to and read back from
+and defaults to `./dump.mrdb`, resolved against the directory the server was started in;
+a file that is present but will not decode refuses startup rather than starting empty
+over it, and so does anything else at that path that is not a regular file -- a
+directory, a named pipe. Whenever saving is on, the startup check tries the write it
+guards against rather than only inspecting the path: it creates and removes a temporary
+file shaped like the one a save writes, in the snapshot's own directory, so a directory
+that cannot take that file, a name the filesystem will not accept, and a directory that
+will not let the file be removed are all refused before the server starts, and an
+existing snapshot whose file flags would block a rename over it is refused too. What it
+judges at that path is the entry a save's rename would replace, not whatever that entry
+points at, so a `--snapshot-path` that is a symlink is accepted and replaced, exactly as
+the rename replaces it. It still cannot see a disk that fills later or a directory
+changed after startup. A save writes a temporary file beside the snapshot, named after
+it, and renames it into place; a file left under that name, as a process killed mid-save
+leaves one, is never read or removed, and every start over the same path names it in a
+warning, so long as the directory can be listed. `--snapshot-interval` (seconds, default
+`60`) and `--expiry-sweep-interval` (milliseconds, default `100`, the same span as the
+run loop's own `select()` timeout of `0.1` seconds) both follow the same rule as the
 caps above: `0` turns the periodic task off, and a negative value is refused at the CLI
-and again in `Server.__init__`. `--ignore-snapshot` takes no value of its own: passed, the
-file at `--snapshot-path` is never read, whether or not it is readable, so a good snapshot
-is discarded as readily as a corrupt one. The server starts with an empty keyspace, and
-the file itself stays on disk untouched until the next save writes the keyspace as it then
-stands over it -- unless `--snapshot-interval` is 0, in which case nothing ever overwrites
-it. It is the escape hatch for a file that refuses to load. Left set permanently -- in a
-unit file, say -- it starts every restart with an empty keyspace, not just the first,
-because it never reads the file.
+and again in `Server.__init__`. So is a value too large to put on a clock: above `2**63
+- 1` the arithmetic that schedules an interval cannot convert it, and it is refused at
+both doors rather than left to surface as an `OverflowError` one tick later.
+`--ignore-snapshot` takes no value of its own: passed, the file at `--snapshot-path` is
+never read, whether or not it is readable, so a good snapshot is discarded as readily as
+a corrupt one. The server starts with an empty keyspace, and the file itself stays on
+disk untouched until the next save writes the keyspace as it then stands over it --
+unless `--snapshot-interval` is 0, in which case nothing ever overwrites it. It is the
+escape hatch for a file that refuses to load. Left set permanently -- in a unit file,
+say -- it starts every restart with an empty keyspace, not just the first, because it
+never reads the file.
 
 **A clean stop can still lose recent writes.** Snapshots save on `--snapshot-interval`
-and not on the way out, so a `SIGINT` or `SIGTERM` can lose up to one interval's worth
-of writes; lowering `--snapshot-interval` bounds how much a restart can lose. The save
+and not on the way out, so a `SIGINT` or `SIGTERM` can lose one interval's worth of
+writes plus however long the last save took. The interval is counted from the moment a
+save finishes rather than from the moment it starts — the rule `CONFIG GET save`
+publishes, and the reference's own — so the window between two saves is the interval
+plus the duration of the one before it. At the default and the snapshot size measured
+below that is a little over sixty seconds; on a keyspace large enough for a save to
+outlast its own interval it is the interval plus the save. Lowering
+`--snapshot-interval` bounds how much a restart can lose, down to that floor. The save
 also blocks: it runs on the one thread that answers commands, so while a snapshot is
 being serialized and written the server answers nobody. Real Redis forks and lets a
 copy-on-write child pay that cost, which is the right answer at scale and the one given
