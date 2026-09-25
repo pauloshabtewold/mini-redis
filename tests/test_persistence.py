@@ -1265,8 +1265,12 @@ def test_check_writable_refuses_an_existing_snapshot_under_uf_append(tmp_path):
 
 
 def test_check_writable_refuses_an_existing_snapshot_under_sf_append(tmp_path, monkeypatch):
-    if not hasattr(stat, "SF_APPEND"):
-        pytest.skip("no stat.SF_APPEND on this platform")
+    # asked of the platform's own stat result rather than of the stat module: the
+    # SF_APPEND constant is defined everywhere Python runs, and the field the bitmask
+    # under test reads is not -- st_flags is BSD's, and on Linux the fake below cannot
+    # be built at all. Guarding on the constant skipped nothing and went red in CI
+    if not hasattr(os.lstat(str(tmp_path)), "st_flags"):
+        pytest.skip("this platform's stat results carry no flags field")
     path = tmp_path / "dump.mrdb"
     good = Store()
     good.write(b"k", b"v", keep_ttl=False)
