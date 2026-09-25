@@ -1475,3 +1475,29 @@ def test_a_key_repeated_three_times_is_refused_with_its_own_count():
     blob = body + struct.pack("<I", zlib.crc32(body))
     with pytest.raises(persistence.SnapshotError, match=r"3 times"):
         persistence.decode(blob)
+
+
+def test_the_delete_rehearsal_is_skipped_for_a_symlink_whose_target_is_undeletable(tmp_path):
+    # the rehearsal makes a hard link, and os.link follows a symlink to its target, so
+    # running it on a symlinked path asks about the target's deletability -- which a save
+    # never needs, because the rename replaces the link and leaves the target alone.
+    # Without the guard that keeps the rehearsal to a regular file, a snapshot path
+    # pointing at an undeletable file is refused although a save writes it: the same
+    # confusion between the entry and what it points at that the lstat checks above fixed
+    target = tmp_path / "real.mrdb"
+    link = tmp_path / "dump.mrdb"
+    store = Store()
+    store.write(b"k", b"v", keep_ttl=False)
+    persistence.save(store, str(target))
+    target_bytes = target.read_bytes()
+    link.symlink_to(target)
+    user = getpass.getuser()
+    _deny_delete_or_skip(target, user)
+    try:
+        persistence.check_writable(str(link))
+        persistence.save(store, str(link))
+        assert not link.is_symlink(), "the save did not replace the link, as rename does"
+        assert target.read_bytes() == target_bytes, "the undeletable target was touched"
+        assert sorted(persistence.load(str(link))._data) == [b"k"]
+    finally:
+        _clear_deny_delete(target, user)
