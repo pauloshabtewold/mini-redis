@@ -26,8 +26,8 @@ import getpass
 import pathlib
 import stat
 import struct
-import threading
 import tempfile
+import time
 import zlib
 from collections import deque
 
@@ -1509,6 +1509,44 @@ def test_a_snapshot_an_acl_will_not_let_a_rename_replace_starts_and_then_fails_s
         _clear_deny_delete(path, user)
 
 
+def test_a_rename_the_filesystem_refuses_fails_safely_on_every_platform(
+    tmp_path, monkeypatch
+):
+    # the same property as the test above, asked without chmod +a: that one skips wherever
+    # macOS ACL syntax is not understood, which is every machine CI runs on, and it is the
+    # only thing pinning the failure mode the startup check was removed in favour of. Here
+    # the rename is refused directly, so what a denying filesystem would do is what runs
+    path = tmp_path / "dump.mrdb"
+    store = Store()
+    store.write(b"first", b"value", keep_ttl=False)
+    persistence.save(store, str(path))
+    before = path.read_bytes()
+
+    # check_writable passes: it creates and removes its own file, which says nothing about
+    # the right to remove this one. That gap is the removal's whole premise
+    persistence.check_writable(str(path))
+
+    real_rename = os.rename
+
+    def refuse_the_replacement(source, target, *args, **kwargs):
+        if str(target) == str(path):
+            raise PermissionError(errno.EACCES, "Permission denied")
+        return real_rename(source, target, *args, **kwargs)
+
+    monkeypatch.setattr(persistence.os, "rename", refuse_the_replacement)
+    later = Store()
+    later.write(b"second", b"value", keep_ttl=False)
+    with pytest.raises(OSError):
+        persistence.save(later, str(path))
+    monkeypatch.undo()
+
+    assert path.read_bytes() == before, "the failed save damaged the snapshot"
+    assert sorted(persistence.load(str(path))._data) == [b"first"], (
+        "the snapshot the save could not replace no longer loads")
+    left = [entry.name for entry in tmp_path.iterdir() if entry.name != "dump.mrdb"]
+    assert not left, ("the failed save stranded something", left)
+
+
 def test_check_writable_writes_nothing_into_the_directory_it_checks(tmp_path):
     # it creates and removes one temporary file of the shape a save writes, and that is
     # all. A second probe that made a hard link beside the snapshot is what this pins
@@ -1519,19 +1557,32 @@ def test_check_writable_writes_nothing_into_the_directory_it_checks(tmp_path):
     store.write(b"k", b"v", keep_ttl=False)
     persistence.save(store, str(path))
 
-    created = []
-    real_link = os.link
+    # asked of the snapshot's own inode rather than by intercepting os.link. A link count
+    # read after the call sees nothing, because a probe that makes a second name and
+    # removes it again leaves the count back at one -- and so does patching the os.link
+    # attribute, against a probe that bound it at import time or shelled out to ln. What
+    # does survive is the inode's ctime: linking or unlinking changes the link count,
+    # which is inode metadata, so either one moves it, and neither reading the file nor
+    # creating an unrelated file beside it does. That is the property, and it holds
+    # however the probe spells its call
+    beside = tmp_path / "beside.mrdb"
+    beside.write_bytes(b"the operator's own file")
+    entries_before = {entry.name: entry.stat().st_ino for entry in tmp_path.iterdir()}
+    inode_before = path.stat()
+    # the snapshot was written a moment ago; without this the ctime a probe sets can land
+    # inside the same tick as the one it is compared against
+    time.sleep(0.01)
 
-    def recording_link(source, target, *args, **kwargs):
-        created.append(target)
-        return real_link(source, target, *args, **kwargs)
+    persistence.check_writable(str(path))
 
-    os.link = recording_link
-    try:
-        persistence.check_writable(str(path))
-    finally:
-        os.link = real_link
-
-    assert not created, ("the check made a hard link in the snapshot's directory", created)
-    assert [entry.name for entry in tmp_path.iterdir()] == ["dump.mrdb"], (
-        "the check left something behind in the directory it was asked about")
+    inode_after = path.stat()
+    assert inode_after.st_ctime_ns == inode_before.st_ctime_ns, (
+        "the check touched the snapshot's own inode, which is what making a second name "
+        "for it and removing it again looks like from outside",
+        inode_before.st_ctime_ns, inode_after.st_ctime_ns)
+    assert inode_after.st_nlink == 1, (
+        "the check left the snapshot with a second name", inode_after.st_nlink)
+    entries_after = {entry.name: entry.stat().st_ino for entry in tmp_path.iterdir()}
+    assert entries_after == entries_before, (
+        "the check changed what stands in the directory it was asked about",
+        entries_before, entries_after)
