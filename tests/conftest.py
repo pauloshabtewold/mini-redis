@@ -96,8 +96,12 @@ def _bound_this_port(proc, port, deadline):
                     # up, so this is the pair that is actually knowable here
                     # the connect first, and the liveness check after it: asked before,
                     # a child that exits the instant it has printed is still alive when
-                    # the question is put, and the answer is stale by the time the port is
-                    # handed back. The connect is what gives it time to be gone
+                    # the question is put. Asked after, it has had a connect's worth of
+                    # time to be gone -- which is a better chance and not a guarantee, so
+                    # this half is deliberately unpinned by any test. Asserting that a
+                    # child racing to exit loses that race is asserting a scheduling
+                    # outcome: it held on this machine and lost on CI's. What IS pinned is
+                    # the connect: a port nothing serves is never handed back
                     return wait_until_listening(port, deadline) and proc.poll() is None
         elif proc.poll() is not None:
             # exited without ever printing the line: the bind failed

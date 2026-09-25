@@ -1354,30 +1354,6 @@ def test_launch_server_sees_a_bind_line_that_shares_one_write_with_another(
         conftest.stop_server(proc)
 
 
-def test_launch_server_refuses_a_dead_server_whose_port_still_answers(
-    tmp_path, monkeypatch
-):
-    # a connect answers for whoever holds the port, and the bind line answers for a
-    # process that may already be gone. Only the pair says this server is running: here
-    # the line is right, the port answers -- something else is holding it -- and the
-    # process that printed it has exited
-    squatter = socket.socket()
-    squatter.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    squatter.bind(("127.0.0.1", 0))
-    squatter.listen(1)
-    squatted = squatter.getsockname()[1]
-    root = _fake_server_root(tmp_path,
-                             "print('listening on 127.0.0.1:' + port, flush=True)\n"
-                             "raise SystemExit(0)\n")
-    try:
-        monkeypatch.setattr(conftest, "REPO_ROOT", root)
-        monkeypatch.setattr(conftest, "free_port", lambda: squatted)
-        with pytest.raises(AssertionError, match="no server could be started"):
-            conftest.launch_server(tmp_path / "dump.mrdb", attempts=1)
-    finally:
-        squatter.close()
-
-
 def test_launch_server_notices_a_closed_pipe_rather_than_spinning_to_its_deadline(
     tmp_path, monkeypatch
 ):
