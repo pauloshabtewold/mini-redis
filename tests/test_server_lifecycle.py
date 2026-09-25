@@ -8,6 +8,7 @@ import socket
 import struct
 import subprocess
 import sys
+import threading
 import time
 
 import pytest
@@ -1289,12 +1290,29 @@ def test_launch_server_gives_up_on_a_server_that_prints_half_a_line_and_stalls(
                                        "sys.stdout.flush()\n"
                                        "time.sleep(60)\n")
     monkeypatch.setattr(conftest, "REPO_ROOT", root)
-    started = time.monotonic()
-    with pytest.raises(AssertionError, match="no server could be started"):
-        conftest.launch_server(tmp_path / "dump.mrdb", attempts=1)
-    elapsed = time.monotonic() - started
-    assert elapsed < 30, (
-        "launch_server ran past its own five-second deadline on a partial line", elapsed)
+
+    # the call runs in a thread and the bound is the join, not a clock read afterwards.
+    # Timing it from outside only works if it returns at all: with the read unbounded it
+    # comes back when this fake's own sleep ends and closes the pipe, sixty seconds later,
+    # so the measurement was really of the fake's patience. A server that never exits --
+    # which is what a real one does -- would hang here with nothing to fail
+    outcome = []
+
+    def call():
+        try:
+            outcome.append(conftest.launch_server(tmp_path / "dump.mrdb", attempts=1))
+        except BaseException as exc:
+            outcome.append(exc)
+
+    caller = threading.Thread(target=call, daemon=True)
+    caller.start()
+    caller.join(timeout=20)
+    assert not caller.is_alive(), (
+        "launch_server did not return: its five-second deadline does not hold on every "
+        "path through the read"
+    )
+    assert isinstance(outcome[0], AssertionError), outcome[0]
+    assert "no server could be started" in str(outcome[0]), outcome[0]
 
 
 def test_launch_server_refuses_a_port_that_nothing_is_serving(tmp_path, monkeypatch):
