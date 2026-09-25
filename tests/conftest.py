@@ -94,7 +94,11 @@ def _bound_this_port(proc, port, deadline):
                     # answers for whoever holds the port, and a line a child printed before
                     # dying answers for nothing -- and no check can promise a server stays
                     # up, so this is the pair that is actually knowable here
-                    return proc.poll() is None and wait_until_listening(port, deadline)
+                    # the connect first, and the liveness check after it: asked before,
+                    # a child that exits the instant it has printed is still alive when
+                    # the question is put, and the answer is stale by the time the port is
+                    # handed back. The connect is what gives it time to be gone
+                    return wait_until_listening(port, deadline) and proc.poll() is None
         elif proc.poll() is not None:
             # exited without ever printing the line: the bind failed
             return False

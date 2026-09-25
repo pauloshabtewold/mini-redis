@@ -1501,3 +1501,64 @@ def test_the_delete_rehearsal_is_skipped_for_a_symlink_whose_target_is_undeletab
         assert sorted(persistence.load(str(link))._data) == [b"k"]
     finally:
         _clear_deny_delete(target, user)
+
+
+def test_a_repeat_after_a_unique_key_names_the_repeat_and_not_the_first_key():
+    # every other repeat test builds a blob holding one distinct key, where a scan that
+    # reported whichever key it reached first would still be right by accident. This one
+    # puts a unique key ahead of the repeat, so naming the first key is visibly wrong
+    def entry(key, value):
+        return (struct.pack("<I", len(key)) + key + bytes((persistence.TYPE_STRING,))
+                + struct.pack("<q", -1) + struct.pack("<I", len(value)) + value)
+
+    body = (persistence.MAGIC + struct.pack("<II", persistence.SNAPSHOT_VERSION, 3)
+            + entry(b"alone", b"a") + entry(b"pair", b"b") + entry(b"pair", b"c"))
+    blob = body + struct.pack("<I", zlib.crc32(body))
+    with pytest.raises(persistence.SnapshotError) as refused:
+        persistence.decode(blob)
+    assert "pair" in str(refused.value), (
+        "the refusal named a key that is not the repeated one", str(refused.value))
+    assert "alone" not in str(refused.value), str(refused.value)
+    assert "2 times" in str(refused.value), str(refused.value)
+
+
+def test_a_directory_sync_that_raises_outright_does_not_claim_a_stranded_file(
+    tmp_path, monkeypatch
+):
+    # _sync_the_directory swallows what it means to swallow, but its own finally closes a
+    # descriptor and that close is not inside anything. Run from inside save()'s guarded
+    # region, an exception escaping here reaches the handler that removes the temporary
+    # file -- a name the rename has already consumed -- and attaches a note saying a
+    # full-size copy was stranded, over a save whose snapshot is on disk and correct
+    real_close = os.close
+
+    def close_refusing_directories(fd):
+        try:
+            is_directory = stat.S_ISDIR(os.fstat(fd).st_mode)
+        except OSError:
+            is_directory = False
+        real_close(fd)
+        if is_directory:
+            raise OSError(errno.EIO, "Input/output error")
+
+    store = Store()
+    store.write(b"k", b"v", keep_ttl=False)
+    path = tmp_path / "dump.mrdb"
+    monkeypatch.setattr(os, "close", close_refusing_directories)
+    raised = None
+    try:
+        persistence.save(store, str(path))
+    except OSError as exc:
+        raised = exc
+    monkeypatch.undo()
+
+    assert path.exists() and sorted(persistence.load(str(path))._data) == [b"k"], (
+        "the snapshot is not on disk, so this test is not measuring what it means to"
+    )
+    left = [entry.name for entry in tmp_path.iterdir() if entry.name != "dump.mrdb"]
+    assert not left, ("a temporary file was stranded by a failure after the rename", left)
+    if raised is not None:
+        assert not any("left the temporary file" in note
+                       for note in getattr(raised, "__notes__", [])), (
+            "a save whose snapshot is on disk claimed it stranded a temporary file",
+            getattr(raised, "__notes__", []))

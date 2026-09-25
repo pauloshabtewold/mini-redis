@@ -1332,3 +1332,76 @@ def test_launch_server_rejects_a_bind_line_naming_a_different_port(tmp_path, mon
     monkeypatch.setattr(conftest, "REPO_ROOT", root)
     with pytest.raises(AssertionError, match="no server could be started"):
         conftest.launch_server(tmp_path / "dump.mrdb", attempts=1)
+
+
+def test_launch_server_sees_a_bind_line_that_shares_one_write_with_another(
+    tmp_path, monkeypatch
+):
+    # the other multi-line test sleeps between its two prints, so they arrive in separate
+    # reads and one line per pass is enough. Written in a single flushed call they land in
+    # one chunk, and a pass that inspects only the first line in a chunk drops the one
+    # that matters
+    root = _fake_server_root(
+        tmp_path,
+        "sys.stdout.write('starting up\\nlistening on 127.0.0.1:' + port + '\\n')\n"
+        "sys.stdout.flush()\n"
+        "time.sleep(60)\n", listen=True)
+    monkeypatch.setattr(conftest, "REPO_ROOT", root)
+    proc, port = conftest.launch_server(tmp_path / "dump.mrdb", attempts=1)
+    try:
+        assert proc.poll() is None
+    finally:
+        conftest.stop_server(proc)
+
+
+def test_launch_server_refuses_a_dead_server_whose_port_still_answers(
+    tmp_path, monkeypatch
+):
+    # a connect answers for whoever holds the port, and the bind line answers for a
+    # process that may already be gone. Only the pair says this server is running: here
+    # the line is right, the port answers -- something else is holding it -- and the
+    # process that printed it has exited
+    squatter = socket.socket()
+    squatter.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    squatter.bind(("127.0.0.1", 0))
+    squatter.listen(1)
+    squatted = squatter.getsockname()[1]
+    root = _fake_server_root(tmp_path,
+                             "print('listening on 127.0.0.1:' + port, flush=True)\n"
+                             "raise SystemExit(0)\n")
+    try:
+        monkeypatch.setattr(conftest, "REPO_ROOT", root)
+        monkeypatch.setattr(conftest, "free_port", lambda: squatted)
+        with pytest.raises(AssertionError, match="no server could be started"):
+            conftest.launch_server(tmp_path / "dump.mrdb", attempts=1)
+    finally:
+        squatter.close()
+
+
+def test_launch_server_notices_a_closed_pipe_rather_than_spinning_to_its_deadline(
+    tmp_path, monkeypatch
+):
+    # select() reports an EOF'd pipe as ready forever. Treating that as "nothing yet"
+    # costs the whole per-attempt deadline on every attempt, for an answer available at
+    # once -- no assertion catches it, only the clock
+    root = _fake_server_root(tmp_path, "raise SystemExit(1)\n")
+    monkeypatch.setattr(conftest, "REPO_ROOT", root)
+    started = time.monotonic()
+    with pytest.raises(AssertionError, match="no server could be started"):
+        conftest.launch_server(tmp_path / "dump.mrdb", attempts=2)
+    elapsed = time.monotonic() - started
+    assert elapsed < 3, (
+        "a child that closed its stdout took a deadline to notice rather than a read",
+        elapsed)
+
+
+def test_main_lets_a_failure_inside_the_loop_out_as_itself(tmp_path, monkeypatch):
+    # the one-line answer is for a bind that failed, which is why it catches a named
+    # exception. Widened to Exception it would report a bug anywhere inside run() as a
+    # failure to start, and the traceback that says where it happened would be gone
+    def run_raising(self):
+        raise RuntimeError("something inside the loop")
+
+    monkeypatch.setattr(Server, "run", run_raising)
+    with pytest.raises(RuntimeError, match="something inside the loop"):
+        main(["--port", "0", "--snapshot-path", str(tmp_path / "dump.mrdb")])
