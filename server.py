@@ -65,6 +65,11 @@ DEFAULT_EXPIRY_SWEEP_INTERVAL_MS = 100
 SWEEP_SAMPLE_SIZE = 20
 SWEEP_RELOOP_THRESHOLD = 0.25
 SWEEP_BUDGET_SECONDS = 0.001
+# how many repeats of one periodic task's failure pass in silence before a line says how
+# many there were. see _guard_task: a task that fails on every tick -- a save over a path
+# whose snapshot cannot be replaced, a full disk -- writes one traceback and then a short
+# line per this many, instead of a traceback per interval for as long as the server runs
+FAILURE_REPEATS_PER_LINE = 100
 # the one site --expiry-sweep-interval's milliseconds are turned into the seconds
 # time.monotonic() deals in
 _MILLISECONDS_PER_SECOND = 1000
@@ -375,6 +380,10 @@ class Server:
         # to None on its way out
         self._next_sweep_at: float | None = None
         self._next_snapshot_at: float | None = None
+        # per task name: how many failures in a row, counting the one already reported.
+        # _guard_task keeps it; a task that succeeds drops its entry, so the next failure
+        # after a recovery is a first failure again and is reported in full
+        self._failures_in_a_row: dict[str, int] = {}
 
     @property
     def connected_clients(self) -> int:
@@ -466,10 +475,40 @@ class Server:
         # non-blocking socket operation that just needs retrying on the next readiness
         # event, and neither periodic task touches a socket -- a blocked write here is a
         # slow disk, not a signal to come back later
+        #
+        # what is reported is bounded, because what fails here fails on a timer. a save
+        # over a snapshot whose directory entry cannot be removed, or onto a full disk,
+        # fails identically once per interval for as long as the server runs, and
+        # logging writes to stderr with a blocking write(): a reader that stops -- a
+        # stalled collector, a pipeline whose far end died -- fills its buffer and then
+        # parks this call, which is on the only thread here, inside the tick. from there
+        # the loop never reaches select() again and every client is served nothing, with
+        # no further line to say so. the first failure is reported in full because it is
+        # the diagnostic; the repeats after it carry no information the first did not,
+        # and a count says more than a thousand copies of one traceback
+        #
+        # this bounds what this server writes. it does not make the write non-blocking,
+        # and nothing here can: O_NONBLOCK lives on the open file description, which
+        # belongs to whoever handed this process its stderr, and a writer thread is a
+        # second thread on a server whose single one is the point
         try:
             step()
         except Exception:
-            logger.exception("%s failed", what)
+            failures = self._failures_in_a_row.get(what, 0) + 1
+            self._failures_in_a_row[what] = failures
+            if failures == 1:
+                logger.exception("%s failed", what)
+            elif failures % FAILURE_REPEATS_PER_LINE == 0:
+                # no traceback and no exc_info: this line exists to say the failure is
+                # still going, and the one that named it is already in the log above
+                logger.error(
+                    "%s has now failed %d times in a row; the first failure above is "
+                    "still the one to read", what, failures)
+        else:
+            # cleared on success rather than decayed: the next failure after a recovery
+            # is a different episode, and reporting it in full is the whole point of
+            # keeping this per task
+            self._failures_in_a_row.pop(what, None)
 
     def _abandon(self, conn: Connection) -> None:
         # the one place a close that itself fails is handled, reached from the boundary above and from the shutdown sweep, so a failing close ends the same way wherever it is noticed. every statement in _close can raise, and a raise from the boundary's own recovery reaches the top of the only thread this server has

@@ -429,10 +429,13 @@ def check_writable(path: str) -> None:
     means removing that entry, or making a second name for the snapshot and removing
     that; a version of this check did the latter, and in two rounds it deleted a file it
     had not created and made concurrent starts refuse each other, to catch a configuration
-    that fails safely anyway. Uncaught, such a path starts and then fails every save with
-    a logged traceback, leaving the snapshot it could not replace intact. That is the
-    trade: this check refuses what it can prove, and does not write into the operator's
-    directory to guess at the rest.
+    that fails safely anyway. Uncaught, such a path starts and then fails every save,
+    leaving the snapshot it could not replace intact: the first failure carries its
+    traceback and the repeats after it are counted rather than reprinted, because what
+    fails here fails once an interval for as long as the server runs, and `server.py`'s
+    `_guard_task` says what an unbounded stream of them costs. That is the trade: this
+    check refuses what it can prove, and does not write into the operator's directory to
+    guess at the rest.
     """
     if not os.path.basename(path):
         raise SnapshotError("cannot write snapshot %r: the path names no file" % (path,))

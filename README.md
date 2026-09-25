@@ -78,8 +78,17 @@ the rename replaces it. It writes nothing else there and removes nothing it did 
 create, so what it cannot see it says nothing about: a disk that fills later, a
 directory changed after startup, and a permission that blocks the removal of the
 existing snapshot's own entry, which is what the rename needs and what no file created
-beside it can answer for. A path like that starts, and then every save fails with a
-logged error, leaving the snapshot it could not replace intact. A save writes a
+beside it can answer for. A path like that starts, and then every save fails, leaving
+the snapshot it could not replace intact. What such a failure reports is bounded: the
+first one is logged with its traceback, and after that a single line says how many times
+in a row it has now failed, once per hundred. That bound is not cosmetic. Logging writes
+to standard error with a blocking write, and this server has one thread, so a reader that
+stops — a stalled collector, a pipeline whose far end died — can fill its buffer and park
+the loop inside the tick, after which nothing is served and nothing more is logged. A
+failure that repeats on a timer is the one thing that can fill that buffer on its own, and
+it no longer does. The residual stands: a buffer filled from elsewhere still parks the
+next write, and closing that needs either a descriptor this process does not own or a
+second thread. A save writes a
 temporary file beside the snapshot, named after it, and renames it into place; a file
 left under that name, as a process killed mid-save leaves one, is never read or removed,
 and every start over the same path names it in a warning, so long as the directory can

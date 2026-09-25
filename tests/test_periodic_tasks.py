@@ -443,9 +443,97 @@ def test_an_arm_that_raises_is_logged_with_its_traceback_and_keeps_its_schedule(
     finally:
         logging.getLogger("server").removeHandler(handler)
     logged = [r for r in records if r.levelno >= logging.ERROR and r.exc_info]
-    assert len(logged) == 4, "each failure must be logged with its traceback"
-    assert all("expiry sweep" in r.getMessage() for r in logged), (
-        "the log line must name which arm failed", [r.getMessage() for r in logged])
+    assert len(logged) == 1, (
+        "the first failure must be logged with its traceback, and only the first: what "
+        "fails here fails once an interval for as long as the server runs, and four "
+        "copies of one traceback is the start of a stream that can fill a log sink and "
+        "park this thread inside the write", [r.getMessage() for r in logged])
+    assert "expiry sweep" in logged[0].getMessage(), (
+        "the log line must name which arm failed", logged[0].getMessage())
+    assert not [r for r in records if r.levelno >= logging.ERROR and not r.exc_info], (
+        "four failures is under the repeat threshold, so nothing should have summarised "
+        "them yet")
+
+
+def _guard_records(server, what, failures):
+    # drives _guard_task directly rather than through the tick: what is under test is the
+    # boundary's own reporting, and a tick would add an interval's arithmetic to every
+    # case for nothing
+    records = []
+    handler = logging.Handler()
+    handler.emit = records.append
+    logging.getLogger("server").addHandler(handler)
+    try:
+        for failing in failures:
+            def step(failing=failing):
+                if failing:
+                    raise OSError(28, "No space left on device")
+            server._guard_task(what, step)
+    finally:
+        logging.getLogger("server").removeHandler(handler)
+    return records
+
+
+def test_a_task_failing_on_every_tick_reports_a_bounded_number_of_lines(tmp_path):
+    # the point of the bound. logging writes to stderr with a blocking write and this
+    # server has one thread, so a reader that stops fills its buffer and parks the loop
+    # inside the tick -- after which nothing is served and nothing more is logged. A save
+    # over a path whose snapshot cannot be replaced fails identically once an interval
+    # forever, which is the one thing here that can fill that buffer on its own
+    server = Server(0, snapshot_interval=0, expiry_sweep_interval=0)
+    try:
+        records = _guard_records(server, "snapshot save", [True] * 250)
+    finally:
+        server._loop.close()
+    tracebacks = [r for r in records if r.exc_info]
+    assert len(tracebacks) == 1, (
+        "250 identical failures printed more than one traceback",
+        [r.getMessage() for r in tracebacks])
+    summaries = [r for r in records if not r.exc_info]
+    assert len(summaries) == 250 // server_mod.FAILURE_REPEATS_PER_LINE, (
+        "one line per FAILURE_REPEATS_PER_LINE suppressed failures, and no more",
+        [r.getMessage() for r in summaries])
+    # the last line lands on the last multiple of the threshold, not on the last failure:
+    # nothing fires between multiples, so 250 failures are summarised at 100 and at 200
+    # and the final fifty are still unreported when the run ends. That is the bound doing
+    # its job rather than a gap -- a count is only owed periodically
+    assert "200" in summaries[-1].getMessage(), (
+        "the summary has to carry the count, which is the only thing it adds",
+        summaries[-1].getMessage())
+    assert all(r.levelno >= logging.ERROR for r in records), (
+        "a failure that is still going is not a debug detail",
+        [r.levelno for r in records])
+
+
+def test_the_first_failure_after_a_recovery_is_reported_in_full_again(tmp_path):
+    # cleared on success rather than decayed: a task that failed, recovered and failed
+    # again is a second episode, and suppressing its traceback because an earlier one had
+    # already been printed would hide the failure an operator is actually looking for
+    server = Server(0, snapshot_interval=0, expiry_sweep_interval=0)
+    try:
+        records = _guard_records(
+            server, "snapshot save", [True, True, True, False, True])
+    finally:
+        server._loop.close()
+    tracebacks = [r for r in records if r.exc_info]
+    assert len(tracebacks) == 2, (
+        "the failure after the recovery was suppressed as though it were a repeat",
+        [r.getMessage() for r in records])
+
+
+def test_two_tasks_failing_at_once_are_counted_apart(tmp_path):
+    # per task name, so a sweep failing does not suppress a save's first traceback. the
+    # two arms fail for unrelated reasons and an operator needs both
+    server = Server(0, snapshot_interval=0, expiry_sweep_interval=0)
+    try:
+        saves = _guard_records(server, "snapshot save", [True, True])
+        sweeps = _guard_records(server, "expiry sweep", [True, True])
+    finally:
+        server._loop.close()
+    assert len([r for r in saves if r.exc_info]) == 1
+    assert len([r for r in sweeps if r.exc_info]) == 1, (
+        "the sweep's first failure was suppressed by the save's count",
+        [r.getMessage() for r in sweeps])
 
 
 def test_an_arm_that_raises_does_not_escape_the_tick(tmp_path):
