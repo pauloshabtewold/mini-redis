@@ -19,7 +19,7 @@ import tempfile
 import threading
 import time
 
-from tests.conftest import free_port, wait_until_listening
+from tests.conftest import launch_server, stop_server
 
 REPO_ROOT = pathlib.Path(__file__).resolve().parent.parent
 
@@ -211,18 +211,12 @@ def test_many_connections_incrementing_one_counter_stay_exact(mini_redis_server)
 def _run_burst_against_a_fresh_server(n):
     # not the mini_redis_server fixture: pytest refuses a fixture called outside a
     # test, so this builds its own server from the same two helpers the fixture uses
-    port = free_port()
     # a scratch directory of its own, cleaned up below: this function also runs from
     # __main__, where there is no tmp_path fixture, and a snapshot left at the default
     # ./dump.mrdb would land in the repository's own working directory
     scratch = tempfile.mkdtemp()
-    proc = subprocess.Popen(
-        [sys.executable, str(REPO_ROOT / "server.py"), "--port", str(port),
-         "--snapshot-path", str(pathlib.Path(scratch) / "dump.mrdb")],
-        stdout=subprocess.DEVNULL,
-    )
+    proc, port = launch_server(pathlib.Path(scratch) / "dump.mrdb")
     try:
-        assert wait_until_listening(port, time.monotonic() + 5), "server never started listening"
         with socket.create_connection(("127.0.0.1", port)) as sock:
             received, expected, peak = _run_burst(sock, n)
         with socket.create_connection(("127.0.0.1", port)) as sock:
@@ -230,12 +224,7 @@ def _run_burst_against_a_fresh_server(n):
             counter_value = _read_bulk_string_reply(sock, time.monotonic() + 5)
         return received, expected, peak, counter_value
     finally:
-        proc.terminate()
-        try:
-            proc.wait(timeout=5)
-        except subprocess.TimeoutExpired:
-            proc.kill()
-            proc.wait(timeout=5)
+        stop_server(proc)
         shutil.rmtree(scratch, ignore_errors=True)
 
 

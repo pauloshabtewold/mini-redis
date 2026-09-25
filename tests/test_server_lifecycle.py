@@ -1,4 +1,5 @@
 import contextlib
+import io
 import logging
 import pathlib
 import selectors
@@ -13,9 +14,10 @@ import pytest
 
 import commands
 import store as store_module
+import tests.conftest as conftest
 from commands import registry
 from connection import Connection
-from server import DEFAULT_PORT, Server, build_arg_parser
+from server import DEFAULT_PORT, ListenFailed, Server, build_arg_parser, main
 from tests.int_ceiling import NO_CEILING_REASON, NO_CONVERSION_CEILING, OVERSIZED_DIGIT_RUN
 
 REPO_ROOT = pathlib.Path(__file__).resolve().parent.parent
@@ -533,6 +535,65 @@ def test_a_failed_bind_leaves_the_server_usable():
         # armed before the bind was tried, and disarmed again by the same way out: a retry
         # arms afresh, and until then nothing is scheduled
         assert (server._next_sweep_at, server._next_snapshot_at) == (None, None)
+    finally:
+        squatter.close()
+
+
+def test_main_exits_one_with_a_single_line_and_no_traceback_on_a_failed_bind():
+    # every other startup refusal main() has -- a corrupt snapshot, an unwritable path --
+    # already exits 1 with one line; before ListenFailed existed a bind failure alone
+    # unwound as a full traceback out of main(), where this line is what tells the two
+    # apart from an operator's own mistake
+    squatter = socket.socket()
+    squatter.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    squatter.bind(("127.0.0.1", 0))
+    squatter.listen(1)
+    port = squatter.getsockname()[1]
+    try:
+        err = io.StringIO()
+        try:
+            with contextlib.redirect_stderr(err):
+                main(["--port", str(port)])
+            pytest.fail("main() started on a port another socket already holds")
+        except SystemExit as exc:
+            assert exc.code == 1, ("a failed bind is not a usage error", exc.code)
+        output = err.getvalue()
+        assert output.startswith("error: cannot listen on 127.0.0.1:%d" % port), output
+        assert output.count("\n") == 1, ("more than one line reached stderr", output)
+        assert "Traceback" not in output, output
+    finally:
+        squatter.close()
+
+
+def test_open_listener_raises_listen_failed_and_closes_the_socket_it_opened():
+    # the socket _open_listener() creates is closed on its own failure path rather than
+    # left for the caller: nothing else ever gets a reference to it, since the raise
+    # carries only the message and not the socket itself
+    squatter = socket.socket()
+    squatter.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    squatter.bind(("127.0.0.1", 0))
+    squatter.listen(1)
+    port = squatter.getsockname()[1]
+    try:
+        server = Server(port)
+        try:
+            opened = []
+            real_socket = socket.socket
+
+            def recording_socket(*args, **kwargs):
+                sock = real_socket(*args, **kwargs)
+                opened.append(sock)
+                return sock
+
+            with pytest.MonkeyPatch.context() as patch:
+                patch.setattr(socket, "socket", recording_socket)
+                with pytest.raises(ListenFailed):
+                    server._open_listener()
+            assert len(opened) == 1, opened
+            assert opened[0].fileno() == -1, (
+                "the socket _open_listener() opened was left open after the bind failed")
+        finally:
+            server._loop.close()
     finally:
         squatter.close()
 
@@ -1141,3 +1202,53 @@ def test_an_idle_partial_element_resumes_when_the_rest_arrives(server_and_client
     assert conn.read_buffer == bytearray()
     assert conn._argv is None
     assert conn._parse_needed == 0
+
+
+def test_launch_server_retries_a_port_another_process_already_holds(tmp_path, monkeypatch):
+    # free_port() only proves a port was free when it was chosen -- this squats on the
+    # number it hands out first, standing in for the race launch_server()'s own retry
+    # loop exists to survive
+    squatter = socket.socket()
+    squatter.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    squatter.bind(("127.0.0.1", 0))
+    squatter.listen(1)
+    squatted_port = squatter.getsockname()[1]
+    try:
+        real_free_port = conftest.free_port
+        handed_out = [squatted_port]
+
+        def free_port_once_squatted_then_real():
+            if handed_out:
+                return handed_out.pop()
+            return real_free_port()
+
+        monkeypatch.setattr(conftest, "free_port", free_port_once_squatted_then_real)
+        proc, port = conftest.launch_server(tmp_path / "dump.mrdb")
+        try:
+            assert port != squatted_port, (
+                "launch_server returned a port another process still holds", port)
+            with socket.create_connection(("127.0.0.1", port), timeout=2):
+                pass
+        finally:
+            conftest.stop_server(proc)
+    finally:
+        squatter.close()
+
+
+def test_launch_server_gives_up_rather_than_returning_someone_elses_server(
+    tmp_path, monkeypatch
+):
+    # free_port() handing out only a port this process itself squats on stands in for
+    # every attempt losing the same race: launch_server() must raise rather than answer
+    # with a proc and a port it never actually bound
+    squatter = socket.socket()
+    squatter.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    squatter.bind(("127.0.0.1", 0))
+    squatter.listen(1)
+    squatted_port = squatter.getsockname()[1]
+    try:
+        monkeypatch.setattr(conftest, "free_port", lambda: squatted_port)
+        with pytest.raises(AssertionError, match="no server could be started"):
+            conftest.launch_server(tmp_path / "dump.mrdb")
+    finally:
+        squatter.close()

@@ -3,6 +3,7 @@ subprocess, and a RESP2 redis-py client already pointed at it.
 """
 
 import pathlib
+import select
 import socket
 import subprocess
 import sys
@@ -28,6 +29,8 @@ def free_port():
 
 
 def wait_until_listening(port, deadline):
+    # answers "is anything listening there", which is not the same question as "did my
+    # server start" -- see launch_server() below, which is what every launch site uses
     while time.monotonic() < deadline:
         try:
             with socket.create_connection(("127.0.0.1", port), timeout=0.05):
@@ -37,33 +40,78 @@ def wait_until_listening(port, deadline):
     return False
 
 
+def stop_server(proc):
+    proc.terminate()
+    try:
+        proc.wait(timeout=5)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+        proc.wait(timeout=5)
+    finally:
+        # launch_server reads one line from this pipe and leaves it open; closing it here
+        # rather than at garbage collection keeps a ResourceWarning out of a suite that
+        # starts a server per test
+        if proc.stdout is not None:
+            proc.stdout.close()
+
+
+def _bound_this_port(proc, port, deadline):
+    # server.py prints one flushed line naming the address it actually bound. That line,
+    # and not a TCP connect, is what says the process listening on this port is this one:
+    # free_port() binds a port and releases it, so the number is free when chosen and can
+    # be taken before the server binds it, and the ephemeral range on this machine is
+    # 16,384 wide -- once it wraps, two concurrent processes are handed the same number.
+    # The loser then dies with EADDRINUSE while a plain connect still succeeds, because
+    # the winner is listening, and its tests run against the other one's server and read
+    # values they never wrote. That is the shape the 8 MiB round trip's own failure
+    # message describes, and nothing here could see it
+    while time.monotonic() < deadline:
+        ready, _, _ = select.select([proc.stdout], [], [], 0.05)
+        if ready:
+            line = proc.stdout.readline()
+            return line.startswith("listening on ") and line.rstrip().endswith(":%d" % port)
+        if proc.poll() is not None:
+            # exited without ever printing the line: the bind failed
+            return False
+    return False
+
+
+def launch_server(snapshot_path, extra_args=(), attempts=5):
+    """Start `server.py` on a port this process holds, and return `(proc, port)`.
+
+    The one launch site every test goes through, so the ownership check above is written
+    once. A port another process took is retried rather than failed, because a collision
+    is nobody's defect and a suite that goes red under concurrency is the same loss of
+    signal as one that silently uses the wrong server. `stdout` is a pipe rather than
+    `DEVNULL` for the same reason the redirection existed: the bind line stays out of the
+    transcript under `-s`, and now it is also read.
+    """
+    for _ in range(attempts):
+        port = free_port()
+        proc = subprocess.Popen(
+            [sys.executable, str(REPO_ROOT / "server.py"), "--port", str(port),
+             "--snapshot-path", str(snapshot_path), *extra_args],
+            stdout=subprocess.PIPE, text=True,
+        )
+        if _bound_this_port(proc, port, time.monotonic() + 5):
+            return proc, port
+        stop_server(proc)
+    raise AssertionError(
+        "no server could be started: %d ports in a row were taken before it bound one"
+        % attempts)
+
+
 @pytest.fixture
 def mini_redis_server(tmp_path):
-    port = free_port()
-    proc = subprocess.Popen(
-        # a path under this test's own tmp_path, not the default ./dump.mrdb: a snapshot
-        # written to the repository's own working directory would outlive the test that
-        # wrote it and load back into whichever test runs against this fixture next
-        [sys.executable, str(REPO_ROOT / "server.py"), "--port", str(port),
-         "--snapshot-path", str(tmp_path / "dump.mrdb")],
-        stdout=subprocess.DEVNULL,
-    )
-    # server.py prints its bind line to stdout on every launch, unconditionally. the
-    # port here is ephemeral, so no expected test output could ever name it, and the
-    # tests built on this fixture are run with -s, which would otherwise let that line
-    # straight through into their transcript. redirecting removes it at the source --
-    # readiness below is proved by a real TCP connect, a stronger signal than the print
-    # ever was -- and stderr is left inherited, so a traceback still surfaces
+    # a path under this test's own tmp_path, not the default ./dump.mrdb: a snapshot
+    # written to the repository's own working directory would outlive the test that
+    # wrote it and load back into whichever test runs against this fixture next.
+    # stderr is left inherited, so a traceback still surfaces
+    proc, port = launch_server(tmp_path / "dump.mrdb")
     try:
-        assert wait_until_listening(port, time.monotonic() + 5), "server never started listening"
         yield port
     finally:
-        proc.terminate()
-        try:
-            proc.wait(timeout=5)
-        except subprocess.TimeoutExpired:
-            proc.kill()
-            proc.wait(timeout=5)
+        stop_server(proc)
 
 
 @pytest.fixture
