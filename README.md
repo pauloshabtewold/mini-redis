@@ -74,25 +74,27 @@ will not let the file be removed are all refused before the server starts, and a
 existing snapshot whose file flags would block a rename over it is refused too. What it
 judges at that path is the entry a save's rename would replace, not whatever that entry
 points at, so a `--snapshot-path` that is a symlink is accepted and replaced, exactly as
-the rename replaces it. It still cannot see a disk that fills later or a directory
-changed after startup. A save writes a temporary file beside the snapshot, named after
-it, and renames it into place; a file left under that name, as a process killed mid-save
-leaves one, is never read or removed, and every start over the same path names it in a
-warning, so long as the directory can be listed. `--snapshot-interval` (seconds, default
-`60`) and `--expiry-sweep-interval` (milliseconds, default `100`, the same span as the
-run loop's own `select()` timeout of `0.1` seconds) both follow the same rule as the
-caps above: `0` turns the periodic task off, and a negative value is refused at the CLI
-and again in `Server.__init__`. So is a value too large to put on a clock: above `2**63
-- 1` the arithmetic that schedules an interval cannot convert it, and it is refused at
-both doors rather than left to surface as an `OverflowError` one tick later.
-`--ignore-snapshot` takes no value of its own: passed, the file at `--snapshot-path` is
-never read, whether or not it is readable, so a good snapshot is discarded as readily as
-a corrupt one. The server starts with an empty keyspace, and the file itself stays on
-disk untouched until the next save writes the keyspace as it then stands over it --
-unless `--snapshot-interval` is 0, in which case nothing ever overwrites it. It is the
-escape hatch for a file that refuses to load. Left set permanently -- in a unit file,
-say -- it starts every restart with an empty keyspace, not just the first, because it
-never reads the file.
+the rename replaces it. It still cannot see a disk that fills later, a directory changed
+after startup, or a permission on the entry of a `--snapshot-path` that is itself a
+symlink, since rehearsing the removal of that entry would mean removing it. A save
+writes a temporary file beside the snapshot, named after it, and renames it into place;
+a file left under that name, as a process killed mid-save leaves one, is never read or
+removed, and every start over the same path names it in a warning, so long as the
+directory can be listed. `--snapshot-interval` (seconds, default `60`) and
+`--expiry-sweep-interval` (milliseconds, default `100`, the same span as the run loop's
+own `select()` timeout of `0.1` seconds) both follow the same rule as the caps above:
+`0` turns the periodic task off, and a negative value is refused at the CLI and again in
+`Server.__init__`. So is a value too large to put on a clock: above `2**63 - 1` the
+arithmetic that schedules an interval cannot convert it, and it is refused at both doors
+rather than left to surface as an `OverflowError` one tick later. `--ignore-snapshot`
+takes no value of its own: passed, the file at `--snapshot-path` is never read, whether
+or not it is readable, so a good snapshot is discarded as readily as a corrupt one. The
+server starts with an empty keyspace, and the file itself stays on disk untouched until
+the next save writes the keyspace as it then stands over it -- unless
+`--snapshot-interval` is 0, in which case nothing ever overwrites it. It is the escape
+hatch for a file that refuses to load. Left set permanently -- in a unit file, say -- it
+starts every restart with an empty keyspace, not just the first, because it never reads
+the file.
 
 **A clean stop can still lose recent writes.** Snapshots save on `--snapshot-interval`
 and not on the way out, so a `SIGINT` or `SIGTERM` can lose one interval's worth of

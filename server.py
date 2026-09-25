@@ -46,8 +46,10 @@ DEFAULT_SNAPSHOT_INTERVAL_SECONDS = 60
 # refusing to start over a corrupt file is the default; --ignore-snapshot is the
 # explicit escape hatch for bringing a server back up past one anyway
 DEFAULT_IGNORE_SNAPSHOT = False
-# matches the reference's own cadence: hz is 10 on redis-server 7.2.7, so its
-# background cycle runs every 100 ms too
+# matches the cadence an idle redis-server 7.2.7 runs its background cycle at: hz is 10
+# there by default, so the cycle runs every 100 ms. dynamic-hz defaults on and raises hz
+# with the client count, so a busy one runs it more often -- the cycle's share of each
+# tick stays a quarter either way
 DEFAULT_EXPIRY_SWEEP_INTERVAL_MS = 100
 # the sweep's own constants -- 20 sampled keys, a re-loop past a quarter expired, a
 # 1 ms budget -- checked against the tagged sources rather than assumed: 7.2.7's
@@ -57,16 +59,16 @@ DEFAULT_EXPIRY_SWEEP_INTERVAL_MS = 100
 # spells it ACTIVE_EXPIRE_CYCLE_LOOKUPS_PER_LOOP, and neither name appears in the other
 # version. so the 20 keys and the 1 ms budget here are both the reference's own numbers
 # in both versions. what is not the reference's own is which cycle each is borrowed from:
-# in both versions the cycle driven from the cron at hz -- 100 ms at hz 10, the cadence
-# --expiry-sweep-interval defaults to -- is the slow one, and gets a quarter of that tick
+# in both versions the cycle driven from the cron at hz -- every 100 ms at hz 10, which
+# is the cadence --expiry-sweep-interval defaults to -- is the slow one, and gets a quarter of that tick
 # (25 ms), while the 1 ms belongs to a separate fast cycle run from beforeSleep, between
 # event-loop passes. spending the fast cycle's millisecond on the slow cycle's 100 ms
 # cadence, instead of the slow cycle's own 25 ms, is this project's own choice.
 #
 # two further differences, neither of them cosmetic. the draw: 5.0 takes random keys one
 # at a time with replacement, min(20, however many carry a TTL) of them, where 7.2.7
-# walks the expiry table with a cursor and can overshoot 20, since one dictScan step
-# drains a whole bucket -- and this sweep draws without replacement, which is neither.
+# walks the expiry table with a cursor instead -- and this sweep draws without
+# replacement, which is neither. min(20, keys carrying a TTL) is the ceiling in both.
 # and the re-loop test, where SWEEP_RELOOP_THRESHOLD below is NOT 5.0's rule: 5.0 repeats
 # while expired > ACTIVE_EXPIRE_CYCLE_LOOKUPS_PER_LOOP/4, a comparison against the
 # constant -- more than five -- however few keys the pass actually drew, while the

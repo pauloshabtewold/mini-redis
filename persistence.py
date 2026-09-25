@@ -420,7 +420,10 @@ def check_writable(path: str) -> None:
     with a traceback per interval as the only sign, so the refusal belongs before it
     starts. This sees the directory, and the existing snapshot if there is one, as they
     are at the call -- a directory made read-only afterwards, an ACL changed afterwards,
-    or a disk that fills up later, is met by the save itself, not by this.
+    or a disk that fills up later, is met by the save itself, not by this. So is one case
+    present at the call and still not visible: an ACL on the directory entry of a `path`
+    that is itself a symlink. The rename replaces that entry, and the only way to rehearse
+    removing it is to remove it, which this check will not do.
     """
     if not os.path.basename(path):
         raise SnapshotError("cannot write snapshot %r: the path names no file" % (path,))
@@ -499,23 +502,11 @@ def check_writable(path: str) -> None:
         ) from exc
 
 
-# the name the delete-right rehearsal below gives its hard link. Deliberately not the
+# the suffix the delete-right rehearsal below gives its hard link. Deliberately not the
 # shape stale_temporaries() matches: it is a second name for the snapshot itself, not a
 # temporary file, and reporting it as one would tell an operator to weigh a file that is
 # their own data under another name
 _LINK_PROBE_SUFFIX = ".linkprobe"
-
-
-def _is_a_second_name_for(path: str, other: str) -> bool:
-    # one inode under two names, asked of the filesystem rather than assumed from the
-    # name. A hard link to the snapshot can be removed without destroying anything,
-    # because the snapshot's own entry still points at the same bytes; nothing else can
-    try:
-        mine = os.lstat(path)
-        theirs = os.lstat(other)
-    except OSError:
-        return False
-    return (mine.st_dev, mine.st_ino) == (theirs.st_dev, theirs.st_ino)
 
 
 def _refuse_if_the_snapshot_cannot_be_replaced(path: str) -> None:
@@ -531,37 +522,25 @@ def _refuse_if_the_snapshot_cannot_be_replaced(path: str) -> None:
 
     Rehearsed on a hard link rather than on the snapshot, so nothing is ever moved or
     removed: a second name for the same inode carries the same ACL, so unlinking it needs
-    the same right the rename needs. A filesystem without hard links, or any other reason
-    the link cannot be made, leaves this unchecked rather than guessing -- that is where
-    it stood before.
+    the same right the rename needs. The link's name carries this process's pid and eight
+    random characters, for the same reason a save's temporary file does -- two servers
+    starting against one snapshot path must not contend for a single name. Sharing one
+    made concurrent starts refuse each other: measured, five to seven of twelve were
+    refused on a path that is entirely fine, one of them told to move aside a file that
+    was another instance's own probe. It also meant this could remove a name it had not
+    created, which is a startup check destroying data in order to run.
+
+    A filesystem without hard links, or any other reason the link cannot be made, leaves
+    this unchecked rather than guessing -- that is where it stood before. So does a path
+    that is a symlink, which the caller skips: `os.link` follows one to its target, and
+    the target's deletability is not what a save needs, since the rename replaces the
+    link. An ACL on the link's *own* entry is therefore not caught here, because removing
+    that entry is the only way to rehearse it and this check destroys nothing; that case
+    is met by the save.
     """
-    link = path + _LINK_PROBE_SUFFIX
+    link = "%s.%d.%s%s" % (path, os.getpid(), os.urandom(4).hex(), _LINK_PROBE_SUFFIX)
     try:
         os.link(path, link)
-    except FileExistsError:
-        # something already holds the name. Removing it is only safe when it is what a
-        # refused start leaves -- a second name for the snapshot that is there right now,
-        # where unlinking it destroys nothing. Anything else at that name is the
-        # operator's: an unrelated file, or a link to a snapshot this path no longer
-        # holds, which may be their only copy of it. This removed whatever it found,
-        # which is a start that deletes data to run a check
-        if not _is_a_second_name_for(path, link):
-            raise SnapshotError(
-                "cannot write snapshot %s: %s is in the way and is not a second name for "
-                "the snapshot, so it is not this check's to remove; move it aside"
-                % (path, os.path.basename(link)))
-        # self-healing from here: once the operator clears whatever refused the start, the
-        # next one tidies up and passes rather than refusing forever over the evidence of
-        # the last refusal
-        try:
-            os.unlink(link)
-            os.link(path, link)
-        except OSError as exc:
-            raise SnapshotError(
-                "cannot write snapshot %s: %s is a second name for it left by an earlier "
-                "refused start and cannot be removed, which is the same permission a save "
-                "needs to replace the snapshot: %s"
-                % (path, os.path.basename(link), exc)) from exc
     except OSError:
         # no hard links here, or the directory will not take one. The probe below already
         # answers for the directory; this one has nothing left to add
