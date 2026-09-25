@@ -47,44 +47,21 @@ DEFAULT_SNAPSHOT_INTERVAL_SECONDS = 60
 # explicit escape hatch for bringing a server back up past one anyway
 DEFAULT_IGNORE_SNAPSHOT = False
 # matches the cadence an idle redis-server 7.2.7 runs its background cycle at: hz is 10
-# there by default, so the cycle runs every 100 ms. dynamic-hz defaults on and raises hz
-# with the client count, so a busy one runs it more often -- the cycle's share of each
-# tick stays a quarter either way
+# there by default, so the cycle runs every 100 ms
 DEFAULT_EXPIRY_SWEEP_INTERVAL_MS = 100
-# the sweep's own constants -- 20 sampled keys, a re-loop past a quarter expired, a
-# 1 ms budget -- checked against the tagged sources rather than assumed: 7.2.7's
-# expire.c:109-111 and 5.0.14's server.h:172-174 compile in the same three numbers, 20
-# keys a pass, a 1000-microsecond fast cycle and 25 per cent for the slow one. the names
-# are not shared: 7.2.7 spells the first ACTIVE_EXPIRE_CYCLE_KEYS_PER_LOOP and 5.0.14
-# spells it ACTIVE_EXPIRE_CYCLE_LOOKUPS_PER_LOOP, and neither name appears in the other
-# version. so the 20 keys and the 1 ms budget here are both the reference's own numbers
-# in both versions. what is not the reference's own is which cycle each is borrowed from:
-# in both versions the cycle driven from the cron at hz -- every 100 ms at hz 10, which
-# is the cadence --expiry-sweep-interval defaults to -- is the slow one, and gets a quarter of that tick
-# (25 ms), while the 1 ms belongs to a separate fast cycle run from beforeSleep, between
-# event-loop passes. spending the fast cycle's millisecond on the slow cycle's 100 ms
-# cadence, instead of the slow cycle's own 25 ms, is this project's own choice.
+# the sweep's own three constants, read off the tagged sources rather than assumed:
+# 7.2.7's expire.c:109-111 and 5.0.14's server.h:172-174 compile in 20 keys a pass, a
+# 1000-microsecond budget and 25 per cent, and the 20 and the 1 ms here are those. the
+# 25 per cent is not: it bounds a share of a tick there, where SWEEP_RELOOP_THRESHOLD
+# below is a fraction of the sample a pass actually drew, and the two are different
+# quantities that happen to be written with the same digits.
 #
-# two further differences, neither of them cosmetic. the draw: 5.0 takes random keys one
-# at a time with replacement, min(20, however many carry a TTL) of them, where 7.2.7
-# walks the expiry table with a cursor instead -- and this sweep draws without
-# replacement, which is neither. min(20, keys carrying a TTL) is the ceiling in both.
-# and the re-loop test, where SWEEP_RELOOP_THRESHOLD below is NOT 5.0's rule: 5.0 repeats
-# while expired > ACTIVE_EXPIRE_CYCLE_LOOKUPS_PER_LOOP/4, a comparison against the
-# constant -- more than five -- however few keys the pass actually drew, while the
-# fraction below is of the sample actually drawn. the two agree only on a full pass of
-# twenty: over a keyspace with eight keys carrying a TTL, 5.0 re-loops at six expired and
-# this sweep at three. 7.2.7 instead repeats while a pass sampled nothing or more than
-# 10 per cent of it was stale -- integer division, so three of twenty-eight is 10 and
-# does not re-loop -- at the default effort.
-#
-# that effort is 7.2.7's alone, and it does not do one thing to the four numbers it
-# moves: the keys per loop and the fast cycle's microseconds each grow by a quarter of
-# themselves per step, the slow cycle's percentage by a flat two points not derived from
-# the 25, and the stale percentage above shrinks by one per step -- so the 10 is the
-# value at the default effort and also its largest. CONFIG GET answers the effort, so a
-# running 7.2.7 shows that and not the values it derives. 5.0.14 has no such option
-# anywhere in its sources and uses the three constants raw
+# what is deliberately not written here is how the reference reaches those numbers --
+# which of its two cycles each belongs to, how it draws its sample, when it re-loops.
+# every attempt to set that down here has been wrong about one clause or another, each
+# correction introducing the next, and none of it was load-bearing: nothing in this file
+# behaves differently for any of it. the numbers above are checkable against the sources
+# named; the machinery around them is the reference's and not this file's to describe
 SWEEP_SAMPLE_SIZE = 20
 SWEEP_RELOOP_THRESHOLD = 0.25
 SWEEP_BUDGET_SECONDS = 0.001
