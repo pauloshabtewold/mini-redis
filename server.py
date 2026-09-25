@@ -86,6 +86,16 @@ MAX_SCHEDULABLE_INTERVAL = 2**63 - 1
 logger = logging.getLogger(__name__)
 
 
+class ListenFailed(OSError):
+    """The listening socket could not be bound, so this server never started.
+
+    An `OSError` subclass, because a failed bind has always raised `OSError` and a caller
+    that catches one still catches this. A named subclass, because `main()` catches it
+    around `run()` and `run()` is the whole event loop: catching plain `OSError` there
+    would report a socket error from anywhere inside that loop as a failure to start.
+    """
+
+
 def _port(value: str) -> int:
     # argparse's own type=int lets -1 and 99999 through to bind(), which answers them with
     # an OverflowError traceback where a mistyped port answers with a usage message. the
@@ -142,12 +152,26 @@ def _load_initial_store(
     # to be the way back. whether or not saving is on: such files belong to the path and
     # not to the interval, and a directory this process cannot list reports none
     for name in persistence.stale_temporaries(snapshot_path):
-        logger.warning(
-            "found %s beside %s: it has the name a save there gives its temporary file, "
-            "now or in an earlier build of this server, so a save was likely interrupted, "
-            "and it may hold that save's snapshot; nothing reads or removes it",
-            name, snapshot_path,
-        )
+        # two sentences, because the two shapes say different things. A name built from
+        # the snapshot's own basename can only have come from a save to this path. The
+        # bare tmpXXXXXXXX an earlier build left is tempfile's own default and carries
+        # nothing about which snapshot it belongs to -- anything on the machine that
+        # called mkstemp in this directory leaves the same name -- so telling an operator
+        # it may hold their snapshot is a guess presented as a fact
+        if persistence.is_legacy_temporary_name(name):
+            logger.warning(
+                "found %s beside %s: it has the bare temporary-file name an earlier build "
+                "of this server left behind, which any program that makes a temporary "
+                "file in that directory also produces, so it may be an interrupted save's "
+                "snapshot or may have nothing to do with this server; nothing reads or "
+                "removes it", name, snapshot_path,
+            )
+        else:
+            logger.warning(
+                "found %s beside %s: it has the name a save there gives its temporary "
+                "file, so a save was likely interrupted, and it may hold that save's "
+                "snapshot; nothing reads or removes it", name, snapshot_path,
+            )
     if snapshot_interval:
         # ahead of both the load and --ignore-snapshot: a path no save could write as
         # things stand would otherwise start a server that answers every write and loses
@@ -382,7 +406,19 @@ class Server:
     def _open_listener(self) -> socket.socket:
         listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        listener.bind((LISTEN_HOST, self.port))
+        try:
+            listener.bind((LISTEN_HOST, self.port))
+        except OSError as exc:
+            # the one startup step that fails after construction, and a port already in
+            # use is the ordinary way it does: starting a second instance by accident.
+            # Every other startup refusal this server has -- a corrupt snapshot, an
+            # unwritable path, a negative interval -- exits with one line, and this one
+            # alone unwound as a traceback out of main(), which reads as a crash rather
+            # than as the operator's own mistake. the socket is closed here because
+            # nothing else will: run() has not reached the assignment that would
+            listener.close()
+            raise ListenFailed(
+                "cannot listen on %s:%d: %s" % (LISTEN_HOST, self.port, exc)) from exc
         listener.setblocking(False)
         listener.listen(socket.SOMAXCONN)
         return listener
@@ -736,7 +772,15 @@ def main(argv=None) -> None:
         # exit 1 rather than argparse's 2: a corrupt snapshot is not a usage error
         print(f"error: {exc}", file=sys.stderr)
         raise SystemExit(1)
-    server.run()
+    try:
+        server.run()
+    except ListenFailed as exc:
+        # its own exception type, not OSError: run() is the whole event loop, and an
+        # OSError raised anywhere inside it -- a selector, a socket, a bug -- would be
+        # folded into a one-line CLI message that was never meant to describe it. Only
+        # the bind raises this
+        print(f"error: {exc}", file=sys.stderr)
+        raise SystemExit(1)
 
 
 if __name__ == "__main__":

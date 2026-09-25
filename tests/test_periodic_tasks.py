@@ -28,7 +28,9 @@ import pytest
 
 import persistence
 import server as server_mod
-from server import SWEEP_BUDGET_SECONDS, SWEEP_SAMPLE_SIZE, Server, build_arg_parser
+from server import (
+    MAX_SCHEDULABLE_INTERVAL, SWEEP_BUDGET_SECONDS, SWEEP_SAMPLE_SIZE, Server, build_arg_parser,
+)
 from store import Store
 
 
@@ -641,6 +643,46 @@ def test_startup_names_a_temporary_file_an_interrupted_save_left_and_leaves_it_a
     assert stranded.read_bytes() == b"left by a killed save"
 
 
+def test_the_two_shapes_of_stranded_temporary_file_are_warned_about_differently(tmp_path):
+    # is_legacy_temporary_name() is the one thing that tells the two shapes apart: a name
+    # built from the snapshot's own basename can only be this path's own interrupted
+    # save, where the bare tmpXXXXXXXX tempfile.mkstemp() itself would leave carries
+    # nothing about which snapshot -- or which program -- left it, so a warning claiming
+    # it holds THIS save's snapshot is a guess dressed as a fact
+    path = tmp_path / "dump.mrdb"
+    good = Store()
+    good.write(b"k", b"v", keep_ttl=False)
+    persistence.save(good, str(path))
+    current_shape = tmp_path / "dump.mrdb.a1b2c3d4.tmp.mrdb"
+    current_shape.write_bytes(b"left by a killed save of this snapshot")
+    legacy_shape = tmp_path / "tmpabcd1234"
+    legacy_shape.write_bytes(b"left by an earlier build, or by something else entirely")
+
+    records = []
+    handler = logging.Handler()
+    handler.emit = records.append
+    logging.getLogger("server").addHandler(handler)
+    try:
+        server = Server(0, snapshot_path=str(path), snapshot_interval=60)
+    finally:
+        logging.getLogger("server").removeHandler(handler)
+    try:
+        messages = [r.getMessage() for r in records if r.levelno >= logging.WARNING]
+        current_shape_warnings = [m for m in messages if current_shape.name in m]
+        legacy_shape_warnings = [m for m in messages if legacy_shape.name in m]
+        assert current_shape_warnings, messages
+        assert legacy_shape_warnings, messages
+        assert "may hold that save's snapshot" in current_shape_warnings[0], (
+            current_shape_warnings)
+        assert "may hold that save's snapshot" not in legacy_shape_warnings[0], (
+            "the bare temporary-file name was described as holding this save's own "
+            "snapshot, which nothing about its name can say", legacy_shape_warnings)
+        assert "may have nothing to do with this server" in legacy_shape_warnings[0], (
+            legacy_shape_warnings)
+    finally:
+        server._loop.close()
+
+
 def test_a_path_the_first_save_could_not_write_refuses_construction_and_opens_no_selector(
     tmp_path
 ):
@@ -1014,6 +1056,31 @@ def test_an_interval_past_what_can_be_scheduled_is_refused_at_both_doors(flag, k
         Server(0, **{keyword: too_large})
 
 
+@pytest.mark.parametrize("flag, keyword", [
+    ("--snapshot-interval", "snapshot_interval"),
+    ("--expiry-sweep-interval", "expiry_sweep_interval"),
+], ids=["snapshot", "sweep"])
+def test_the_scheduling_ceiling_itself_is_accepted_and_one_past_it_is_refused(flag, keyword):
+    # _check_schedulable compares with `>`, never `>=`: the ceiling itself still has to
+    # reach the arithmetic that schedules it -- a clock reading plus the interval, or the
+    # interval divided into seconds -- rather than being refused alongside the value one
+    # past it, which is the one the check exists to keep out of that arithmetic
+    args = build_arg_parser().parse_args([flag, str(MAX_SCHEDULABLE_INTERVAL)])
+    assert getattr(args, keyword) == MAX_SCHEDULABLE_INTERVAL
+
+    server = Server(0, **{keyword: MAX_SCHEDULABLE_INTERVAL})
+    try:
+        assert getattr(server, keyword) == MAX_SCHEDULABLE_INTERVAL
+    finally:
+        server._loop.close()
+
+    one_past = MAX_SCHEDULABLE_INTERVAL + 1
+    with pytest.raises(SystemExit):
+        build_arg_parser().parse_args([flag, str(one_past)])
+    with pytest.raises(ValueError, match="cannot be scheduled"):
+        Server(0, **{keyword: one_past})
+
+
 def test_the_snapshot_arm_counts_its_interval_from_when_the_save_finished(tmp_path):
     # the interval is the gap between saves, not a window a long save eats into, which is
     # what `CONFIG GET save` claims when it spells the schedule in the reference's syntax:
@@ -1048,6 +1115,48 @@ def test_the_snapshot_arm_counts_its_interval_from_when_the_save_finished(tmp_pa
             server._tick()
             assert len(saves) == 2, (
                 "no save fired 61 seconds after the first one returned", saves)
+        finally:
+            server._loop.close()
+
+
+def test_the_sweep_arm_counts_its_interval_from_when_the_tick_started_not_from_when_the_sweep_returned():
+    # the mirror of the test above, and the opposite rule: the sweep re-arms from the
+    # same clock reading _tick() took at its own start, before _sweep_expired ever runs,
+    # where the save arm re-arms from a fresh reading taken after the save returns. the
+    # sweep is held to its own millisecond budget rather than to _tick()'s cadence, so
+    # counting its interval from after a slow pass returned would run it back to back
+    # with itself exactly the way a slow save is not allowed to -- moving the sweep's
+    # re-arm after _guard_task, to match the save arm's own ordering, passes every other
+    # test in this module and fails only here
+    with _injected_clock() as clock:
+        server = Server(0, snapshot_path=None, snapshot_interval=0,
+                        expiry_sweep_interval=100)
+        try:
+            sweeps = []
+
+            def slow_sweep():
+                sweeps.append(clock.monotonic())
+                # a pass that runs long relative to its own 100 ms interval
+                clock.t += 90.0
+
+            server._sweep_expired = slow_sweep
+            server._next_sweep_at = clock.monotonic() + 0.1
+            clock.t += 0.1
+            tick_started_at = clock.monotonic()
+            server._tick()
+            assert len(sweeps) == 1, ("the sweep never fired", sweeps)
+            assert server._next_sweep_at == pytest.approx(tick_started_at + 0.1), (
+                "the sweep's next deadline was not counted from the reading the tick "
+                "took before the sweep ran", server._next_sweep_at, tick_started_at)
+            # the clock already moved 90 seconds inside the sweep, so the rearmed
+            # deadline -- tick_started_at + 0.1 -- is already well behind it; the very
+            # next tick has to fire the sweep again rather than waiting a fresh 0.1
+            # seconds from here
+            server._tick()
+            assert len(sweeps) == 2, (
+                "the sweep did not fire again although its rearmed deadline was already "
+                "in the past -- the rearm must have been taken before the slow pass ran, "
+                "not after it returned", sweeps)
         finally:
             server._loop.close()
 
