@@ -420,10 +420,19 @@ def check_writable(path: str) -> None:
     with a traceback per interval as the only sign, so the refusal belongs before it
     starts. This sees the directory, and the existing snapshot if there is one, as they
     are at the call -- a directory made read-only afterwards, an ACL changed afterwards,
-    or a disk that fills up later, is met by the save itself, not by this. So is one case
-    present at the call and still not visible: an ACL on the directory entry of a `path`
-    that is itself a symlink. The rename replaces that entry, and the only way to rehearse
-    removing it is to remove it, which this check will not do.
+    or a disk that fills up later, is met by the save itself, not by this.
+
+    So is one thing present at the call: a permission that blocks the removal of the
+    existing snapshot's own directory entry, which is what the rename needs and what no
+    probe beside it can ask about. An ACL denying `delete` on the snapshot is the case --
+    the flags above catch what a flags field can express and nothing else. Rehearsing it
+    means removing that entry, or making a second name for the snapshot and removing
+    that; a version of this check did the latter, and in two rounds it deleted a file it
+    had not created and made concurrent starts refuse each other, to catch a configuration
+    that fails safely anyway. Uncaught, such a path starts and then fails every save with
+    a logged traceback, leaving the snapshot it could not replace intact. That is the
+    trade: this check refuses what it can prove, and does not write into the operator's
+    directory to guess at the rest.
     """
     if not os.path.basename(path):
         raise SnapshotError("cannot write snapshot %r: the path names no file" % (path,))
@@ -466,8 +475,6 @@ def check_writable(path: str) -> None:
         raise SnapshotError(
             "cannot write snapshot %s: the existing snapshot's flags would block a "
             "rename over it" % (path,))
-    if path_mode is not None and stat.S_ISREG(path_mode):
-        _refuse_if_the_snapshot_cannot_be_replaced(path)
     # everything left standing -- directory permissions, an ACL, a name the filesystem
     # will not accept -- is answered by attempting exactly what a save attempts: the
     # same temporary file, in the same place, removed the same way
@@ -500,59 +507,6 @@ def check_writable(path: str) -> None:
             "cannot write snapshot %s: a file can be created in %s but not removed, so "
             "%s is left there: %s" % (path, directory, os.path.basename(probe_path), exc)
         ) from exc
-
-
-# the suffix the delete-right rehearsal below gives its hard link. Deliberately not the
-# shape stale_temporaries() matches: it is a second name for the snapshot itself, not a
-# temporary file, and reporting it as one would tell an operator to weigh a file that is
-# their own data under another name
-_LINK_PROBE_SUFFIX = ".linkprobe"
-
-
-def _refuse_if_the_snapshot_cannot_be_replaced(path: str) -> None:
-    """Rehearse the one permission a `save()`'s final `os.rename()` needs and nothing
-    above can see: the right to remove the existing snapshot's directory entry.
-
-    The flags check above catches `chflags`, which is what a flags field can express. It
-    cannot see an ACL -- `chmod +a "<user> deny delete"` on the snapshot blocks the same
-    rename for a different reason, and the probe that follows creates a *new* file, whose
-    permissions are the directory's and say nothing about this one's. A path like that
-    passed the startup check and then failed every save, once an interval, forever, which
-    is the failure this whole function exists to move to startup.
-
-    Rehearsed on a hard link rather than on the snapshot, so nothing is ever moved or
-    removed: a second name for the same inode carries the same ACL, so unlinking it needs
-    the same right the rename needs. The link's name carries this process's pid and eight
-    random characters, for the same reason a save's temporary file does -- two servers
-    starting against one snapshot path must not contend for a single name. Sharing one
-    made concurrent starts refuse each other: measured, five to seven of twelve were
-    refused on a path that is entirely fine, one of them told to move aside a file that
-    was another instance's own probe. It also meant this could remove a name it had not
-    created, which is a startup check destroying data in order to run.
-
-    A filesystem without hard links, or any other reason the link cannot be made, leaves
-    this unchecked rather than guessing -- that is where it stood before. So does a path
-    that is a symlink, which the caller skips: `os.link` follows one to its target, and
-    the target's deletability is not what a save needs, since the rename replaces the
-    link. An ACL on the link's *own* entry is therefore not caught here, because removing
-    that entry is the only way to rehearse it and this check destroys nothing; that case
-    is met by the save.
-    """
-    link = "%s.%d.%s%s" % (path, os.getpid(), os.urandom(4).hex(), _LINK_PROBE_SUFFIX)
-    try:
-        os.link(path, link)
-    except OSError:
-        # no hard links here, or the directory will not take one. The probe below already
-        # answers for the directory; this one has nothing left to add
-        return
-    try:
-        os.unlink(link)
-    except OSError as exc:
-        raise SnapshotError(
-            "cannot write snapshot %s: the existing snapshot cannot be removed, so the "
-            "rename that finishes a save would be refused, and %s is left beside it as a "
-            "second name for the same file -- deleting it loses nothing: %s"
-            % (path, os.path.basename(link), exc)) from exc
 
 
 def stale_temporaries(path: str) -> list[str]:

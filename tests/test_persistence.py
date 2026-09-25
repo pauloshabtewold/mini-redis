@@ -1398,57 +1398,6 @@ def _clear_deny_delete(path, user_denied):
                    capture_output=True, text=True)
 
 
-def test_check_writable_refuses_a_snapshot_an_acl_will_not_let_a_rename_replace(tmp_path):
-    # the flags field says what chflags can express and nothing about an ACL, and the
-    # probe that follows makes a NEW file, whose permissions are the directory's. A
-    # snapshot under `deny delete` passed the whole check and then failed every save,
-    # once an interval, forever -- which is the failure this check exists to move to
-    # startup rather than a fact about the path it cannot see
-    path = tmp_path / "dump.mrdb"
-    store = Store()
-    store.write(b"k", b"v", keep_ttl=False)
-    persistence.save(store, str(path))
-    before = path.read_bytes()
-    user = getpass.getuser()
-    _deny_delete_or_skip(path, user)
-    try:
-        with pytest.raises(persistence.SnapshotError, match="cannot be removed"):
-            persistence.check_writable(str(path))
-        # and the refusal is right about the save: the rename really is denied
-        with pytest.raises(OSError):
-            persistence.save(store, str(path))
-        assert path.read_bytes() == before, "the refused save changed the snapshot"
-    finally:
-        _clear_deny_delete(path, user)
-        for left in tmp_path.iterdir():
-            if left != path:
-                left.unlink()
-
-
-def test_the_delete_rehearsal_leaves_nothing_behind_on_a_path_it_accepts(tmp_path):
-    path = tmp_path / "dump.mrdb"
-    store = Store()
-    store.write(b"k", b"v", keep_ttl=False)
-    persistence.save(store, str(path))
-    persistence.check_writable(str(path))
-    assert [entry.name for entry in tmp_path.iterdir()] == ["dump.mrdb"], (
-        "the rehearsal left a second name for the snapshot behind on a path it accepted"
-    )
-
-
-def test_the_link_probe_is_not_reported_as_a_stranded_save(tmp_path):
-    # it is a second name for the operator's own data, not a temporary file, and telling
-    # them to weigh it as one would invite them to read it as a newer snapshot
-    path = tmp_path / "dump.mrdb"
-    store = Store()
-    store.write(b"k", b"v", keep_ttl=False)
-    persistence.save(store, str(path))
-    os.link(str(path), str(tmp_path / ("dump.mrdb.%d.deadbeef.linkprobe" % os.getpid())))
-    (tmp_path / "dump.mrdb.abcd1234.tmp.mrdb").write_bytes(b"a real stranded save")
-    assert persistence.stale_temporaries(str(path)) == ["dump.mrdb.abcd1234.tmp.mrdb"]
-    assert not persistence.is_legacy_temporary_name("dump.mrdb.linkprobe")
-
-
 def test_a_key_repeated_three_times_is_refused_with_its_own_count():
     # "twice" whatever the count is a claim about the file an operator may act on
     def entry(key, value):
@@ -1460,32 +1409,6 @@ def test_a_key_repeated_three_times_is_refused_with_its_own_count():
     blob = body + struct.pack("<I", zlib.crc32(body))
     with pytest.raises(persistence.SnapshotError, match=r"3 times"):
         persistence.decode(blob)
-
-
-def test_the_delete_rehearsal_is_skipped_for_a_symlink_whose_target_is_undeletable(tmp_path):
-    # the rehearsal makes a hard link, and os.link follows a symlink to its target, so
-    # running it on a symlinked path asks about the target's deletability -- which a save
-    # never needs, because the rename replaces the link and leaves the target alone.
-    # Without the guard that keeps the rehearsal to a regular file, a snapshot path
-    # pointing at an undeletable file is refused although a save writes it: the same
-    # confusion between the entry and what it points at that the lstat checks above fixed
-    target = tmp_path / "real.mrdb"
-    link = tmp_path / "dump.mrdb"
-    store = Store()
-    store.write(b"k", b"v", keep_ttl=False)
-    persistence.save(store, str(target))
-    target_bytes = target.read_bytes()
-    link.symlink_to(target)
-    user = getpass.getuser()
-    _deny_delete_or_skip(target, user)
-    try:
-        persistence.check_writable(str(link))
-        persistence.save(store, str(link))
-        assert not link.is_symlink(), "the save did not replace the link, as rename does"
-        assert target.read_bytes() == target_bytes, "the undeletable target was touched"
-        assert sorted(persistence.load(str(link))._data) == [b"k"]
-    finally:
-        _clear_deny_delete(target, user)
 
 
 def test_a_repeat_after_a_unique_key_names_the_repeat_and_not_the_first_key():
@@ -1549,104 +1472,66 @@ def test_a_directory_sync_that_raises_outright_does_not_claim_a_stranded_file(
             getattr(raised, "__notes__", []))
 
 
-def test_the_rehearsal_never_touches_a_name_it_did_not_create(tmp_path):
-    # its link carries this process's pid and eight random characters, so it cannot
-    # collide with a file that is already there and has no reason to remove one. A fixed
-    # name meant the opposite: an operator's own file under it, or a link to an older
-    # snapshot whose own name is gone, was deleted by a check that exists to refuse
-    # before anything is touched
+def test_a_snapshot_an_acl_will_not_let_a_rename_replace_starts_and_then_fails_safely(
+    tmp_path
+):
+    # the startup check does not catch this, deliberately. The rename needs the right to
+    # remove the existing snapshot's own directory entry, and nothing that can be asked
+    # about the directory answers for that one file: the flags check above sees what a
+    # flags field expresses and no more. Rehearsing it means removing that entry, or
+    # making a second name for the snapshot and removing that -- a version of this check
+    # did the latter, and inside two rounds it deleted a file it had not created and made
+    # concurrent starts refuse each other, all to catch a configuration that fails safely
+    # without it. What is pinned here is that it does fail safely: the server starts, the
+    # save raises where a caller will log it, and the snapshot it could not replace is
+    # still there and still loads
+    path = tmp_path / "dump.mrdb"
+    store = Store()
+    store.write(b"first", b"value", keep_ttl=False)
+    persistence.save(store, str(path))
+    before = path.read_bytes()
+    user = getpass.getuser()
+    _deny_delete_or_skip(path, user)
+    try:
+        persistence.check_writable(str(path))
+
+        later = Store()
+        later.write(b"second", b"value", keep_ttl=False)
+        with pytest.raises(OSError):
+            persistence.save(later, str(path))
+
+        assert path.read_bytes() == before, "the failed save damaged the snapshot"
+        assert sorted(persistence.load(str(path))._data) == [b"first"], (
+            "the snapshot the save could not replace no longer loads")
+        left = [entry.name for entry in tmp_path.iterdir() if entry.name != "dump.mrdb"]
+        assert not left, ("the failed save stranded something", left)
+    finally:
+        _clear_deny_delete(path, user)
+
+
+def test_check_writable_writes_nothing_into_the_directory_it_checks(tmp_path):
+    # it creates and removes one temporary file of the shape a save writes, and that is
+    # all. A second probe that made a hard link beside the snapshot is what this pins
+    # against coming back without a reason: it wrote into the operator's own directory at
+    # every start, and twice that turned into a defect
     path = tmp_path / "dump.mrdb"
     store = Store()
     store.write(b"k", b"v", keep_ttl=False)
     persistence.save(store, str(path))
 
-    theirs = tmp_path / "dump.mrdb.linkprobe"
-    theirs.write_bytes(b"not this check's to remove")
-    older = tmp_path / "dump.mrdb.1.deadbeef.linkprobe"
-    other = Store()
-    other.write(b"older", b"value", keep_ttl=False)
-    persistence.save(other, str(older))
-
-    persistence.check_writable(str(path))
-
-    assert theirs.read_bytes() == b"not this check's to remove", (
-        "the startup check destroyed a file it did not create")
-    assert sorted(persistence.load(str(older))._data) == [b"older"], (
-        "a file shaped exactly like the probe's own name was removed")
-    assert sorted(entry.name for entry in tmp_path.iterdir()) == [
-        "dump.mrdb", "dump.mrdb.1.deadbeef.linkprobe", "dump.mrdb.linkprobe"], (
-        "the rehearsal left something of its own behind")
-
-
-def test_concurrent_rehearsals_do_not_refuse_each_other(tmp_path, monkeypatch):
-    # two servers starting against one snapshot path is a real arrangement -- a
-    # supervisor restart overlapping the instance it replaces. With one shared probe name
-    # they contended for a single directory entry and refused each other: measured, five
-    # to seven of twelve concurrent calls refused on a path that is fine, one of them
-    # naming another instance's probe as a file to move aside
-    path = tmp_path / "dump.mrdb"
-    store = Store()
-    store.write(b"k", b"v", keep_ttl=False)
-    persistence.save(store, str(path))
-
-    # two things are checked, because the interesting one is not visible from outside.
-    # Sharing a name no longer makes concurrent starts refuse each other -- the loser's
-    # os.link now meets EEXIST and takes the "cannot rehearse" branch -- so it fails
-    # silently instead, by skipping the check on every start but one. What says the
-    # rehearsals are independent is that each used a name of its own, which is asserted
-    # directly; the absence of refusals is the cheaper half and is kept beside it
-    workers, rounds = 12, 5
-    refusals = []
-    names = []
-    guard = threading.Lock()
+    created = []
     real_link = os.link
 
     def recording_link(source, target, *args, **kwargs):
-        with guard:
-            names.append(target)
+        created.append(target)
         return real_link(source, target, *args, **kwargs)
 
-    monkeypatch.setattr(os, "link", recording_link)
+    os.link = recording_link
+    try:
+        persistence.check_writable(str(path))
+    finally:
+        os.link = real_link
 
-    for _ in range(rounds):
-        barrier = threading.Barrier(workers)
-
-        def rehearse():
-            barrier.wait()
-            try:
-                persistence.check_writable(str(path))
-            except persistence.SnapshotError as exc:
-                with guard:
-                    refusals.append(str(exc))
-
-        threads = [threading.Thread(target=rehearse) for _ in range(workers)]
-        for thread in threads:
-            thread.start()
-        for thread in threads:
-            thread.join()
-
-    assert not refusals, ("concurrent starts refused a path that is writable", refusals)
-    assert len(names) == workers * rounds, ("a rehearsal did not run", len(names))
-    assert len(set(names)) == len(names), (
-        "two rehearsals contended for one name",
-        sorted(n for n in names if names.count(n) > 1)[:4])
+    assert not created, ("the check made a hard link in the snapshot's directory", created)
     assert [entry.name for entry in tmp_path.iterdir()] == ["dump.mrdb"], (
-        "a concurrent rehearsal left a link behind")
-
-
-def test_a_filesystem_that_will_not_take_a_hard_link_leaves_the_check_where_it_stood(
-    tmp_path, monkeypatch
-):
-    # the rehearsal is an addition, not a precondition: where os.link cannot be made the
-    # check falls back to what it did before rather than refusing every path
-    path = tmp_path / "dump.mrdb"
-    store = Store()
-    store.write(b"k", b"v", keep_ttl=False)
-    persistence.save(store, str(path))
-
-    def no_hard_links(*args, **kwargs):
-        raise OSError(errno.ENOSYS, "Function not implemented")
-
-    monkeypatch.setattr(os, "link", no_hard_links)
-    persistence.check_writable(str(path))
-    assert [entry.name for entry in tmp_path.iterdir()] == ["dump.mrdb"]
+        "the check left something behind in the directory it was asked about")
