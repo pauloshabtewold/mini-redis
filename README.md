@@ -114,8 +114,8 @@ up here — every non-tearing alternative needs a point-in-time view of the keys
 a pure-Python copy, cheaper in memory than it sounds (`docs/DESIGN.md` measures it),
 still leaves every list to copy element by element and the encode on this one thread, so
 the pause is priced and published rather than hidden. A snapshot of 100,000 keys —
-16-byte keys and 100-byte values — costs about 59.9 ms to serialize and about 75.2 ms to
-deserialize, a 12.7 MiB payload, and about 116.2 MiB of peak resident memory in a
+16-byte keys and 100-byte values — costs about 62.3 ms to serialize and about 80.4 ms to
+deserialize, a 12.7 MiB payload, and about 117.2 MiB of peak resident memory in a
 process that builds the keyspace, serializes it and then decodes the payload back into a
 second copy (`resource.getrusage(RUSAGE_CHILDREN).ru_maxrss`). The fixture is stated
 because the payload is a function of it, and the figures come from measuring the tree
