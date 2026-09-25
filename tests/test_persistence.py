@@ -19,6 +19,7 @@ not choose.
 import errno
 import faulthandler
 import fcntl
+import logging
 import os
 import pathlib
 import stat
@@ -991,3 +992,385 @@ def test_a_list_element_count_too_long_for_the_formats_uint32_length_field_is_re
     with pytest.raises(ValueError, match="its element count"):
         persistence.encode(store)
     assert list(tmp_path.iterdir()) == [], "save must not create anything before encode runs"
+
+
+def test_load_decides_the_type_from_the_descriptor_not_the_path(tmp_path, monkeypatch):
+    # the regular-file check reads os.fstat() on the descriptor load() itself opened,
+    # not os.stat() on the path -- a fifo reported for a descriptor that really names a
+    # regular file proves that: a decoder that re-stated the path here would see the
+    # real, unmodified file and load it instead of refusing it
+    path = tmp_path / "dump.mrdb"
+    store = Store()
+    store.write(b"k", b"v", keep_ttl=False)
+    persistence.save(store, str(path))
+
+    real_fstat = os.fstat
+
+    def fifo_fstat(fd):
+        result = real_fstat(fd)
+        fake_mode = stat.S_IFIFO | stat.S_IMODE(result.st_mode)
+        return os.stat_result((fake_mode,) + tuple(result)[1:])
+
+    monkeypatch.setattr(os, "fstat", fifo_fstat)
+    with pytest.raises(persistence.SnapshotError, match="not a regular file"):
+        persistence.load(str(path))
+
+
+def test_load_opens_with_o_nonblock_so_a_fifo_cannot_hang_it(tmp_path, monkeypatch):
+    path = tmp_path / "dump.mrdb"
+    store = Store()
+    store.write(b"k", b"v", keep_ttl=False)
+    persistence.save(store, str(path))
+
+    real_open = os.open
+    flags_seen = []
+
+    def recording_open(p, flags, *args, **kwargs):
+        flags_seen.append(flags)
+        return real_open(p, flags, *args, **kwargs)
+
+    monkeypatch.setattr(os, "open", recording_open)
+    persistence.load(str(path))
+    assert flags_seen, "load() never called os.open()"
+    assert flags_seen[0] & os.O_NONBLOCK, (
+        "load() must open with O_NONBLOCK, or a fifo at the path blocks it forever",
+        flags_seen[0])
+
+
+def test_load_closes_its_descriptor_even_when_the_blob_is_corrupt(tmp_path, monkeypatch):
+    path = tmp_path / "dump.mrdb"
+    path.write_bytes(b"not a valid snapshot at all")
+
+    real_open, real_close = os.open, os.close
+    opened = []
+    closed = []
+
+    def recording_open(p, flags, *args, **kwargs):
+        fd = real_open(p, flags, *args, **kwargs)
+        opened.append(fd)
+        return fd
+
+    def recording_close(fd):
+        closed.append(fd)
+        return real_close(fd)
+
+    monkeypatch.setattr(os, "open", recording_open)
+    monkeypatch.setattr(os, "close", recording_close)
+    for _ in range(50):
+        with pytest.raises(persistence.SnapshotError):
+            persistence.load(str(path))
+    assert len(opened) == 50, opened
+    assert closed == opened, (
+        "a descriptor from a failed, corrupt load was never closed", opened, closed)
+
+
+def test_check_writable_accepts_a_symlink_to_a_directory_and_save_writes_through_it(tmp_path):
+    # os.rename() replaces the symlink itself rather than following it into the
+    # directory it names, so a save through a "current -> real-dir/dump.mrdb"-style
+    # path never touches what the link points at
+    real_dir = tmp_path / "elsewhere"
+    real_dir.mkdir()
+    (real_dir / "untouched.txt").write_bytes(b"leave this alone")
+    link = tmp_path / "dump.mrdb"
+    link.symlink_to(real_dir)
+
+    persistence.check_writable(str(link))
+    store = Store()
+    store.write(b"k", b"v", keep_ttl=False)
+    persistence.save(store, str(link))
+
+    assert not link.is_symlink(), (
+        "save should have replaced the symlink with the snapshot, not written through it"
+    )
+    assert persistence.load(str(link)).lookup(b"k") == b"v"
+    assert sorted(p.name for p in real_dir.iterdir()) == ["untouched.txt"], (
+        "the directory the symlink pointed at was written into"
+    )
+    assert (real_dir / "untouched.txt").read_bytes() == b"leave this alone"
+
+
+def test_check_writable_accepts_a_symlink_to_an_immutable_file_and_save_leaves_it_untouched(
+    tmp_path
+):
+    if not hasattr(os, "chflags") or not hasattr(stat, "UF_IMMUTABLE"):
+        pytest.skip("no chflags/UF_IMMUTABLE on this platform")
+    target = tmp_path / "immutable-target"
+    target.write_bytes(b"never touched")
+    try:
+        os.chflags(str(target), stat.UF_IMMUTABLE)
+    except OSError:
+        pytest.skip("this filesystem does not honor UF_IMMUTABLE")
+    try:
+        # the flags that could block a rename are the symlink's own -- checked with
+        # lstat, not the immutable target's -- and a plain symlink carries none
+        link = tmp_path / "dump.mrdb"
+        link.symlink_to(target)
+        persistence.check_writable(str(link))
+        store = Store()
+        store.write(b"k", b"v", keep_ttl=False)
+        persistence.save(store, str(link))
+        assert not link.is_symlink(), (
+            "save should have replaced the symlink, not written through it to the "
+            "immutable target"
+        )
+        assert persistence.load(str(link)).lookup(b"k") == b"v"
+        assert target.read_bytes() == b"never touched"
+    finally:
+        os.chflags(str(target), 0)
+
+
+def test_a_directory_that_can_be_renamed_into_but_not_read_does_not_fail_the_save(
+    tmp_path, caplog
+):
+    # write and execute permission is everything os.rename() needs from a directory;
+    # read permission is a separate thing, needed only to open the directory itself for
+    # the sync that follows the rename -- a directory granting the first but not the
+    # second is exactly the case _sync_the_directory()'s own os.open() can fail on,
+    # after the snapshot is already safely renamed into place
+    directory = tmp_path / "write-and-execute-only"
+    directory.mkdir()
+    directory.chmod(0o300)
+    try:
+        path = directory / "dump.mrdb"
+        store = Store()
+        store.write(b"k", b"v", keep_ttl=False)
+        with caplog.at_level(logging.WARNING, logger="persistence"):
+            persistence.save(store, str(path))  # must return, not raise
+    finally:
+        directory.chmod(0o700)
+
+    assert persistence.load(str(path)).lookup(b"k") == b"v", (
+        "the snapshot was not written even though the rename that lands it needs no "
+        "read permission on the directory"
+    )
+    assert sorted(p.name for p in directory.iterdir()) == ["dump.mrdb"], (
+        "something besides the snapshot itself was left beside it"
+    )
+    warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
+    assert len(warnings) == 1, (
+        "a directory that could not be synced must log exactly one warning", warnings)
+    assert str(directory) in warnings[0].getMessage(), (
+        "the warning does not name the directory that could not be synced",
+        warnings[0].getMessage())
+
+
+def test_a_snapshot_with_an_unrecognised_kind_byte_and_a_repeated_key_is_refused_naming_the_kind():
+    # the same construction test_a_snapshot_with_a_repeated_key_is_refused_naming_the_key
+    # above uses, except the entry's own type byte is first flipped to one this format
+    # does not recognise -- from_items() raises on that before it ever gets far enough
+    # to notice the repeat, so the refusal has to name the kind and not the repeat
+    store = Store()
+    store.write(b"only", b"first", keep_ttl=False)
+    blob = bytearray(persistence.encode(store))
+    header = bytes(blob[:8])
+    entry = bytearray(blob[12:-4])
+    # a four-byte key length and the key itself come first in one entry, and the type
+    # byte is next
+    type_at = 4 + len(b"only")
+    assert entry[type_at] == persistence.TYPE_STRING
+    entry[type_at] = 0x7F
+    entry = bytes(entry)
+    body = header + struct.pack("<I", 2) + entry + entry
+    spliced = body + struct.pack("<I", zlib.crc32(body))
+    with pytest.raises(persistence.SnapshotError, match="not a snapshot kind") as refused:
+        persistence.decode(spliced)
+    assert "twice" not in str(refused.value), (
+        "the kind byte is what from_items() actually raised on, before the repeat was "
+        "ever reached -- naming the repeat instead hides the real cause",
+        str(refused.value))
+
+
+def test_stale_temporaries_follows_this_filesystem_on_another_spelling_of_the_suffix(tmp_path):
+    # a save always lower-cases the random part and the suffix it appends, so the
+    # canonical spelling of any temporary file this path could have produced keeps the
+    # basename exactly as given and lowers everything after it. a name differing only in
+    # the suffix's own case -- TMP.MRDB rather than tmp.mrdb -- is this path's temporary
+    # file wherever the filesystem folds case, and belongs to nothing here otherwise,
+    # which is asked of the filesystem itself rather than assumed either way
+    (tmp_path / "Case.probe").write_bytes(b"")
+    folds_case = (tmp_path / "case.PROBE").exists()
+    path = tmp_path / "dump.mrdb"
+    other_suffix = "dump.mrdb.abcd1234.TMP.MRDB"
+    (tmp_path / other_suffix).write_bytes(b"left by a save whose suffix case differs")
+    reported = persistence.stale_temporaries(str(path))
+    if folds_case:
+        assert reported == [other_suffix], (
+            "this filesystem folds case, so that file is this path's own temporary "
+            "file", reported)
+    else:
+        assert reported == [], (
+            "this filesystem keeps the two spellings apart, so a suffix spelled in "
+            "upper case belongs to no snapshot this call can name", reported)
+
+
+def test_is_legacy_temporary_name_recognizes_only_the_bare_tmp_shape():
+    assert persistence.is_legacy_temporary_name("tmpabcd1234")
+    assert not persistence.is_legacy_temporary_name("dump.mrdb.abcd1234.tmp.mrdb")
+
+
+class _FakeLengthAtTheUint32Ceiling(bytes):
+    """Reports a length of exactly `persistence._UINT32_MAX`, the one value the guard's
+    `>` comparison must accept, without ever holding that many real bytes -- only
+    `__len__` lies, the same trick `_FakeLengthBytes` above plays for a length past it.
+    """
+
+    def __len__(self):
+        return persistence._UINT32_MAX
+
+
+def test_a_value_exactly_at_the_uint32_ceiling_is_accepted_not_refused():
+    # pins > rather than >=: a length of exactly _UINT32_MAX is the largest this
+    # format's length field can hold, not one past it, and belongs on the accepted side
+    # of the boundary
+    store = Store()
+    store.write(b"k", _FakeLengthAtTheUint32Ceiling(b"x"), keep_ttl=False)
+    persistence.encode(store)  # must not raise
+
+
+def test_check_writable_names_an_immutable_directory_as_not_writable(tmp_path):
+    if not hasattr(os, "chflags") or not hasattr(stat, "UF_IMMUTABLE"):
+        pytest.skip("no chflags/UF_IMMUTABLE on this platform")
+    directory = tmp_path / "immutable-directory"
+    directory.mkdir()
+    try:
+        os.chflags(str(directory), stat.UF_IMMUTABLE)
+    except OSError:
+        pytest.skip("this filesystem does not honor UF_IMMUTABLE on a directory")
+    try:
+        # mkstemp inside an immutable directory fails with EPERM rather than EACCES --
+        # both have to be recognised, or this refusal falls through to the generic
+        # message instead of naming the directory not writable
+        with pytest.raises(persistence.SnapshotError, match="is not writable"):
+            persistence.check_writable(str(directory / "dump.mrdb"))
+    finally:
+        os.chflags(str(directory), 0)
+
+
+def test_check_writable_refuses_an_existing_snapshot_under_uf_append(tmp_path):
+    if not hasattr(os, "chflags") or not hasattr(stat, "UF_APPEND"):
+        pytest.skip("no chflags/UF_APPEND on this platform")
+    path = tmp_path / "dump.mrdb"
+    good = Store()
+    good.write(b"k", b"v", keep_ttl=False)
+    persistence.save(good, str(path))
+    try:
+        os.chflags(str(path), stat.UF_APPEND)
+    except OSError:
+        pytest.skip("this filesystem does not honor UF_APPEND")
+    try:
+        with pytest.raises(persistence.SnapshotError):
+            persistence.check_writable(str(path))
+    finally:
+        os.chflags(str(path), 0)
+
+
+def test_check_writable_refuses_an_existing_snapshot_under_sf_append(tmp_path, monkeypatch):
+    if not hasattr(stat, "SF_APPEND"):
+        pytest.skip("no stat.SF_APPEND on this platform")
+    path = tmp_path / "dump.mrdb"
+    good = Store()
+    good.write(b"k", b"v", keep_ttl=False)
+    persistence.save(good, str(path))
+
+    # SF_APPEND is a superuser-only flag to set on this platform, so it is faked onto
+    # the snapshot's own lstat rather than actually applied with chflags -- the bitmask
+    # under test only reads st_flags off whatever lstat() answers and does not care how
+    # the flag arrived there
+    real_lstat = os.lstat
+    target = str(path)
+
+    def sf_append_lstat(p, *args, **kwargs):
+        result = real_lstat(p, *args, **kwargs)
+        if str(p) == target:
+            return os.stat_result(
+                tuple(result), {"st_flags": result.st_flags | stat.SF_APPEND})
+        return result
+
+    monkeypatch.setattr(os, "lstat", sf_append_lstat)
+    with pytest.raises(persistence.SnapshotError):
+        persistence.check_writable(str(path))
+
+
+def test_save_closes_the_mkstemp_descriptor_when_fdopen_raises(tmp_path, monkeypatch):
+    closed = []
+    real_close = os.close
+
+    def recording_close(fd):
+        closed.append(fd)
+        return real_close(fd)
+
+    def failing_fdopen(fd, *args, **kwargs):
+        raise OSError("fdopen refused")
+
+    monkeypatch.setattr(os, "close", recording_close)
+    monkeypatch.setattr(os, "fdopen", failing_fdopen)
+    store = Store()
+    store.write(b"k", b"v", keep_ttl=False)
+    with pytest.raises(OSError, match="fdopen refused"):
+        persistence.save(store, str(tmp_path / "dump.mrdb"))
+    assert closed, "save() left the mkstemp descriptor open when fdopen raised"
+    assert list(tmp_path.iterdir()) == [], (
+        "the unopened temporary file was left on disk after fdopen raised"
+    )
+
+
+def test_sync_the_directory_closes_its_descriptor(tmp_path, monkeypatch):
+    real_open, real_close = os.open, os.close
+    opened = []
+    closed = []
+
+    def recording_open(p, flags, *args, **kwargs):
+        fd = real_open(p, flags, *args, **kwargs)
+        opened.append(fd)
+        return fd
+
+    def recording_close(fd):
+        closed.append(fd)
+        return real_close(fd)
+
+    monkeypatch.setattr(os, "open", recording_open)
+    monkeypatch.setattr(os, "close", recording_close)
+    for _ in range(50):
+        persistence._sync_the_directory(str(tmp_path))
+    assert len(opened) == 50, opened
+    assert closed == opened, (
+        "_sync_the_directory left a descriptor open on some call", opened, closed)
+
+
+def test_one_file_under_both_spellings_returns_false_when_the_respelling_names_nothing(
+    tmp_path
+):
+    # called directly with a name whose re-spelled counterpart does not exist on disk at
+    # all -- a stub that always answered True would pass every positive case elsewhere in
+    # this module too, since those all have a real file at the respelled name
+    assert persistence._one_file_under_both_spellings(
+        str(tmp_path), "dump.mrdb.abcd1234.TMP.MRDB", "dump.mrdb"
+    ) is False
+
+
+class _FakeEntryWhoseTypeCannotBeDetermined:
+    """Stands in for an `os.DirEntry` whose cached type `is_file()` cannot answer --
+    what a directory listable but not searchable does to every entry inside it.
+    """
+
+    def __init__(self, name):
+        self.name = name
+
+    def is_file(self, follow_symlinks=False):
+        raise OSError("type could not be determined")
+
+
+def test_stale_temporaries_reports_a_name_whose_type_scandir_cannot_determine(
+    tmp_path, monkeypatch
+):
+    path = tmp_path / "dump.mrdb"
+    stuck_name = "dump.mrdb.abcd1234.tmp.mrdb"
+
+    def fake_scandir(directory):
+        return iter([_FakeEntryWhoseTypeCannotBeDetermined(stuck_name)])
+
+    monkeypatch.setattr(os, "scandir", fake_scandir)
+    assert persistence.stale_temporaries(str(path)) == [stuck_name], (
+        "a name whose type os.scandir() cannot determine must still be reported -- "
+        "dropping it is silence exactly where the warning matters most"
+    )

@@ -9,7 +9,7 @@ from collections import deque
 
 import pytest
 
-from store import KIND_LIST, KIND_STRING, Store, WrongTypeError
+from store import KIND_LIST, KIND_STRING, DuplicateKeyError, Store, WrongTypeError
 from tests.conftest import FrozenStore
 
 
@@ -181,6 +181,17 @@ def test_from_items_refuses_two_items_that_name_one_key():
     items = [(b"k", KIND_STRING, b"first", 1_900_000_000_000),
              (b"k", KIND_STRING, b"second", -1)]
     with pytest.raises(ValueError, match="share one key"):
+        Store.from_items(items)
+
+
+def test_from_items_raises_duplicate_key_error_specifically_for_a_repeated_key():
+    # persistence._decode() catches this one by type, to tell a repeated key apart from
+    # the bare ValueError an unrecognised kind byte raises -- a caller that only matched
+    # on ValueError would report a corrupt kind byte as a repeated key, or the reverse,
+    # whichever from_items() happened to raise first
+    items = [(b"k", KIND_STRING, b"first", -1),
+             (b"k", KIND_STRING, b"second", -1)]
+    with pytest.raises(DuplicateKeyError):
         Store.from_items(items)
 
 

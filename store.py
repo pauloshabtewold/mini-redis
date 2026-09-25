@@ -14,6 +14,16 @@ KIND_LIST = b"list"
 _MISSING = object()
 
 
+class DuplicateKeyError(ValueError):
+    """Two items handed to `from_items()` named one key.
+
+    Its own type, and not a bare `ValueError`, because `persistence._decode()` is the one
+    caller that can say which key it was -- it still holds the entries -- and it has to
+    know that a repeat is what it caught. Deciding by re-scanning instead named a repeat
+    as the cause of a refusal an unrecognised kind byte had already raised.
+    """
+
+
 class WrongTypeError(Exception):
     """A key holds a value of a kind the caller did not ask for.
 
@@ -245,7 +255,7 @@ class Store:
         # here, because items may be an iterator this has already consumed -- the caller
         # holding the entries is the one that can still find it
         if len(store._data) != loaded:
-            raise ValueError(
+            raise DuplicateKeyError(
                 "two of the %d items share one key: they produced %d keys"
                 % (loaded, len(store._data)))
         return store
