@@ -49,6 +49,10 @@ DEFAULT_IGNORE_SNAPSHOT = False
 # matches the cadence an idle redis-server 7.2.7 runs its background cycle at: hz is 10
 # there by default, so the cycle runs every 100 ms
 DEFAULT_EXPIRY_SWEEP_INTERVAL_MS = 100
+# a local choice: long enough for a reader that is only slow to take what is already queued for it, and short enough that an operator's own kill timer -- docker stop waits ten seconds -- does not land inside the drain and skip the teardown behind it
+DEFAULT_SHUTDOWN_DRAIN_TIMEOUT_SECONDS = 5
+# a local choice, and it must not fall under 50: redis-benchmark -c 50 is the standard invocation, and a cap under it refuses some of the benchmark's own clients and turns it into a test of the cap. a cap of exactly 50 admits exactly 50, since a count equal to the cap is full
+DEFAULT_MAX_CONNECTIONS = 1024
 # the sweep's own three constants, read off the tagged sources rather than assumed:
 # 7.2.7's expire.c:109-111 and 5.0.14's server.h:172-174 compile in 20 keys a pass, a
 # 1000-microsecond budget and 25 per cent, and the 20 and the 1 ms here are those. the
@@ -70,15 +74,20 @@ SWEEP_BUDGET_SECONDS = 0.001
 # whose snapshot cannot be replaced, a full disk -- writes one traceback and then a short
 # line per this many, instead of a traceback per interval for as long as the server runs
 FAILURE_REPEATS_PER_LINE = 100
+# the cap's counterpart to FAILURE_REPEATS_PER_LINE, ten times larger because the two rates differ: a periodic task fails at most once an interval, where a client retrying in a loop is refused as fast as it can connect, and a hundred of those would still write a line every few milliseconds. see Server._log_refusal
+REFUSALS_PER_LINE = 1000
+# how long refusals must stop for before the next one is reported in full again. a close cannot end the episode, however natural that looks: a freed slot is what a retrier is waiting for, so with slots turning over one comes between every pair of refusals
+REFUSAL_EPISODE_GAP_SECONDS = 60
 # the one site --expiry-sweep-interval's milliseconds are turned into the seconds
 # time.monotonic() deals in
 _MILLISECONDS_PER_SECOND = 1000
-# the ceiling _check_schedulable refuses past: above this, the arithmetic that schedules
-# an interval -- now + value for the snapshot arm, value / 1000 for the sweep -- raises
-# OverflowError from float's own limit (around 10**308) rather than refusing cleanly.
-# 2**63 - 1 is this project's own convention for the largest integer any value here is
-# ever let hold (see commands/registry.py's INT64_MAX), reused as a ceiling that is
-# still far below where the float conversion actually breaks
+# the ceiling _check_schedulable refuses past. the arithmetic that schedules an
+# interval -- now + value for the snapshot arm, value / 1000 for the sweep -- raises
+# OverflowError from float's own limit (around 10**308), and the ceiling is there so that
+# a value that large is refused cleanly at startup instead. 2**63 - 1 is this project's own
+# convention for the largest integer any value here is ever let hold (see
+# commands/registry.py's INT64_MAX), reused as a ceiling that is still far below where
+# the float conversion actually breaks
 MAX_SCHEDULABLE_INTERVAL = 2**63 - 1
 
 # logging.lastResort sends an ERROR record to stderr with no configuration
@@ -110,7 +119,13 @@ def _port(value: str) -> int:
     return number
 
 
-def _check_not_negative(value: int, label: str) -> None:
+# the ending of every negative-value refusal but one: for the flags this rule was written for, 0 is the value that turns the check off, and it is the one the operator is steered to
+_ZERO_DISABLES = "0 disables the check, not %d"
+# --shutdown-drain-timeout's own ending, because its 0 is the restrictive value: no drain at all, so whatever the kernel will not take in one pass is discarded. -1 is the likeliest spelling of "unlimited" and is exactly what is refused here, so the shared ending would send the operator from the value they typed to the one that does the opposite of what they meant
+_ZERO_SKIPS_THE_DRAIN = "%d does not mean unlimited, and 0 means no drain at all"
+
+
+def _check_not_negative(value: int, label: str, ending: str = _ZERO_DISABLES) -> None:
     # the "0 disables, a negative number is refused" rule, stated once and used by every
     # CLI validator below and by Server.__init__. `limit and len(buf) >
     # limit` reads any non-zero value as "enabled", and every buffer length is greater
@@ -120,17 +135,18 @@ def _check_not_negative(value: int, label: str) -> None:
     # elsewhere, which makes it the likeliest value to be typed here by someone
     # reaching for the opposite of what it does
     if value < 0:
-        raise ValueError(
-            "%s cannot be negative; 0 disables the check, not %d" % (label, value))
+        raise ValueError(("%s cannot be negative; " + ending) % (label, value))
 
 
 def _check_schedulable(value: int, label: str, unit: str) -> None:
-    # shared by the CLI validators for --snapshot-interval and --expiry-sweep-interval
-    # and by Server.__init__ for the same two, the only numeric settings the periodic
-    # tick's own arithmetic adds to a clock reading or divides by a constant. a value
-    # past this ceiling reaches that arithmetic as an OverflowError instead of a clean
-    # refusal -- the same failure mode _check_not_negative exists to prevent at the
-    # other end of the range, and the reason this check runs beside it rather than
+    # shared by the CLI validators for --snapshot-interval, --expiry-sweep-interval and
+    # --shutdown-drain-timeout and by Server.__init__ for the same three, the only numeric
+    # settings whose own arithmetic adds them to a clock reading or divides them by a
+    # constant: the periodic tick for the first two, the drain's deadline for the third.
+    # a value far enough past this ceiling reaches that arithmetic as an OverflowError
+    # instead of a clean refusal -- for the drain timeout that is a traceback on SIGTERM,
+    # after the save -- the same failure mode _check_not_negative exists to prevent at
+    # the other end of the range, and the reason this check runs beside it rather than
     # replacing it
     if value > MAX_SCHEDULABLE_INTERVAL:
         raise ValueError(
@@ -175,16 +191,21 @@ def _load_initial_store(
         # ahead of both the load and --ignore-snapshot: a path no save could write as
         # things stand would otherwise start a server that answers every write and loses
         # them at the next restart, and --ignore-snapshot's warning would promise a
-        # replacement no save can make. with saving off nothing is written there, so this
-        # check has nothing to refuse -- a directory at the path is still refused, by the
-        # load, unless --ignore-snapshot skips the load as well
+        # replacement no save can make. a save can happen unless the snapshot was ignored
+        # and periodic saving is off, which is wider than the non-zero interval this runs
+        # under: with --snapshot-interval 0 and no --ignore-snapshot the stop still saves
+        # there and nothing checks the path first, so one a save could not write is first
+        # found at the stop, where the failure is logged and the exit status stays 0. a
+        # directory at the path is still refused at interval 0, by the load, unless
+        # --ignore-snapshot skips the load as well
         persistence.check_writable(snapshot_path)
     if ignore_snapshot:
         if os.path.exists(snapshot_path):
             if snapshot_interval:
                 logger.warning(
                     "ignoring the snapshot at %s; it will be replaced at the next "
-                    "%d-second interval", snapshot_path, snapshot_interval,
+                    "%d-second interval, or on a clean stop if that comes first",
+                    snapshot_path, snapshot_interval,
                 )
             else:
                 logger.warning(
@@ -203,7 +224,7 @@ def _load_initial_store(
         return Store()
 
 
-def _numeric_limit(value: str, label: str, unit: str) -> int:
+def _numeric_limit(value: str, label: str, unit: str, ending: str = _ZERO_DISABLES) -> int:
     # shared by every CLI validator below, so a value typed on the command line
     # and a value passed straight to Server.__init__ are refused by the same rule
     try:
@@ -212,7 +233,7 @@ def _numeric_limit(value: str, label: str, unit: str) -> int:
         raise argparse.ArgumentTypeError(
             "%s must be a number of %s, not %r" % (label, unit, value)) from None
     try:
-        _check_not_negative(number, label)
+        _check_not_negative(number, label, ending)
     except ValueError as exc:
         raise argparse.ArgumentTypeError(str(exc)) from None
     return number
@@ -248,6 +269,19 @@ def _expiry_sweep_interval(value: str) -> int:
     return number
 
 
+def _shutdown_drain_timeout(value: str) -> int:
+    number = _numeric_limit(value, "shutdown drain timeout", "seconds", _ZERO_SKIPS_THE_DRAIN)
+    try:
+        _check_schedulable(number, "shutdown drain timeout", "seconds")
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(str(exc)) from None
+    return number
+
+
+def _max_connections(value: str) -> int:
+    return _numeric_limit(value, "max connections", "connections")
+
+
 def build_arg_parser() -> argparse.ArgumentParser:
     # separate from main() so the parser can be inspected without running the server.
     parser = argparse.ArgumentParser()
@@ -280,17 +314,20 @@ def build_arg_parser() -> argparse.ArgumentParser:
         default=DEFAULT_SNAPSHOT_PATH,
         metavar="PATH",
         help="load a snapshot from PATH on startup and save to it every "
-             "--snapshot-interval; refuses to start if what is at PATH cannot be loaded, "
-             "unless --ignore-snapshot is given, and, whenever saving is on, if a save "
-             "could not write PATH as things stand at startup -- a missing or read-only "
-             "directory, or a directory standing at PATH",
+             "--snapshot-interval and on a clean stop; refuses to start if what is at "
+             "PATH cannot be loaded, unless --ignore-snapshot is given, and, with a "
+             "non-zero --snapshot-interval, if a save could not write PATH as things "
+             "stand at startup -- a missing or read-only directory, or a directory "
+             "standing at PATH",
     )
     parser.add_argument(
         "--snapshot-interval",
         type=_snapshot_interval,
         default=DEFAULT_SNAPSHOT_INTERVAL_SECONDS,
         metavar="SECONDS",
-        help="save a snapshot to --snapshot-path every SECONDS; 0 disables saving",
+        help="save a snapshot to --snapshot-path every SECONDS, and on a clean stop; 0 "
+             "disables the periodic save only -- a clean stop still saves, except with "
+             "--ignore-snapshot, where 0 leaves the file at --snapshot-path alone",
     )
     parser.add_argument(
         "--expiry-sweep-interval",
@@ -312,9 +349,31 @@ def build_arg_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="start with an empty keyspace instead of loading --snapshot-path: the "
              "snapshot is ignored whether or not it is readable, so a good one is "
-             "discarded too, and the next --snapshot-interval overwrites it -- unless "
-             "--snapshot-interval is 0, which leaves the file in place instead. the "
+             "discarded too, and the next --snapshot-interval or a clean stop, whichever "
+             "comes first, overwrites it -- unless --snapshot-interval is 0, which leaves "
+             "the file in place instead: no save runs, not even on the way out. the "
              "escape hatch for a file that refuses to load",
+    )
+    parser.add_argument(
+        "--shutdown-drain-timeout",
+        type=_shutdown_drain_timeout,
+        default=DEFAULT_SHUTDOWN_DRAIN_TIMEOUT_SECONDS,
+        metavar="SECONDS",
+        help="on SIGTERM or SIGINT, save a snapshot and then keep sending the replies "
+             "already queued for clients, for no longer than SECONDS plus one "
+             f"{SELECT_TIMEOUT_SECONDS} second select() timeout, before exiting whether "
+             "or not the kernel took all of them. 0 is not unlimited here, it is the "
+             "opposite: no drain at all, so whatever the kernel will not take in one "
+             "pass is discarded, and a request still unread at the close can take the "
+             "kernel's unsent tail with it",
+    )
+    parser.add_argument(
+        "--max-connections",
+        type=_max_connections,
+        default=DEFAULT_MAX_CONNECTIONS,
+        metavar="COUNT",
+        help="close, without a reply, a connection that arrives while COUNT clients are "
+             "already connected; 0 means no limit, and nothing is refused",
     )
     return parser
 
@@ -334,6 +393,8 @@ class Server:
         snapshot_interval: int = DEFAULT_SNAPSHOT_INTERVAL_SECONDS,
         expiry_sweep_interval: int = DEFAULT_EXPIRY_SWEEP_INTERVAL_MS,
         ignore_snapshot: bool = DEFAULT_IGNORE_SNAPSHOT,
+        shutdown_drain_timeout: int = DEFAULT_SHUTDOWN_DRAIN_TIMEOUT_SECONDS,
+        max_connections: int = DEFAULT_MAX_CONNECTIONS,
     ) -> None:
         # both checked here as well as in the parser, for the same reason: Server is
         # constructed directly by tests and will be by anything embedding this, so a
@@ -362,6 +423,11 @@ class Server:
         self._sweep_interval_seconds = expiry_sweep_interval / _MILLISECONDS_PER_SECOND
         self.snapshot_path = snapshot_path
         self.ignore_snapshot = ignore_snapshot
+        _check_not_negative(shutdown_drain_timeout, "shutdown_drain_timeout", _ZERO_SKIPS_THE_DRAIN)
+        _check_schedulable(shutdown_drain_timeout, "shutdown_drain_timeout", "seconds")
+        self.shutdown_drain_timeout = shutdown_drain_timeout
+        _check_not_negative(max_connections, "max_connections")
+        self.max_connections = max_connections
         # the last validation before self._loop below: every refusal in this constructor
         # lands before the selector opens, so a refused construction -- here, a corrupt
         # snapshot or a path no save could write -- leaks no descriptor for the caller
@@ -384,6 +450,11 @@ class Server:
         # _guard_task keeps it; a task that succeeds drops its entry, so the next failure
         # after a recovery is a first failure again and is reported in full
         self._failures_in_a_row: dict[str, int] = {}
+        # set when the shutdown drain begins and never cleared: it is what turns a read into a discard instead of a dispatch, and what lets end of input on a connection that still owes bytes wait for the drain instead of closing it, which is the reset _drain_for reads to avoid
+        self._draining = False
+        # refusals in the current episode, counting the one already reported, and when the last one came. _log_refusal keeps both: a refusal that follows the one before it by more than REFUSAL_EPISODE_GAP_SECONDS starts the count again
+        self._cap_refusals = 0
+        self._last_refusal_at: float | None = None
 
     @property
     def connected_clients(self) -> int:
@@ -405,6 +476,19 @@ class Server:
         # stopped, says it saves nothing. A property for the reason connected_clients is
         # one: the slot grants attribute reads
         return self.snapshot_interval if self._next_snapshot_at is not None else 0
+
+    @property
+    def _ignored_snapshot_is_left_in_place(self) -> bool:
+        # the one pair of settings that skips the save on the way out: with the snapshot
+        # ignored and periodic saving off, the file was protected only because nothing
+        # wrote to it, and a save on the way out is a write. any other pairing saves: an
+        # interval of 0 alone included, and with a non-zero interval the next interval
+        # overwrites an ignored file anyway. the guarantee is kept rather than
+        # the prose corrected, on the principle the startup path already follows by
+        # removing no stale temporary file beside the snapshot, which may hold the only
+        # copy of a newer save: an operator reaching for the escape hatch is rescuing a
+        # file, and the stop must not be what destroys it
+        return self.ignore_snapshot and not self.snapshot_interval
 
     def _open_listener(self) -> socket.socket:
         listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -433,6 +517,12 @@ class Server:
             # a peer aborting between readiness and accept is normal, and no per-connection boundary can cover this because no connection exists yet; EMFILE arrives here too and looks identical
             return
         # one accept per readable event, so the level-triggered readiness re-reports a remaining backlog on the next select() return.
+        # >= where every byte limit is >: a byte limit compares a quantity already held against a ceiling it may legally reach, and this asks whether there is room for one more, so a count equal to the cap is full. the count is the set's own length because a second counter would disagree with the set silently in both directions
+        if self.max_connections and len(self._connections) >= self.max_connections:
+            self._log_refusal(addr)
+            # closed with nothing written: a send() from this callback is on a socket nothing tracks, for a client that by construction is not being kept, and a close is a refusal the client can see. before Connection() so nothing owns the socket but this frame
+            sock.close()
+            return
         sock.setblocking(False)
         conn = Connection(sock, addr, role=Role.CLIENT)
         try:
@@ -447,6 +537,30 @@ class Server:
         # filled only once the connection is both registered and tracked, so this slot
         # never points at a connection that _on_accept is about to close instead of keep
         conn.server = self
+
+    def _log_refusal(self, addr: tuple[str, int]) -> None:
+        # bounded by count, the way _guard_task bounds a failure that repeats: a full report for the first, one short line per REFUSALS_PER_LINE after it, DEBUG for the rest. what refuses here refuses as fast as a client can connect, and logging writes to stderr with a blocking write on the only thread here, so a line per refusal is a line per attempt of whatever is retrying in a loop
+        #
+        # cleared by a gap with no refusals and not by a connection closing, which is where _guard_task clears its own, on a success. a close is what a saturated cap's retrier is waiting for, and with slots turning over one comes between every pair of refusals, so clearing on it writes a full report per refusal: measured, 300 refusals at --max-connections 1 with the slot turning over are 300 WARNINGs
+        now = time.monotonic()
+        if (self._last_refusal_at is not None
+                and now - self._last_refusal_at > REFUSAL_EPISODE_GAP_SECONDS):
+            self._cap_refusals = 0
+        self._last_refusal_at = now
+        self._cap_refusals += 1
+        if self._cap_refusals == 1:
+            logger.warning(
+                "refusing %s: %d connections is the --max-connections limit; further "
+                "refusals are logged at DEBUG, with a count every %d, until none has "
+                "come for %d seconds",
+                addr, self.max_connections, REFUSALS_PER_LINE, REFUSAL_EPISODE_GAP_SECONDS)
+        elif self._cap_refusals % REFUSALS_PER_LINE == 0:
+            # no address: this line says the refusals are still going, and the first one named who
+            logger.warning(
+                "%d connections refused so far at the --max-connections limit of %d",
+                self._cap_refusals, self.max_connections)
+        else:
+            logger.debug("refusing %s: at the --max-connections limit", addr)
 
     def _on_readable(self, conn: Connection) -> None:
         self._guard(conn, self._read_and_dispatch)
@@ -543,7 +657,16 @@ class Server:
 
     def _read_and_dispatch(self, conn: Connection) -> None:
         if not conn.receive():
+            if self._draining and conn.write_buffer:
+                # end of input is not a dead peer: a client that has shut down its sending half is finished asking and still reading, and closing it here discards every reply it is owed, which is the one thing the drain exists not to do. waiting costs nothing the drain does not already bound -- a peer that has really gone makes the next send fail, which flush() reports as a dead peer and _flush answers with a close the drain then counts, and a peer that has stopped reading is held by the drain's own deadline. reading is switched off for this connection because end of input stays readable: left registered, every pass would return at once having read nothing, for as long as the drain runs. write interest is already registered, because _flush keeps it equal to whether the buffer is non-empty, and the buffer is non-empty here, so clearing the read bit leaves a mask that is not empty. it does not stay that way: when the buffer empties _flush clears the write bit too, the mask reaches 0, and the applier unregisters the connection, which is right for a connection that owes nothing -- it stays open and in the set until _shutdown closes it
+                self._loop.set_read_interest(conn, False)
+                return
+            # a connection that owes nothing is closed, here as everywhere: there is nothing queued for the close to discard and nothing unread to turn it into a reset, and a half-close has nothing left to wait for when nothing is being sent
             self._close(conn)
+            return
+        if self._draining:
+            # read and thrown away: a command dispatched now would queue a reply for a write the snapshot already missed, and a request left unread makes the close that follows a reset and not a FIN. measured, a reset does not take back what the peer has already received -- a client reads every byte and meets the error only on the read after the last -- but it discards what the closing socket itself has queued and the kernel has not yet put on the wire, and that is the tail of what the drain was waiting to deliver. the buffer is emptied so it cannot grow across passes, and nothing is parsed because this connection is only waiting to be closed
+            conn.read_buffer.clear()
             return
         try:
             parsed_commands = conn.take_commands(
@@ -699,9 +822,11 @@ class Server:
     def _save_snapshot(self) -> None:
         # runs whether or not the keyspace changed since the last save -- no dirty-key
         # counter, so a save is a flat cost paid on the interval rather than a decision
-        # self.snapshot_path is never None here: _tick() only reaches this call once
-        # _next_snapshot_at holds a deadline, and _arm_periodic_tasks() only ever sets
-        # that deadline once snapshot_path is confirmed not None
+        #
+        # the guard lives at each call site and not here: _tick() only reaches this call
+        # once _next_snapshot_at holds a deadline, which _arm_periodic_tasks() sets only for
+        # a path, and run()'s shutdown save checks the path itself because it runs with
+        # --snapshot-interval 0, where nothing is ever armed
         persistence.save(self._store, self.snapshot_path)
 
     def _arm_periodic_tasks(self) -> None:
@@ -723,6 +848,34 @@ class Server:
 
     def _request_stop(self, signum, frame) -> None:
         self._running = False
+
+    def _drain_for(self, timeout: int) -> None:
+        deadline = time.monotonic() + timeout
+        # what keeps the remaining work a fixed number of bytes is that nothing is dispatched, not that nothing is read, and a connection has to be drained of inbound bytes before it is closed: closing a socket that still holds unread ones sends a reset instead of a FIN, and a reset discards the closing socket's own send queue -- what this process handed the kernel and the kernel has not yet put on the wire -- so the last replies of a slow reader would go with it. what the peer had already received is not taken back
+        # every connection that owes bytes when the drain begins, kept because a close empties the set it was found in and the report in the finally clause has to count what the drain lost as well as what it is still waiting on. the set only shrinks from here on, because the listener is no longer registered, so nothing can arrive that this list does not hold
+        owing = []
+        try:
+            # a copy, because _abandon discards from the set being walked
+            for conn in list(self._connections):
+                if not conn.write_buffer:
+                    # _abandon rather than _close: this walk runs after the loop has exited, where _guard no longer applies, so one close that raises would strand every connection behind it in iteration order
+                    self._abandon(conn)
+                    continue
+                owing.append(conn)
+            # no write interest is set for these: _flush leaves it equal to whether the buffer is non-empty after every send, and the only two places a reply is queued -- _dispatch_batch, and the protocol error in _read_and_dispatch -- each end in a _flush, so a connection that owes bytes is already registered for EVENT_WRITE, and for EVENT_READ as well when the drain begins. read interest does not last the drain: end of input on a connection that owes bytes clears it, leaving that connection registered for writing only, and when its buffer empties _flush clears the write bit too, which leaves mask 0 and the applier spells that unregistered. the connection is still open and still in the set, and a connection that owes nothing has nothing left to wake the loop for, so that is the intended end of its part in the drain and not a lost registration
+            # run_once() alone, not the main loop's pairing with _tick(): a tick here would run the expiry sweep, whose DELs after the snapshot are writes no snapshot holds, and a periodic save inside a shutdown that has already saved. the deadline is read between passes, so the bound is the timeout plus one select timeout
+            while any(conn.write_buffer for conn in self._connections) and time.monotonic() < deadline:
+                self._loop.run_once()
+        finally:
+            # a close that discarded a reply leaves it in the buffer, so a connection that is closed and still has bytes queued was lost, and one that is closed with an empty buffer had everything handed to the kernel first
+            closed_owing = sum(1 for conn in owing if conn.closed and conn.write_buffer)
+            still_owing = sum(1 for conn in owing if not conn.closed and conn.write_buffer)
+            incomplete = bool(closed_owing or still_owing)
+            # in a finally so that it is the only line this writes however it ends, including a pass that raises, and a WARNING whenever any connection was owed bytes it did not get -- closed while owed them (a peer that went away, an output limit, an unhandled error) or still owed them at the deadline -- so a clean shutdown stays quiet and a loss is not
+            logger.log(
+                logging.WARNING if incomplete else logging.INFO,
+                "shutdown drain %s; connections closed while owed bytes: %d; connections still owed bytes: %d",
+                "incomplete" if incomplete else "complete", closed_owing, still_owing)
 
     def _shutdown(self, listener: socket.socket) -> None:
         try:
@@ -772,7 +925,15 @@ class Server:
                     # nothing to read or write, which is what lets an idle server with no
                     # connections still sweep and save on schedule
                     self._tick()
+                # leaving the select set stops accept dispatch while the listener itself stays open until _shutdown, so a replacement server cannot bind this port while this process is still running
+                self._loop.unregister_listener(listener)
+                # saved before the drain, not after: a client that never reads holds the drain to its whole timeout, and an operator who gives up and sends SIGKILL must not find the snapshot was the thing waiting behind it. the path is checked here and not through the arming guard, because this save runs with --snapshot-interval 0, where that guard never arms, and it is skipped when _ignored_snapshot_is_left_in_place says the file is to be left alone
+                if self.snapshot_path is not None and not self._ignored_snapshot_is_left_in_place:
+                    self._guard_task("shutdown snapshot save", self._save_snapshot)
+                self._draining = True
+                self._drain_for(self.shutdown_drain_timeout)
             finally:
+                # reached from every way out, including a drain that raised, so the port and the selector are still released
                 self._shutdown(listener)
         finally:
             # nothing is scheduled once run() is on its way out, however it got here, and
@@ -796,6 +957,8 @@ def main(argv=None) -> None:
             snapshot_interval=args.snapshot_interval,
             expiry_sweep_interval=args.expiry_sweep_interval,
             ignore_snapshot=args.ignore_snapshot,
+            shutdown_drain_timeout=args.shutdown_drain_timeout,
+            max_connections=args.max_connections,
         )
     except persistence.SnapshotError as exc:
         # this specific exception, not a bare Exception: anything else raised while

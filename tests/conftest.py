@@ -31,7 +31,7 @@ def free_port():
 
 def wait_until_listening(port, deadline):
     # answers "is anything listening there", which is not the same question as "did my
-    # server start" -- see launch_server() below, which is what every launch site uses
+    # server start" -- see launch_server() below, which answers the second
     while time.monotonic() < deadline:
         try:
             with socket.create_connection(("127.0.0.1", port), timeout=0.05):
@@ -112,12 +112,19 @@ def _bound_this_port(proc, port, deadline):
 def launch_server(snapshot_path, extra_args=(), attempts=5):
     """Start `server.py` on a port this process holds, and return `(proc, port)`.
 
-    The one launch site every test goes through, so the ownership check above is written
-    once. A port another process took is retried rather than failed, because a collision
-    is nobody's defect and a suite that goes red under concurrency is the same loss of
-    signal as one that silently uses the wrong server. `stdout` is a pipe rather than
-    `DEVNULL` for the same reason the redirection existed: the bind line stays out of the
-    transcript under `-s`, and now it is also read.
+    The launch site for every test that needs a real `server.py` on a port picked ahead
+    of time, so the ownership check above is written once. A port another process took
+    is retried rather than failed, because a collision is nobody's defect and a suite
+    that goes red under concurrency is the same loss of signal as one that silently uses
+    the wrong server. `stdout` is a pipe rather than `DEVNULL` for the same reason the
+    redirection existed: the bind line stays out of the transcript under `-s`, and now
+    it is also read.
+
+    A module that starts its own asks the kernel for port 0 and reads the bind line
+    itself, so there is no port to race over: `test_graceful_shutdown.py`, because its
+    tests assert how long a stop takes and what status the process exits with and
+    `stop_server()` ignores the status, and `test_connection_cap.py`, for its one test
+    of the flag through `main()`.
 
     Everything here is bounded: five attempts, each with its own five-second deadline that
     holds on every path through the read, so a server that says nothing, says half a line,
