@@ -25,11 +25,14 @@ has the same shape: it sends `LPOP name count` on the wire, and this server's ex
 two-argument arity for `LPOP` answers a wrong-number-of-arguments error rather than the
 two-element reply real Redis would give. The one that costs the most is `pipeline()`,
 whose `transaction` argument defaults to true: the default call wraps the batch in
-`MULTI`/`EXEC`, neither of which this server implements, so it fails on `EXEC` where
-`r.pipeline(transaction=False)` sends the same commands and works. `redis-benchmark`'s
-default run completes `PING`, `SET`, `GET`, `INCR`, `LPUSH`, `RPUSH`, `LPOP` and `RPOP`,
-and exits at `SADD`, the first command in its sequence this server does not implement at
-all.
+`MULTI`/`EXEC`, neither of which this server implements, so it fails on `EXEC`.
+`r.pipeline(transaction=False)` sends the same commands and works for a batch of some
+tens of thousands of small commands. It packs the whole batch and writes it before it
+reads any reply, which is the client the pause described under the water marks below
+leaves hanging, so a batch of hundreds of thousands can hang it at the shipped defaults;
+`--write-buffer-high-water 0` is what lets it complete. `redis-benchmark`'s default run
+completes `PING`, `SET`, `GET`, `INCR`, `LPUSH`, `RPUSH`, `LPOP` and `RPOP`, and exits at
+`SADD`, the first command in its sequence this server does not implement at all.
 
 A `redis-py` client that asks for RESP3 by default, as the one this suite runs against
 does, sends `HELLO 3` as it connects, and this server answers `NOPROTO unsupported
@@ -64,19 +67,19 @@ turns the check off. `--max-multibulk COUNT` refuses a command declaring more th
 elements; it defaults to 1,048,576, and 0 turns it off too. Neither bounds anything in
 aggregate — each is a ceiling on one element, or on one command's element count, never on
 a connection's traffic as a whole.
-Queued replies are the cheap one — one 64 KiB write holds a few thousand `GET`s — about three thousand at a
-short sixteen-byte value, and between one and six thousand across ordinary sizes — every
-reply is buffered whole, and the value they all name was stored once, so a few kilobytes
-of request can commit gigabytes. `--write-buffer-limit BYTES` closes a connection whose
-queued replies still exceed BYTES once the kernel has taken what it will; it defaults to
-32 MiB, and 0 turns it off. The paragraphs after this one say what that default is and
-costs. `KEYS *` has the same shape: it materialises its whole reply as one
-array holding every key in the keyspace, with no cap of its own, so the reply is bounded
-only by however large the keyspace has already grown — real Redis has the same property
-and documents it. `INFO`'s `used_memory` is peak resident memory rather than current on
-any platform without `/proc`: it reads `/proc/self/statm` where that exists and falls
-back to `resource.getrusage(...).ru_maxrss`, a high-water mark, so the two figures agree
-right after a bulk load and diverge for a server that has since freed memory back to the
+Queued replies are the cheapest way to spend this server's memory: every reply is
+buffered whole, and the value a run of pipelined `GET`s all name was stored once, so a
+few kilobytes of request can commit gigabytes (`docs/DESIGN.md` has the arithmetic).
+`--write-buffer-limit BYTES` closes a connection whose queued replies still exceed BYTES
+once the kernel has taken what it will; it defaults to 32 MiB, and 0 turns it off. The
+paragraphs after this one say what that default is and costs. `KEYS *` has the same
+shape: it materialises its whole reply as one array holding every key in the keyspace,
+with no cap of its own, so the reply is bounded only by however large the keyspace has
+already grown — real Redis has the same property and documents it. `INFO`'s
+`used_memory` is peak resident memory rather than current on any platform without
+`/proc`: it reads `/proc/self/statm` where that exists and falls back to
+`resource.getrusage(...).ru_maxrss`, a high-water mark, so the two figures agree right
+after a bulk load and diverge for a server that has since freed memory back to the
 allocator. `ratelimit.py` and `replication.py` are declared and empty: neither feature
 is built.
 
@@ -86,41 +89,51 @@ for it, and `--write-buffer-low-water BYTES` (default 256 KiB) starts reading it
 once the queue has fallen to BYTES or fewer. There are two marks because one would pause
 and resume a connection on every event, so a low-water mark that is not below the
 high-water one is refused, at the CLI and by `Server.__init__`, unless the high-water
-mark is 0. `--write-buffer-limit` is the ceiling behind them. With the pause in force it
-is not what slows a client down: a client that stops reading is paused long before
-it reaches 32 MiB, and what the limit catches is a single reply larger than it is. The
-32 MiB default is a choice, and a departure from the reference, which leaves an ordinary
-client's output buffer unlimited. This server does not: nothing else here bounds what a
-few kilobytes of pipelined requests can queue, and a bounded queue is worth being
-different over. `--write-buffer-limit 0` is the reference's behaviour.
+mark is 0. A high-water mark of 0 switches the pause off, so reading goes on however
+much is queued and the low-water mark is never reached; with the pause on, a low-water
+mark of 0 means resume only when the queue is empty. `--write-buffer-limit` is the
+ceiling behind them. With the pause in force it is not what slows a client down: a
+client that stops reading is paused long before it reaches 32 MiB, and what the limit
+catches is a reply larger than it is, or the replies to one read's worth of pipelined
+requests, which the pause cannot unqueue once they are parsed. The 32 MiB default is a
+choice, and a departure from the reference, which leaves an ordinary client's output
+buffer unlimited. This server does not: nothing else here bounds what a few kilobytes
+of pipelined requests can queue, and a bounded queue is worth being different over.
+`--write-buffer-limit 0` is the reference's behaviour.
 
 **A value can be stored and not read back.** `--max-value-size` defaults to 64 MiB and
 `--write-buffer-limit` to 32 MiB, and nothing relates the two, so a `SET` of a value
 between them is accepted and the `GET` that follows closes the connection: the reply is
 larger than the limit, and the limit is judged after the send, on what the kernel would
-not take. The value stays stored. Neither default changes. A hard limit does the same in
-the reference, so the choice here is to say so and leave both numbers alone;
-`docs/DESIGN.md` has the sizes measured against this server and against the reference.
-To read back every value the size cap admits, set `--write-buffer-limit` above
-`--max-value-size`, or to 0.
+not take. The value stays stored. A hard limit does the same in the reference, so the
+choice here is to say so and leave both numbers alone; `docs/DESIGN.md` has the sizes
+measured against this server and against the reference. To read back every string value
+the size cap admits, set `--write-buffer-limit` above `--max-value-size`, or to 0. That
+does not reach a list, whose elements are each held to the size cap and whose length is
+not capped: `LRANGE 0 -1` queues the whole list as one reply, judged whole against the
+limit, so a list of elements that are all far under the cap can be stored and not read
+back at any finite limit, and a `KEYS` reply is judged the same way. Only 0 reads every
+one of them back.
 
 **A client that stops reading is paused, not closed.** The pause is what keeps it from
-ever approaching `--write-buffer-limit`, so that limit never fires for it; it has sent
-no half of a command, so `--incomplete-command-timeout` never sees it either; and it
-holds what is already queued for it, at least the high-water mark's worth plus whatever
-the one batch that crossed the mark queued, until it disconnects. That is bounded: per
-connection by the mark plus that batch, which the limit in turn caps at the limit plus
-one reply while the limit is on, and over all connections by `--max-connections`. It is
-also a divergence from the reference, which keeps reading such a client and closes it at
-the hard limit configured for ordinary clients, if there is one. It is accepted and not
-fixed: bounding how long a connection may stay paused would be a control of its own, and
-`--incomplete-command-timeout` is not it, since that flag bounds a half-sent command and
-this client has sent none. The pause has one more cost, for a different client: one that
-writes every request before it reads any reply hangs once the requests it has still to
-send no longer fit in what the two kernels will hold, and nothing closes it. Where that
-point falls moves from run to run, and with `--write-buffer-high-water 0` the pause is
-off and the same client is answered in full. `docs/DESIGN.md` has the measurements and
-the reasoning.
+ever approaching `--write-buffer-limit`, so that limit never fires for it;
+`--incomplete-command-timeout` is suspended for every paused connection, whatever it has
+or has not sent, so that flag does not bound it either; and it holds what is already
+queued for it, at least the high-water mark's worth plus whatever the one batch that
+crossed the mark queued, until it disconnects. That is bounded: per connection by the
+mark plus that batch, which the limit in turn caps at the limit plus one reply while the
+limit is on, and over all connections by `--max-connections`. It is also a divergence
+from the reference, which keeps reading such a client and closes it at the hard limit
+configured for ordinary clients, if there is one. It is accepted and not fixed: bounding
+how long a connection may stay paused would be a control of its own, and
+`--incomplete-command-timeout` is not it, since it is suspended for a paused connection
+whether or not that connection holds a half-sent command. The pause has one more cost,
+for a different client: one that writes every request before it reads any reply, as
+`redis-py`'s `pipeline()` does with the batch it holds, hangs once the requests it has
+still to send no longer fit in what the two kernels will hold, and nothing closes it.
+Where that point falls moves from run to run, and with `--write-buffer-high-water 0` the
+pause is off and the same client is answered in full. `docs/DESIGN.md` has the
+measurements and the reasoning.
 
 **Four more flags cover persistence and the active sweep.** Persistence is on by
 default. `--snapshot-path` names the file a snapshot is written to and read back from
@@ -268,9 +281,9 @@ peer during the drain. End of input on a connection that still owes bytes does n
 it: reading from that connection stops, because end of input stays readable and would
 otherwise wake every pass of the loop, and the drain keeps sending until the connection
 is drained or the deadline arrives. End of input on a connection that owes nothing still
-closes it, because there is nothing for the close to discard. Outside the drain nothing
-changed: end of input with replies queued closes the connection and discards them after
-the one best-effort flush, as the reference does.
+closes it, because there is nothing for the close to discard. Outside the drain, end of
+input is taken for a dead peer: the connection closes and whatever is queued for it is
+discarded after the one best-effort flush, as the reference does.
 
 The drain has one limit worth knowing: a client that is still sending when it ends can
 still lose the tail of its replies. The drain finishes as soon as the last byte reaches
@@ -325,11 +338,15 @@ An empty `HOST` is refused, since it would listen on every interface, and `0.0.0
 for that by name. `--log-level` (default `INFO`; `DEBUG`, `INFO`, `WARNING` or `ERROR`,
 in any case) sets how much is logged, once, in `main()`: importing `server` configures
 nothing, so a program that embeds it keeps its own logging. INFO adds a line for each
-connection opened and each closed to what WARNING shows. DEBUG adds a line per
-dispatched command naming it and counting its arguments, never showing a key or a value,
-and that call sits behind a level check, so at INFO nothing is built for it. An unknown
-level is a usage error and exits 2. Neither flag takes a number, so neither has a `0` to
-misread.
+connection opened and each closed to what WARNING shows. Those two lines have no count
+bound of their own, unlike the refusal and task-failure lines above, and each is a
+blocking write to standard error on the one thread this server has: a client that
+connects and disconnects in a loop can fill a stalled reader's buffer by itself and park
+the loop, which is the hazard those bounds exist for, and `--log-level WARNING` is what
+removes it. DEBUG adds a line per dispatched command naming it and counting its
+arguments, never showing a key or a value, and that call sits behind a level check, so
+at INFO nothing is built for it. An unknown level is a usage error and exits 2. Neither
+flag takes a number, so neither has a `0` to misread.
 
 ## Quickstart
 

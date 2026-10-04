@@ -22,21 +22,21 @@ DEFAULT_PORT = 6379
 LISTEN_HOST = "127.0.0.1"
 # bounds how long a stop signal waits to be noticed, and on an idle loop floors both --expiry-sweep-interval and --snapshot-interval: either deadline is checked only when run_once() returns -- see Server._tick -- so with no traffic a deadline can be noticed up to one timeout late, and the default sweep interval is equal to it. under traffic run_once() returns as soon as a socket is ready, so a shorter interval is honoured.
 SELECT_TIMEOUT_SECONDS = 0.1
-# the most one connection may have queued once the kernel has taken what it will, past which it is closed. with the water marks below in force this is not what slows a client down: one that stops reading is paused long before it gets here, so what this bounds is a single reply larger than it. 0 turns the check off. see Server._flush for why exceeding it closes the connection instead of slowing it down
+# the most one connection may have queued once the kernel has taken what it will, past which it is closed. with the water marks below in force this is not what slows a client down: one that stops reading is paused long before it gets here, so what this bounds is a reply larger than it, or the replies to one read's batch of pipelined requests, which the pause cannot unqueue once they are parsed. 0 turns the check off. see Server._flush for why exceeding it closes the connection instead of slowing it down
 # a local choice and not the reference's, which leaves an ordinary client unlimited. it is below DEFAULT_MAX_VALUE_SIZE, so a value that was stored can be too large to read back: the reply to a GET of it exceeds this and the connection is closed. that is what a hard limit does, and neither default is moved to hide it
 DEFAULT_WRITE_BUFFER_LIMIT = 32 * 1024 * 1024
 # a connection with more than this queued for it stops being read, and is read again once the queue falls to the low-water mark below. the gap between the two is the reason there are two: equal marks would pause and resume the connection on every event. 0 disables the pause. the pause is what keeps a client that pipelines faster than it reads from ever approaching the limit above
 DEFAULT_WRITE_BUFFER_HIGH_WATER = 1024 * 1024
 DEFAULT_WRITE_BUFFER_LOW_WATER = 256 * 1024
-# how long a connection may sit on a command it has only partly sent. the three size caps bound one element and one reply, and none bounds what a hundred connections each holding almost all of a large element add up to in read buffers; this does, by closing the connection that holds one for longer. 0 turns the check off
+# how long a connection may sit on a command it has only partly sent. the size caps bound one element, one command's element count and one connection's queued replies, and none bounds how long a connection may hold part of one, so a hundred connections can each sit on almost all of a large element for as long as they like; this closes a connection that has held one for longer than this. it bounds the time and not the sum: inside the limit those read buffers still add up. 0 turns the check off
 DEFAULT_INCOMPLETE_COMMAND_TIMEOUT_SECONDS = 30
 # applied by main() and nowhere else: a library module that configures logging takes the decision away from whatever imports it
 DEFAULT_LOG_LEVEL = "INFO"
 # a local choice and not the reference's: proto-max-bulk-len defaults to 512 MiB there,
-# eight times this. 64 MiB is well above the largest value the suite round-trips and below
-# anything that risks OOMing this machine. --max-value-size bounds every inbound bulk
-# element, including the command name and any key, not only what a human would call
-# "the value"
+# eight times this. 64 MiB is well above the largest value the suite round-trips and
+# below anything that risks OOMing a development machine. --max-value-size bounds every
+# inbound bulk element, including the command name and any key, not only what a human
+# would call "the value"
 DEFAULT_MAX_VALUE_SIZE = 64 * 1024 * 1024
 # this project's own number as well, and with less to borrow: the reference has no
 # multibulk default at all, and refuses a count only above INT_MAX -- which is
@@ -126,10 +126,12 @@ def _port(value: str) -> int:
     return number
 
 
-# the ending of every negative-value refusal but one: for the flags this rule was written for, 0 is the value that turns the check off, and it is the one the operator is steered to
+# the ending of every negative-value refusal but two: for the flags this rule was written for, 0 is the value that turns the check off, and it is the one the operator is steered to
 _ZERO_DISABLES = "0 disables the check, not %d"
 # --shutdown-drain-timeout's own ending, because its 0 is the restrictive value: no drain at all, so whatever the kernel will not take in one pass is discarded. -1 is the likeliest spelling of "unlimited" and is exactly what is refused here, so the shared ending would send the operator from the value they typed to the one that does the opposite of what they meant
 _ZERO_SKIPS_THE_DRAIN = "%d does not mean unlimited, and 0 means no drain at all"
+# --write-buffer-low-water's own ending, because its 0 disables nothing: with the pause on it means resume only once the queue is empty, the most conservative resume, so the shared ending would send an operator who typed -1 to a value that does not switch anything off
+_ZERO_RESUMES_WHEN_EMPTY = "%d does not turn anything off, and 0 means resume only when the queue is empty"
 
 
 def _check_not_negative(value: int, label: str, ending: str = _ZERO_DISABLES) -> None:
@@ -277,7 +279,7 @@ def _write_buffer_high_water(value: str) -> int:
 
 
 def _write_buffer_low_water(value: str) -> int:
-    return _numeric_limit(value, "write buffer low water", "bytes")
+    return _numeric_limit(value, "write buffer low water", "bytes", _ZERO_RESUMES_WHEN_EMPTY)
 
 
 def _max_value_size(value: str) -> int:
@@ -347,8 +349,9 @@ def build_arg_parser() -> argparse.ArgumentParser:
         metavar="BYTES",
         help="close a connection whose queued replies still exceed BYTES once the kernel "
              "has taken what it will; 0 means no limit, and nothing is closed for it. "
-             "with --write-buffer-high-water in force this bounds one reply larger than "
-             "BYTES rather than a client that reads slowly, and a value stored under "
+             "with --write-buffer-high-water in force this bounds a reply larger than "
+             "BYTES, or the replies to one read's batch of pipelined requests, rather "
+             "than a client that reads slowly, and a value stored under "
              "--max-value-size can be too large to read back under it",
     )
     parser.add_argument(
@@ -543,7 +546,7 @@ class Server:
         _check_not_negative(max_connections, "max_connections")
         self.max_connections = max_connections
         _check_not_negative(write_buffer_high_water, "write_buffer_high_water")
-        _check_not_negative(write_buffer_low_water, "write_buffer_low_water")
+        _check_not_negative(write_buffer_low_water, "write_buffer_low_water", _ZERO_RESUMES_WHEN_EMPTY)
         _check_water_marks(
             write_buffer_high_water, write_buffer_low_water,
             "write_buffer_high_water", "write_buffer_low_water")
@@ -879,13 +882,16 @@ class Server:
             self._close(conn)
             return
         # checked after the send, so what it measures is what the kernel would not take
-        # rather than what was queued a moment ago. closing rather than throttling is the
-        # whole design: refusing to read a client that has stopped reading cannot slow it
-        # down, because a client that writes its requests before reading any reply then
-        # blocks in send() waiting for room only its own reading would create, and both
-        # sides wait forever. the reference closes here too. replication will need its own
-        # links exempted from this, on the same reasoning that keeps them off the rate
-        # limiter -- a follower that falls behind is not a client that has stopped reading
+        # rather than what was queued a moment ago. the limit closes rather than
+        # throttles, and the measurement behind that stands: refusing to read a client
+        # that has stopped reading cannot slow it down, because a client that writes its
+        # requests before reading any reply then blocks in send() waiting for room only
+        # its own reading would create, and both sides wait forever. the pause below
+        # refuses to read anyway and accepts that cost, because it holds a slow reader
+        # where the limit alone would close it; docs/DESIGN.md has why. the reference
+        # closes here too. replication will need its own links exempted from this, on the
+        # same reasoning that keeps them off the rate limiter -- a follower that falls
+        # behind is not a client that has stopped reading
         if self.write_buffer_limit and len(conn.write_buffer) > self.write_buffer_limit:
             logger.warning(
                 "closing %s: %d bytes of queued replies exceeds the %d byte limit",
