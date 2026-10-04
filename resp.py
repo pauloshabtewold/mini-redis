@@ -29,7 +29,7 @@ MAX_MULTIBULK_COUNT = 2**31 - 1
 # flag: no CLI flag covers the inline limit, and MAX_MULTIBULK_COUNT above is the in-repo
 # precedent for a reference-owned ceiling stated as a constant rather than threaded as a
 # parameter. it bounds only a line that has *ended* -- an unterminated line is a different case,
-# left deliberately unbounded here and deferred to the future --incomplete-command-timeout flag,
+# left deliberately unbounded in size here and bounded in time by --incomplete-command-timeout,
 # because a line with no terminator yet has no declared length to compare against anything
 MAX_INLINE_SIZE = 64 * 1024
 TOO_BIG_INLINE = b"ERR Protocol error: too big inline request"
@@ -309,8 +309,8 @@ def _parse_inline(
     newline = buf.find(b"\n", search_from)
     if newline == -1:
         # a line that never ends has no declared length yet to compare against anything --
-        # deliberately left unbounded here. the future --incomplete-command-timeout flag is the
-        # intended answer to everything unterminated; this deferral is that, not an oversight
+        # deliberately left unbounded here. --incomplete-command-timeout answers everything
+        # unterminated, by closing a connection that has held one too long: this parser has no clock
         return (None, 0, 0)
     # measured off the newline index, ahead of both the slice below (buf[:newline] would copy
     # a multi-MiB line just to learn it is refused) and _split_inline (which would have already

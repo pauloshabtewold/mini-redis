@@ -63,6 +63,16 @@ class Connection:
         self.id = next(_NEXT_ID)
         # bytearray because a consumed prefix is deleted (del buf[:n]) rather than the buffer being re-allocated.
         self.read_buffer = bytearray()
+        # a monotonic reading the server writes, None while this connection holds no incomplete
+        # command: armed on the transition into holding one, cleared on the transition out or
+        # when the server stops reading, and not re-armed while the same command is outstanding
+        # and reads are live. a batch in which a command completed is the exception: whatever is
+        # held after a completed command is the start of the next one, so it gets a deadline of
+        # its own. without that, a client whose every read cuts a pipeline mid-command would
+        # carry the first deadline through the whole pipeline and be closed at the timeout
+        # however quickly each command completed. the server reads the clock; this module holds
+        # buffers and parse state and no policy, so it imports none and never writes the slot
+        self.incomplete_since = None
         self.write_buffer = bytearray()
         # the buffer length the last incomplete parse said it needs, so a partial command is not re-parsed from byte zero on every readable event
         self._parse_needed = 0
@@ -93,6 +103,11 @@ class Connection:
 
     def fileno(self) -> int:
         return self._sock.fileno()
+
+    @property
+    def has_incomplete_command(self) -> bool:
+        # the buffer alone is not enough: a multibulk whose header is consumed and whose latest element ended exactly at the buffer's end leaves _argv a list and the buffer empty, with elements still owed
+        return self._argv is not None or bool(self.read_buffer)
 
     def receive(self) -> bool:
         # true means the peer is still connected, not that data arrived: the BlockingIOError branch returns True having read nothing

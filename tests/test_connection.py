@@ -376,3 +376,85 @@ def test_close_really_is_idempotent_not_merely_survivable():
     finally:
         sock.close()
         peer.close()
+
+
+def test_a_connection_holding_nothing_reports_no_incomplete_command(pair):
+    conn, _peer = pair
+    assert conn.has_incomplete_command is False
+    # a readable event that delivers nothing changes nothing
+    assert conn.receive() is True
+    assert conn.take_commands() == []
+    assert conn.has_incomplete_command is False
+
+
+def test_a_partial_inline_line_reports_an_incomplete_command(pair):
+    # the inline path keeps its bytes in the buffer and has no argv, so only the buffer clause sees it
+    conn, peer = pair
+    # a byte at a time, so the first reading is a one-byte buffer: a single byte is an incomplete command too
+    for byte in (b"P", b"I", b"N"):
+        peer.sendall(byte)
+        conn.receive()
+        assert conn.take_commands() == []
+        assert conn._argv is None
+        assert conn.has_incomplete_command is True, bytes(conn.read_buffer)
+
+
+def test_a_partial_multibulk_header_reports_an_incomplete_command(pair):
+    # no header has been consumed yet, so _argv is still None and the buffer is what holds the evidence
+    conn, peer = pair
+    for byte in (b"*", b"2", b"\r"):
+        peer.sendall(byte)
+        conn.receive()
+        assert conn.take_commands() == []
+        assert conn._argv is None
+        assert conn.has_incomplete_command is True, bytes(conn.read_buffer)
+
+
+def test_a_multibulk_awaiting_elements_with_an_empty_buffer_reports_an_incomplete_command(pair):
+    # the header and the first of two elements are consumed and the buffer ends exactly there, so a
+    # buffer-length check says nothing is owed while the connection is still waiting on a second element
+    conn, peer = pair
+    peer.sendall(b"*2\r\n$3\r\nGET\r\n")
+    conn.receive()
+    assert conn.take_commands() == []
+    assert conn.read_buffer == bytearray(), "the case under test needs an empty buffer"
+    assert conn._argv is not None, "the case under test needs a multibulk still owed elements"
+    assert conn.has_incomplete_command is True
+    peer.sendall(b"$3\r\nkey\r\n")
+    conn.receive()
+    assert conn.take_commands() == [[b"GET", b"key"]]
+    assert conn.has_incomplete_command is False
+
+
+def test_a_completed_batch_reports_no_incomplete_command(pair):
+    conn, peer = pair
+    peer.sendall(b"*1\r\n$4\r\nPING\r\n" + b"PING\r\n" + b"\r\n*0\r\n")
+    conn.receive()
+    assert conn.take_commands() == [[b"PING"], [b"PING"]]
+    assert conn.read_buffer == bytearray()
+    assert conn.has_incomplete_command is False
+
+
+def test_incomplete_since_is_none_on_a_new_connection_and_is_never_written_by_connection(pair):
+    # the slot belongs to the server, which owns the clock: whatever this class is asked to do, a
+    # reading it wrote itself would arm a deadline the server never asked for
+    conn, peer = pair
+    assert conn.incomplete_since is None
+    peer.sendall(b"*2\r\n$3\r\nGET\r\n")
+    conn.receive()
+    conn.take_commands()
+    assert conn.incomplete_since is None
+    peer.sendall(b"$3\r\nkey\r\n")
+    conn.receive()
+    conn.take_commands()
+    assert conn.incomplete_since is None
+    peer.sendall(b"*abc\r\n")
+    conn.receive()
+    with pytest.raises(resp.ProtocolError):
+        conn.take_commands()
+    assert conn.incomplete_since is None
+    conn.queue(b"+OK\r\n")
+    assert conn.flush() is True
+    assert conn.incomplete_since is None
+    conn.close()
+    assert conn.incomplete_since is None

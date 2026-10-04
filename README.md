@@ -26,10 +26,10 @@ two-argument arity for `LPOP` answers a wrong-number-of-arguments error rather t
 two-element reply real Redis would give. The one that costs the most is `pipeline()`,
 whose `transaction` argument defaults to true: the default call wraps the batch in
 `MULTI`/`EXEC`, neither of which this server implements, so it fails on `EXEC` where
-`r.pipeline(transaction=False)` sends the same commands and works. `redis-benchmark`'s default run gets further
-than it used to — `PING`, `SET`, `GET`, `INCR`, `LPUSH`, `RPUSH`, `LPOP` and `RPOP` all
-complete now — and exits at `SADD`, the first command in its sequence this server does
-not implement at all.
+`r.pipeline(transaction=False)` sends the same commands and works. `redis-benchmark`'s
+default run completes `PING`, `SET`, `GET`, `INCR`, `LPUSH`, `RPUSH`, `LPOP` and `RPOP`,
+and exits at `SADD`, the first command in its sequence this server does not implement at
+all.
 
 A `redis-py` client that asks for RESP3 by default, as the one this suite runs against
 does, sends `HELLO 3` as it connects, and this server answers `NOPROTO unsupported
@@ -40,11 +40,22 @@ assumes.
 **Nothing bounds how much memory a client can use.** There is no cap on key count, no
 cap on total keyspace size, and no eviction policy to fall back on if there were — a
 client with nothing but `SET` can grow the process until the host runs out of memory.
-The read buffer is uncapped too: an unterminated command grows it for as long as a
-client keeps sending, which at least costs that client a byte per byte — that is the one
-case the two caps below do not reach, because a line with no terminator yet has no
-declared length to compare against anything. A line that *has* ended is bounded even
-with no flag of its own: an inline command is refused past 64 KiB, the reference's own
+The read buffer is uncapped in size too: an unterminated command grows it for as long as
+a client keeps sending, which at least costs that client a byte per byte, and a line
+with no terminator yet has no declared length for either size cap below to compare
+against anything. `--incomplete-command-timeout SECONDS` bounds that case by time
+instead: a connection that has held a command it has only partly sent for longer than
+SECONDS is closed, without a reply, and the close is logged as a warning. It defaults to
+30, and 0 turns the check off. The clock starts when the command begins and is not
+restarted by its later bytes, because a client sending one byte a second is the client
+the flag is for; the price is that a command which honestly takes longer than SECONDS to
+arrive, a large value over a slow link, is closed however steadily it comes. A long
+pipeline is not penalised, since each command that completes starts a fresh clock for
+whatever the connection holds after it, and a connection holding nothing is never closed
+however long it idles. The clock also stops while the high-water mark described below
+has a connection paused, because the server is what stopped reading it, and starts over
+from zero when reading resumes. A line that *has* ended is bounded even with no flag of
+its own: an inline command is refused past 64 KiB, the reference's own
 ceiling, because it is complete the moment its newline arrives and nothing later can
 reach it. `--max-value-size BYTES` refuses a single declared bulk element — including
 the command name and any key, not only what a human would call the value — that
@@ -56,9 +67,10 @@ a connection's traffic as a whole.
 Queued replies are the cheap one — one 64 KiB write holds a few thousand `GET`s — about three thousand at a
 short sixteen-byte value, and between one and six thousand across ordinary sizes — every
 reply is buffered whole, and the value they all name was stored once, so a few kilobytes
-of request can commit gigabytes. `--output-buffer-limit BYTES` closes a connection whose
-queued replies exceed it; it defaults to 0, off, which is what real Redis defaults to for
-an ordinary client. `KEYS *` has the same shape: it materialises its whole reply as one
+of request can commit gigabytes. `--write-buffer-limit BYTES` closes a connection whose
+queued replies still exceed BYTES once the kernel has taken what it will; it defaults to
+32 MiB, and 0 turns it off. The paragraphs after this one say what that default is and
+costs. `KEYS *` has the same shape: it materialises its whole reply as one
 array holding every key in the keyspace, with no cap of its own, so the reply is bounded
 only by however large the keyspace has already grown — real Redis has the same property
 and documents it. `INFO`'s `used_memory` is peak resident memory rather than current on
@@ -67,6 +79,48 @@ back to `resource.getrusage(...).ru_maxrss`, a high-water mark, so the two figur
 right after a bulk load and diverge for a server that has since freed memory back to the
 allocator. `ratelimit.py` and `replication.py` are declared and empty: neither feature
 is built.
+
+**A queue of replies has two marks and a ceiling.** `--write-buffer-high-water BYTES`
+(default 1 MiB) stops reading a connection while more than BYTES of replies are queued
+for it, and `--write-buffer-low-water BYTES` (default 256 KiB) starts reading it again
+once the queue has fallen to BYTES or fewer. There are two marks because one would pause
+and resume a connection on every event, so a low-water mark that is not below the
+high-water one is refused, at the CLI and by `Server.__init__`, unless the high-water
+mark is 0. `--write-buffer-limit` is the ceiling behind them. With the pause in force it
+is not what slows a client down: a client that stops reading is paused long before
+it reaches 32 MiB, and what the limit catches is a single reply larger than it is. The
+32 MiB default is a choice, and a departure from the reference, which leaves an ordinary
+client's output buffer unlimited. This server does not: nothing else here bounds what a
+few kilobytes of pipelined requests can queue, and a bounded queue is worth being
+different over. `--write-buffer-limit 0` is the reference's behaviour.
+
+**A value can be stored and not read back.** `--max-value-size` defaults to 64 MiB and
+`--write-buffer-limit` to 32 MiB, and nothing relates the two, so a `SET` of a value
+between them is accepted and the `GET` that follows closes the connection: the reply is
+larger than the limit, and the limit is judged after the send, on what the kernel would
+not take. The value stays stored. Neither default changes. A hard limit does the same in
+the reference, so the choice here is to say so and leave both numbers alone;
+`docs/DESIGN.md` has the sizes measured against this server and against the reference.
+To read back every value the size cap admits, set `--write-buffer-limit` above
+`--max-value-size`, or to 0.
+
+**A client that stops reading is paused, not closed.** The pause is what keeps it from
+ever approaching `--write-buffer-limit`, so that limit never fires for it; it has sent
+no half of a command, so `--incomplete-command-timeout` never sees it either; and it
+holds what is already queued for it, at least the high-water mark's worth plus whatever
+the one batch that crossed the mark queued, until it disconnects. That is bounded: per
+connection by the mark plus that batch, which the limit in turn caps at the limit plus
+one reply while the limit is on, and over all connections by `--max-connections`. It is
+also a divergence from the reference, which keeps reading such a client and closes it at
+the hard limit configured for ordinary clients, if there is one. It is accepted and not
+fixed: bounding how long a connection may stay paused would be a control of its own, and
+`--incomplete-command-timeout` is not it, since that flag bounds a half-sent command and
+this client has sent none. The pause has one more cost, for a different client: one that
+writes every request before it reads any reply hangs once the requests it has still to
+send no longer fit in what the two kernels will hold, and nothing closes it. Where that
+point falls moves from run to run, and with `--write-buffer-high-water 0` the pause is
+off and the same client is answered in full. `docs/DESIGN.md` has the measurements and
+the reasoning.
 
 **Four more flags cover persistence and the active sweep.** Persistence is on by
 default. `--snapshot-path` names the file a snapshot is written to and read back from
@@ -96,9 +150,9 @@ That bound is not cosmetic. Logging writes to standard error with a blocking wri
 this server has one thread, so a reader that stops — a stalled collector, a pipeline
 whose far end died — can fill its buffer and park the loop inside the tick, after which
 nothing is served and nothing more is logged. A failure that repeats on a timer is the
-one thing that can fill that buffer on its own, and it no longer does. The residual
-stands: a buffer filled from elsewhere still parks the next write, and closing that
-needs either a descriptor this process does not own or a second thread. A save writes a
+one thing that can fill that buffer on its own, and the bound above stops it. The
+residual is that a buffer filled from elsewhere still parks the next write, and closing
+that needs either a descriptor this process does not own or a second thread. A save writes a
 temporary file beside the snapshot, named after it, and renames it into place; a file
 left under that name, as a process killed mid-save leaves one, is never read or removed,
 and every start over the same path names it in a warning, so long as the directory can
@@ -156,52 +210,58 @@ the tree that ships.
 (default `5`) bounds the drain, which is the part of the way out that waits on clients,
 and not the whole of it: the wait for the loop to notice the signal, up to one
 `select()` timeout, comes first, and so does the snapshot save, which costs what the
-keyspace costs and which this flag does not limit. On `SIGINT` or
-`SIGTERM` the loop stops, and then, before anything is torn down: the listening socket
-leaves the select set, so nothing further is accepted, though the socket itself stays
-open until the teardown and a replacement server cannot bind the port while this process
-is still running; a snapshot is saved; and the server spends up to SECONDS sending the
-replies already queued for clients, then exits whether or not the kernel took all of
-them. The save comes before the drain on purpose. A client that never reads holds the
-drain to its whole timeout, and an operator who gives up and sends `SIGKILL` should not
-find that the snapshot was the thing waiting behind it. It runs whether or not
-`--snapshot-interval` is `0`: that interval schedules periodic saves, and a save on the
-way out is a different thing, which is also why `CONFIG GET save` can answer an empty
-string from a server that will still write a snapshot when it is stopped. The one
-pairing of flags that skips it is the one described with the persistence flags above,
-where the file is being left alone on purpose. During the drain the server keeps reading
-its clients and dispatches nothing. Stopping reading looks like the way to keep the
-drain finite, and it is the wrong one: a request left unread in a socket's receive queue
-turns the close that follows into a reset, and a reset discards the closing socket's own
-send queue, which is the replies this process handed to its kernel and the kernel had
-not yet put on the wire. Replies the peer had already received are not taken back; the
-tail that never left is what goes. What keeps the drain finite is that no command runs
-and so no new reply is queued, while inbound bytes are read and thrown away: the receive
-queue is empty at the close, so the close is orderly and the kernel goes on sending what
-it holds. The deadline is checked between passes of the loop, so the real bound is
-SECONDS plus one `select()` timeout, and the drain ends in one log line however it ends,
-even when a pass raises. The line carries two counts, connections closed while they
-still owed bytes and connections still owing bytes when the drain ended, and it is a
-warning if either is non-zero and informational if both are zero. The informational one
-is not shown in a default run: the server sets up no logging, so Python's fallback
-prints warnings and above only, and a drain that handed everything to the kernel prints
-nothing while one that lost replies prints its warning.
+keyspace costs and which this flag does not limit. On `SIGINT` or `SIGTERM` the loop
+stops, and then, before anything is torn down: the listening socket leaves the select
+set, so nothing further is accepted, though the socket itself stays open until the
+teardown and a replacement server cannot bind the port while this process is still
+running; a snapshot is saved; and the server spends up to SECONDS sending the replies
+already queued for clients, then exits whether or not the kernel took all of them. The
+save comes before the drain on purpose. A client that never reads holds the drain to its
+whole timeout, and an operator who gives up and sends `SIGKILL` should not find that the
+snapshot was the thing waiting behind it. It runs whether or not `--snapshot-interval`
+is `0`: that interval schedules periodic saves, and a save on the way out is a different
+thing, which is also why `CONFIG GET save` can answer an empty string from a server that
+will still write a snapshot when it is stopped. The one pairing of flags that skips it
+is the one described with the persistence flags above, where the file is being left
+alone on purpose. During the drain the server keeps reading its clients and dispatches
+nothing. Stopping reading looks like the way to keep the drain finite, and it is the
+wrong one: a request left unread in a socket's receive queue turns the close that
+follows into a reset, and a reset discards the closing socket's own send queue, which is
+the replies this process handed to its kernel and the kernel had not yet put on the
+wire. Replies the peer had already received are not taken back; the tail that never left
+is what goes. What keeps the drain finite is that no command runs and so no new reply is
+queued, while inbound bytes are read and thrown away: the receive queue is empty at the
+close, so the close is orderly and the kernel goes on sending what it holds. A
+connection the high-water mark had stopped reading is read again from the moment the
+drain begins, for the same reason: whatever it had not read would still be in its
+receive queue at the close. The deadline is checked between passes of the loop, so the
+real bound is SECONDS plus one `select()` timeout, and the drain ends in one log line
+however it ends, even when a pass raises. The line carries two counts, connections
+closed while they still owed bytes and connections still owing bytes when the drain
+ended, and it is a warning if either is non-zero and informational if both are zero.
+Both are shown at the default `--log-level`, which is INFO, so a clean stop ends with a
+line saying it was clean; `--log-level WARNING` leaves only the warning.
 
 `--shutdown-drain-timeout 0` reads the opposite way from the limits it sits beside. For
-`--output-buffer-limit`, `--max-value-size`, `--max-multibulk` and `--max-connections`,
-`0` removes the limit, so a check that closes or refuses something stops doing it and
-turning it off is permissive. This value is a time allowance and what it allows is the
-drain, so `0` is no time at all, and means no drain: turning it off is restrictive.
-(`--port 0` and the two intervals read in neither way: the kernel chooses a port, or a
-periodic task is switched off, and none of the three is a limit.) What is lost is the
-part of the replies the kernel will not take in the one best-effort flush each
-connection gets as it is closed, which still runs, and nothing after it does. No read
-pass runs either, so a request that arrives at any time after the loop's last pass, the
-whole of the snapshot save included, is still unread when its connection closes, and the
-close then resets it and discards what the kernel was holding unsent as well. An
-operator who reads the limits correctly and generalises will set this to `0` expecting
-an unbounded wait, and lose queued replies on every restart. A negative value is
-refused, and so is one above the same `2**63 - 1` ceiling the two intervals have.
+`--write-buffer-limit`, `--max-value-size`, `--max-multibulk`, `--max-connections` and
+`--incomplete-command-timeout`, `0` removes the limit, so a check that closes or refuses
+something stops doing it and turning it off is permissive. This value is a time
+allowance and what it allows is the drain, so `0` is no time at all, and means no drain:
+turning it off is restrictive. (`--port 0` and the two intervals read in neither way:
+the kernel chooses a port, or a periodic task is switched off, and none of the three is
+a limit.) The two water marks read in neither way either, and each has a reading of its
+own: `--write-buffer-high-water 0` disables the pause, so reading goes on however much
+is queued, and `--write-buffer-low-water` is then unreachable, which is accepted and not
+refused; with the pause on, `--write-buffer-low-water 0` means resume only when the
+queue is empty, the most conservative resume and not a way of switching anything off.
+What is lost is the part of the replies the kernel will not take in the one best-effort
+flush each connection gets as it is closed, which still runs, and nothing after it does.
+No read pass runs either, so a request that arrives at any time after the loop's last
+pass, the whole of the snapshot save included, is still unread when its connection
+closes, and the close then resets it and discards what the kernel was holding unsent as
+well. An operator who reads the limits correctly and generalises will set this to `0`
+expecting an unbounded wait, and lose queued replies on every restart. A negative value
+is refused, and so is one above the same `2**63 - 1` ceiling the two intervals have.
 
 A client that finishes sending and keeps reading, a socket half-close, is not a dead
 peer during the drain. End of input on a connection that still owes bytes does not close
@@ -256,6 +316,20 @@ reach exactly, and why this looks like an off-by-one until that is said. The cap
 how many clients there are, not what any one of them can hold: every limit above is
 still per element, per command or per connection, and the cap does not turn any of them
 into a bound on memory.
+
+**Two more flags cover where the server listens and what it says.** `--host HOST`
+(default `127.0.0.1`) is the IPv4 address to listen on, or a name that resolves to one.
+The default is loopback, so a server is local-only unless asked otherwise: it has no
+authentication, and whatever can reach the port can read, overwrite or flush every key.
+An empty `HOST` is refused, since it would listen on every interface, and `0.0.0.0` asks
+for that by name. `--log-level` (default `INFO`; `DEBUG`, `INFO`, `WARNING` or `ERROR`,
+in any case) sets how much is logged, once, in `main()`: importing `server` configures
+nothing, so a program that embeds it keeps its own logging. INFO adds a line for each
+connection opened and each closed to what WARNING shows. DEBUG adds a line per
+dispatched command naming it and counting its arguments, never showing a key or a value,
+and that call sits behind a level check, so at INFO nothing is built for it. An unknown
+level is a usage error and exits 2. Neither flag takes a number, so neither has a `0` to
+misread.
 
 ## Quickstart
 
@@ -319,7 +393,7 @@ filter what they report.
 ## Layout
 
 ```
-server.py       entry point, listener, signals, shutdown drain, connection cap, dispatch
+server.py       entry point, listener, signals, shutdown drain, connection cap, water marks, dispatch
 event_loop.py   selectors readiness dispatch (on_readable / on_writable / on_accept)
 connection.py   per-connection socket, read/write buffers, lifecycle
 resp.py         RESP2 parser and serializer

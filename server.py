@@ -18,13 +18,20 @@ from event_loop import EventLoop
 from store import Store
 
 DEFAULT_PORT = 6379
-# the replication sync command is unauthenticated and is safe only bound to loopback.
+# loopback, so that starting a server exposes it to nothing by accident: it has no authentication of any kind, and whatever can reach the port can read, overwrite or flush every key. --host is the explicit way to listen anywhere else
 LISTEN_HOST = "127.0.0.1"
 # bounds how long a stop signal waits to be noticed, and on an idle loop floors both --expiry-sweep-interval and --snapshot-interval: either deadline is checked only when run_once() returns -- see Server._tick -- so with no traffic a deadline can be noticed up to one timeout late, and the default sweep interval is equal to it. under traffic run_once() returns as soon as a socket is ready, so a shorter interval is honoured.
 SELECT_TIMEOUT_SECONDS = 0.1
-# 0 is unlimited, which is what the reference defaults to for an ordinary client. see
-# Server._flush for why exceeding this closes the connection instead of slowing it down.
-DEFAULT_OUTPUT_BUFFER_LIMIT = 0
+# the most one connection may have queued once the kernel has taken what it will, past which it is closed. with the water marks below in force this is not what slows a client down: one that stops reading is paused long before it gets here, so what this bounds is a single reply larger than it. 0 turns the check off. see Server._flush for why exceeding it closes the connection instead of slowing it down
+# a local choice and not the reference's, which leaves an ordinary client unlimited. it is below DEFAULT_MAX_VALUE_SIZE, so a value that was stored can be too large to read back: the reply to a GET of it exceeds this and the connection is closed. that is what a hard limit does, and neither default is moved to hide it
+DEFAULT_WRITE_BUFFER_LIMIT = 32 * 1024 * 1024
+# a connection with more than this queued for it stops being read, and is read again once the queue falls to the low-water mark below. the gap between the two is the reason there are two: equal marks would pause and resume the connection on every event. 0 disables the pause. the pause is what keeps a client that pipelines faster than it reads from ever approaching the limit above
+DEFAULT_WRITE_BUFFER_HIGH_WATER = 1024 * 1024
+DEFAULT_WRITE_BUFFER_LOW_WATER = 256 * 1024
+# how long a connection may sit on a command it has only partly sent. the three size caps bound one element and one reply, and none bounds what a hundred connections each holding almost all of a large element add up to in read buffers; this does, by closing the connection that holds one for longer. 0 turns the check off
+DEFAULT_INCOMPLETE_COMMAND_TIMEOUT_SECONDS = 30
+# applied by main() and nowhere else: a library module that configures logging takes the decision away from whatever imports it
+DEFAULT_LOG_LEVEL = "INFO"
 # a local choice and not the reference's: proto-max-bulk-len defaults to 512 MiB there,
 # eight times this. 64 MiB is well above the largest value the suite round-trips and below
 # anything that risks OOMing this machine. --max-value-size bounds every inbound bulk
@@ -90,7 +97,7 @@ _MILLISECONDS_PER_SECOND = 1000
 # the float conversion actually breaks
 MAX_SCHEDULABLE_INTERVAL = 2**63 - 1
 
-# logging.lastResort sends an ERROR record to stderr with no configuration
+# importing this module configures nothing: with nothing configured, logging.lastResort writes records at WARNING and above to stderr as bare messages, and main() is the one place that configures logging
 logger = logging.getLogger(__name__)
 
 
@@ -139,19 +146,41 @@ def _check_not_negative(value: int, label: str, ending: str = _ZERO_DISABLES) ->
 
 
 def _check_schedulable(value: int, label: str, unit: str) -> None:
-    # shared by the CLI validators for --snapshot-interval, --expiry-sweep-interval and
-    # --shutdown-drain-timeout and by Server.__init__ for the same three, the only numeric
-    # settings whose own arithmetic adds them to a clock reading or divides them by a
-    # constant: the periodic tick for the first two, the drain's deadline for the third.
-    # a value far enough past this ceiling reaches that arithmetic as an OverflowError
-    # instead of a clean refusal -- for the drain timeout that is a traceback on SIGTERM,
-    # after the save -- the same failure mode _check_not_negative exists to prevent at
-    # the other end of the range, and the reason this check runs beside it rather than
-    # replacing it
+    # shared by the CLI validators for --snapshot-interval, --expiry-sweep-interval,
+    # --shutdown-drain-timeout and --incomplete-command-timeout and by Server.__init__
+    # for the same four, the only numeric settings that are durations. the first three are
+    # added to a clock reading or divided by a constant -- the periodic tick for the first
+    # two, the drain's deadline for the third -- and a value far enough past this ceiling
+    # reaches that arithmetic as an OverflowError instead of a clean refusal; for the drain
+    # timeout that is a traceback on SIGTERM, after the save. that is the same failure mode
+    # _check_not_negative exists to prevent at the other end of the range, and the reason
+    # this check runs beside it rather than replacing it. the fourth never meets arithmetic
+    # that can overflow: the stalled-command sweep only compares an elapsed time against it,
+    # and comparing an int with a float cannot overflow however large the int is. it takes
+    # the same ceiling so that one rule covers every duration, and would not fail without it
     if value > MAX_SCHEDULABLE_INTERVAL:
         raise ValueError(
             "%s cannot exceed %d %s; a larger value cannot be scheduled, not %d"
             % (label, MAX_SCHEDULABLE_INTERVAL, unit, value))
+
+
+def _check_water_marks(high: int, low: int, high_label: str, low_label: str) -> None:
+    # the one rule that spans two settings, stated once for the two places that can see both: main(), which turns the refusal into a usage error because argparse has no hook for a pair, and Server.__init__, which is built directly by tests and by anything embedding it. the labels are the caller's, so each door names the settings the way its own messages do
+    # guarded by the high-water mark, because 0 for it disables the pause, and a pause that is off has no band for a low-water mark to be inconsistent with: without the guard --write-buffer-high-water 0 alone would be refused against the default low-water mark, and so would the one way to switch the pause off
+    # >= and not >: marks that are equal are the band of zero width the two settings exist to avoid
+    if high and low >= high:
+        raise ValueError(
+            "%s (%d) must be below %s (%d); equal marks would pause and resume a "
+            "connection on every event, and 0 for %s switches the pause off instead"
+            % (low_label, low, high_label, high, high_label))
+
+
+def _check_host(value: str, label: str) -> None:
+    # stated once and used by the --host validator and by Server.__init__. an empty host is refused rather than read as a shorthand, because the one thing bind() does with it is listen on every interface, which is the exposure LISTEN_HOST is loopback to avoid, on a server with no authentication at all. it is not a spelling anyone means: it is what `--host "$HOST"` becomes when HOST is unset. 0.0.0.0 is not refused, since it names the same thing and whoever types it has chosen it
+    if not value:
+        raise ValueError(
+            "%s cannot be empty; an empty host listens on every interface, and 0.0.0.0 "
+            "asks for that by name" % label)
 
 
 def _load_initial_store(
@@ -239,8 +268,16 @@ def _numeric_limit(value: str, label: str, unit: str, ending: str = _ZERO_DISABL
     return number
 
 
-def _output_buffer_limit(value: str) -> int:
-    return _numeric_limit(value, "output buffer limit", "bytes")
+def _write_buffer_limit(value: str) -> int:
+    return _numeric_limit(value, "write buffer limit", "bytes")
+
+
+def _write_buffer_high_water(value: str) -> int:
+    return _numeric_limit(value, "write buffer high water", "bytes")
+
+
+def _write_buffer_low_water(value: str) -> int:
+    return _numeric_limit(value, "write buffer low water", "bytes")
 
 
 def _max_value_size(value: str) -> int:
@@ -282,17 +319,37 @@ def _max_connections(value: str) -> int:
     return _numeric_limit(value, "max connections", "connections")
 
 
+def _incomplete_command_timeout(value: str) -> int:
+    number = _numeric_limit(value, "incomplete command timeout", "seconds")
+    try:
+        _check_schedulable(number, "incomplete command timeout", "seconds")
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(str(exc)) from None
+    return number
+
+
+def _host(value: str) -> str:
+    try:
+        _check_host(value, "host")
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(str(exc)) from None
+    return value
+
+
 def build_arg_parser() -> argparse.ArgumentParser:
     # separate from main() so the parser can be inspected without running the server.
     parser = argparse.ArgumentParser()
     parser.add_argument("--port", type=_port, default=DEFAULT_PORT)
     parser.add_argument(
-        "--output-buffer-limit",
-        type=_output_buffer_limit,
-        default=DEFAULT_OUTPUT_BUFFER_LIMIT,
+        "--write-buffer-limit",
+        type=_write_buffer_limit,
+        default=DEFAULT_WRITE_BUFFER_LIMIT,
         metavar="BYTES",
-        help="close a connection whose queued replies exceed BYTES; 0 disables the "
-             "check, which is the reference's own default for an ordinary client",
+        help="close a connection whose queued replies still exceed BYTES once the kernel "
+             "has taken what it will; 0 means no limit, and nothing is closed for it. "
+             "with --write-buffer-high-water in force this bounds one reply larger than "
+             "BYTES rather than a client that reads slowly, and a value stored under "
+             "--max-value-size can be too large to read back under it",
     )
     parser.add_argument(
         "--max-value-size",
@@ -375,6 +432,56 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help="close, without a reply, a connection that arrives while COUNT clients are "
              "already connected; 0 means no limit, and nothing is refused",
     )
+    parser.add_argument(
+        "--write-buffer-high-water",
+        type=_write_buffer_high_water,
+        default=DEFAULT_WRITE_BUFFER_HIGH_WATER,
+        metavar="BYTES",
+        help="stop reading from a connection while more than BYTES of replies are queued "
+             "for it, and resume once the queue falls to --write-buffer-low-water; 0 "
+             "disables the pause, so reading goes on however much is queued, and "
+             "--write-buffer-low-water is then unused",
+    )
+    parser.add_argument(
+        "--write-buffer-low-water",
+        type=_write_buffer_low_water,
+        default=DEFAULT_WRITE_BUFFER_LOW_WATER,
+        metavar="BYTES",
+        help="resume reading from a paused connection once its queued replies fall to "
+             "BYTES or fewer; must be below --write-buffer-high-water unless that is 0. "
+             "0 means resume only when the queue is empty, which is the most "
+             "conservative resume and not a way to switch anything off",
+    )
+    parser.add_argument(
+        "--incomplete-command-timeout",
+        type=_incomplete_command_timeout,
+        default=DEFAULT_INCOMPLETE_COMMAND_TIMEOUT_SECONDS,
+        metavar="SECONDS",
+        help="close a connection that has held a partly sent command for more than "
+             "SECONDS, counted from when the command began and not from its latest byte; "
+             "time spent paused by --write-buffer-high-water is not counted. 0 means no "
+             "limit, and nothing is closed for it",
+    )
+    parser.add_argument(
+        "--host",
+        type=_host,
+        default=LISTEN_HOST,
+        metavar="HOST",
+        help="the IPv4 address to listen on, or a name that resolves to one. the default "
+             "is loopback, so a server is local-only unless asked otherwise: it has no "
+             "authentication, and whatever can reach the port can read and change every "
+             "key. an empty value is refused, since it would listen on every interface; "
+             "0.0.0.0 asks for that by name",
+    )
+    parser.add_argument(
+        "--log-level",
+        type=str.upper,
+        choices=("DEBUG", "INFO", "WARNING", "ERROR"),
+        default=DEFAULT_LOG_LEVEL,
+        help="how much to log, in any case. INFO reports each connection opened and "
+             "closed; DEBUG adds a line per dispatched command naming the command and "
+             "its argument count, never a key or a value",
+    )
     return parser
 
 
@@ -382,7 +489,7 @@ class Server:
     def __init__(
         self,
         port: int,
-        output_buffer_limit: int = DEFAULT_OUTPUT_BUFFER_LIMIT,
+        write_buffer_limit: int = DEFAULT_WRITE_BUFFER_LIMIT,
         max_value_size: int = DEFAULT_MAX_VALUE_SIZE,
         max_multibulk: int = DEFAULT_MAX_MULTIBULK,
         # None, not DEFAULT_SNAPSHOT_PATH: the three defaults below mirror what the CLI
@@ -395,6 +502,13 @@ class Server:
         ignore_snapshot: bool = DEFAULT_IGNORE_SNAPSHOT,
         shutdown_drain_timeout: int = DEFAULT_SHUTDOWN_DRAIN_TIMEOUT_SECONDS,
         max_connections: int = DEFAULT_MAX_CONNECTIONS,
+        # appended and not placed beside the settings they resemble: main() binds the first
+        # four positionally, so a parameter inserted ahead of any of them would rebind every
+        # positional call site without an error
+        write_buffer_high_water: int = DEFAULT_WRITE_BUFFER_HIGH_WATER,
+        write_buffer_low_water: int = DEFAULT_WRITE_BUFFER_LOW_WATER,
+        incomplete_command_timeout: int = DEFAULT_INCOMPLETE_COMMAND_TIMEOUT_SECONDS,
+        host: str = LISTEN_HOST,
     ) -> None:
         # both checked here as well as in the parser, for the same reason: Server is
         # constructed directly by tests and will be by anything embedding this, so a
@@ -405,11 +519,11 @@ class Server:
         if not 0 <= port <= 65535:
             raise ValueError("port must be between 0 and 65535, not %d" % port)
         self.port = port
-        _check_not_negative(output_buffer_limit, "output_buffer_limit")
+        _check_not_negative(write_buffer_limit, "write_buffer_limit")
         # a per-connection ceiling on queued replies, not a process-wide one: what this
         # bounds is one client's ability to make the server hold bytes it has not managed
         # to send, and connections do not share a write buffer to divide between them
-        self.output_buffer_limit = output_buffer_limit
+        self.write_buffer_limit = write_buffer_limit
         _check_not_negative(max_value_size, "max_value_size")
         self.max_value_size = max_value_size
         _check_not_negative(max_multibulk, "max_multibulk")
@@ -428,6 +542,18 @@ class Server:
         self.shutdown_drain_timeout = shutdown_drain_timeout
         _check_not_negative(max_connections, "max_connections")
         self.max_connections = max_connections
+        _check_not_negative(write_buffer_high_water, "write_buffer_high_water")
+        _check_not_negative(write_buffer_low_water, "write_buffer_low_water")
+        _check_water_marks(
+            write_buffer_high_water, write_buffer_low_water,
+            "write_buffer_high_water", "write_buffer_low_water")
+        self.write_buffer_high_water = write_buffer_high_water
+        self.write_buffer_low_water = write_buffer_low_water
+        _check_not_negative(incomplete_command_timeout, "incomplete_command_timeout")
+        _check_schedulable(incomplete_command_timeout, "incomplete_command_timeout", "seconds")
+        self.incomplete_command_timeout = incomplete_command_timeout
+        _check_host(host, "host")
+        self.host = host
         # the last validation before self._loop below: every refusal in this constructor
         # lands before the selector opens, so a refused construction -- here, a corrupt
         # snapshot or a path no save could write -- leaks no descriptor for the caller
@@ -494,7 +620,7 @@ class Server:
         listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         try:
-            listener.bind((LISTEN_HOST, self.port))
+            listener.bind((self.host, self.port))
         except OSError as exc:
             # the one startup step that fails after construction, and a port already in
             # use is the ordinary way it does: starting a second instance by accident.
@@ -505,7 +631,7 @@ class Server:
             # nothing else will: run() has not reached the assignment that would
             listener.close()
             raise ListenFailed(
-                "cannot listen on %s:%d: %s" % (LISTEN_HOST, self.port, exc)) from exc
+                "cannot listen on %s:%d: %s" % (self.host, self.port, exc)) from exc
         listener.setblocking(False)
         listener.listen(socket.SOMAXCONN)
         return listener
@@ -537,6 +663,7 @@ class Server:
         # filled only once the connection is both registered and tracked, so this slot
         # never points at a connection that _on_accept is about to close instead of keep
         conn.server = self
+        logger.info("accepted connection %d from %s; %d connected", conn.id, addr, len(self._connections))
 
     def _log_refusal(self, addr: tuple[str, int]) -> None:
         # bounded by count, the way _guard_task bounds a failure that repeats: a full report for the first, one short line per REFUSALS_PER_LINE after it, DEBUG for the rest. what refuses here refuses as fast as a client can connect, and logging writes to stderr with a blocking write on the only thread here, so a line per refusal is a line per attempt of whatever is retrying in a loop
@@ -576,7 +703,7 @@ class Server:
         except (BlockingIOError, InterruptedError):
             return
         except Exception:
-            # not wrapped: measured, handleError swallows the OSError family, so a full disk or a gone pipe cannot raise here. a closed stream raises ValueError straight through it, which nothing here can produce -- no handler is configured and nothing closes stderr
+            # not wrapped: measured, handleError swallows the OSError family, so a full disk or a gone pipe cannot raise here. a closed stream raises ValueError straight through it, which nothing here can produce -- the handler main() configures writes to stderr and nothing here closes stderr
             logger.exception("closing %s after an unhandled exception", conn.addr)
             self._abandon(conn)
 
@@ -679,7 +806,7 @@ class Server:
             # raise would discard along with its frame
             self._dispatch_batch(conn, exc.commands)
             if conn.closed:
-                # dispatching those commands can itself trip --output-buffer-limit and
+                # dispatching those commands can itself trip --write-buffer-limit and
                 # close the connection, and an error queued onto it after that is a
                 # reply nobody reads. _flush and _close both already guard on
                 # this same flag, so nothing today makes this branch observable --
@@ -692,11 +819,21 @@ class Server:
             self._flush(conn)
             self._close(conn)
             return
+        # the deadline for a half-sent command is armed here, on the transition into holding one, and cleared on the transition out. a command that is still outstanding keeps the reading it was armed with: restarting it on every recv would let a client sending a byte a second hold a buffer indefinitely, and that is the client the deadline is for. a command that completed in this batch is the other case -- whatever is held now is the start of the next one and gets a deadline of its own, or a client streaming a pipeline that every recv cuts in the middle of a command would never leave a clean buffer and would be closed at the timeout however quickly each command completed
+        # before the batch is dispatched and not after it: dispatching can pause this connection, and _flush suspends the deadline by clearing it, which an arm that came later would overwrite with a running one
+        if conn.has_incomplete_command:
+            if conn.incomplete_since is None or parsed_commands:
+                conn.incomplete_since = time.monotonic()
+        else:
+            conn.incomplete_since = None
         self._dispatch_batch(conn, parsed_commands)
 
     def _dispatch_batch(self, conn: Connection, parsed_commands: list[list[bytes]]) -> None:
         # every command take_commands() returns is dispatched: level-triggered readiness re-reports unread socket bytes, not commands already taken out of the buffer, so a leftover here is never revisited and the client waits forever
         for argv in parsed_commands:
+            # guarded, because the arguments are built before logger.debug is called and this is the hot loop: at the default level an unguarded call would pay for them once per dispatched command and write nothing. the name is cut and the arguments are counted, never shown -- a command name is a bulk element and may be as large as --max-value-size, and a key or a value does not belong in a log
+            if logger.isEnabledFor(logging.DEBUG):
+                logger.debug("connection %d: %r with %d arguments", conn.id, argv[0][:32], len(argv) - 1)
             response, effects = commands.dispatch(self._store, conn, argv)
             # drained once per command and before the reply is queued: the queue holds
             # effects the lookups inside THIS command produced, so they precede the
@@ -710,18 +847,25 @@ class Server:
             # one recv can carry thousands of commands, and queueing every reply before
             # the first send is what lets a few kilobytes of request commit gigabytes.
             # the limit has to be consulted here as well as after the batch, or it bounds
-            # only what survives the flush and not the peak that got there
-            if (self.output_buffer_limit
-                    and len(conn.write_buffer) > self.output_buffer_limit):
+            # only what survives the flush and not the peak that got there. so does the
+            # high-water mark, and it is guarded by itself and not by the limit: with the
+            # limit at 0 this flush would never be reached, and a pause decided once per
+            # batch would let one recv of pipelined GETs queue the whole batch before
+            # anything throttled. the pause cannot unqueue what the batch has already
+            # parsed -- every command in it is still dispatched -- but it stops the next
+            # recv, and the flush gives the kernel the chance to take what is queued
+            queued = len(conn.write_buffer)
+            if ((self.write_buffer_limit and queued > self.write_buffer_limit)
+                    or (self.write_buffer_high_water and queued > self.write_buffer_high_water)):
                 # drained before it is judged: a client reading normally can outrun any
                 # limit on a long enough pipeline, and closing it for the depth of its
                 # batch rather than for failing to read is not what the limit is for.
                 # _flush closes it if the buffer is still over once the kernel is done --
-                # which makes this comparison a trigger and not the decision, so its exact
-                # boundary is not observable. mutating it to >= changes only how early the
-                # flush happens, and _flush's own > still decides. mutation testing reports
-                # that as a surviving mutant; it is an equivalent one, noted so the next
-                # reader spends no time on it
+                # which makes both comparisons here a trigger and not the decision, so
+                # their exact boundaries are not observable. mutating either to >= changes
+                # only how early the flush happens, and _flush's own > still decides.
+                # mutation testing reports that as a surviving mutant; it is an equivalent
+                # one, noted so the next reader spends no time on it
                 self._flush(conn)
                 if conn.closed:
                     return
@@ -742,13 +886,25 @@ class Server:
         # sides wait forever. the reference closes here too. replication will need its own
         # links exempted from this, on the same reasoning that keeps them off the rate
         # limiter -- a follower that falls behind is not a client that has stopped reading
-        if self.output_buffer_limit and len(conn.write_buffer) > self.output_buffer_limit:
+        if self.write_buffer_limit and len(conn.write_buffer) > self.write_buffer_limit:
             logger.warning(
                 "closing %s: %d bytes of queued replies exceeds the %d byte limit",
-                conn.addr, len(conn.write_buffer), self.output_buffer_limit,
+                conn.addr, len(conn.write_buffer), self.write_buffer_limit,
             )
             self._close(conn)
             return
+        # read interest is decided before write interest, and the order matters: a paused connection whose buffer has just emptied wants neither, which the selector cannot hold as a mask and the loop spells unregistered. deciding read first means a buffer that drained to empty has already passed the resume below, so the write decision never meets a connection that wants neither
+        # none of it while the shutdown drain runs. what keeps the drain from dispatching is _read_and_dispatch discarding what it reads, so read interest is not this method's to decide there. the guard is for a connection whose peer has finished sending and is still reading: end of input switched its reading off, because end of input stays readable and would wake the loop on every pass, and the resume below fires as soon as its queue is under the low-water mark -- it would switch the reading back on, and the drain would spin on end of input until its deadline
+        if not self._draining:
+            queued = len(conn.write_buffer)
+            if self.write_buffer_high_water and queued > self.write_buffer_high_water:
+                # a paused connection cannot finish its command, because this server is what stopped reading it, so the deadline for a half-sent one stops with the reading. set_read_interest reports whether the registration changed, which is what makes the pause an edge and not a level: this runs on every flush that finds the queue above the mark, and only the one that did the pausing suspends anything
+                if self._loop.set_read_interest(conn, False):
+                    conn.incomplete_since = None
+            elif queued <= self.write_buffer_low_water:
+                # at or below the low-water mark and not only at it, since one send can carry the queue past it. between the marks neither branch runs and the registration is left as it is, which is the hysteresis. a resume re-arms the deadline only if the registration actually changed and a command is actually outstanding: re-arming on every flush would restart it on each byte of a trickle, and arming for a connection holding nothing would close an idle client
+                if self._loop.set_read_interest(conn, True) and conn.has_incomplete_command:
+                    conn.incomplete_since = time.monotonic()
         # write interest tracks the buffer's emptiness exactly: a connection left permanently writable spins the loop at 100% CPU without dropping a single reply
         self._loop.set_write_interest(conn, bool(conn.write_buffer))
 
@@ -767,6 +923,7 @@ class Server:
         # with every later _close returning at the guard above before reaching this line
         conn.server = None
         conn.close()
+        logger.info("closed connection %d from %s; %d connected", conn.id, conn.addr, len(self._connections))
 
     def _tick(self) -> None:
         # each deadline is re-taken from the clock rather than advanced from the one it missed:
@@ -794,6 +951,20 @@ class Server:
         if self._next_snapshot_at is not None and now >= self._next_snapshot_at:
             self._guard_task("snapshot save", self._save_snapshot)
             self._next_snapshot_at = time.monotonic() + self.snapshot_interval
+        if self.incomplete_command_timeout:
+            self._guard_task("incomplete command sweep", self._close_stalled_commands)
+
+    def _close_stalled_commands(self) -> None:
+        now = time.monotonic()
+        # a copy, because closing discards from the set being walked: iterating the set itself raises RuntimeError the first time anything is closed
+        for conn in list(self._connections):
+            armed_at = conn.incomplete_since
+            if armed_at is not None and now - armed_at > self.incomplete_command_timeout:
+                logger.warning(
+                    "closing %s: a command has been incomplete for %d seconds, past the %d second limit",
+                    conn.addr, now - armed_at, self.incomplete_command_timeout)
+                # _abandon and not _close: one close that raises would otherwise end the sweep with every connection behind it in iteration order still holding its half-sent command
+                self._abandon(conn)
 
     def _sweep_expired(self) -> None:
         # bounded by elapsed time and nothing else -- no iteration cap -- because a
@@ -862,7 +1033,9 @@ class Server:
                     self._abandon(conn)
                     continue
                 owing.append(conn)
-            # no write interest is set for these: _flush leaves it equal to whether the buffer is non-empty after every send, and the only two places a reply is queued -- _dispatch_batch, and the protocol error in _read_and_dispatch -- each end in a _flush, so a connection that owes bytes is already registered for EVENT_WRITE, and for EVENT_READ as well when the drain begins. read interest does not last the drain: end of input on a connection that owes bytes clears it, leaving that connection registered for writing only, and when its buffer empties _flush clears the write bit too, which leaves mask 0 and the applier spells that unregistered. the connection is still open and still in the set, and a connection that owes nothing has nothing left to wake the loop for, so that is the intended end of its part in the drain and not a lost registration
+                # reading is switched back on for every connection that owes bytes, because one whose reading is off here was switched off by the high-water mark and by nothing else: outside the drain _flush is the only thing that clears it, and end of input outside the drain closes the connection instead of holding it. left off, the requests it had not read would stay in its receive queue for the whole drain, and the close at the end would be a reset, which discards what the kernel had not yet sent. switched on, _read_and_dispatch reads and discards them as it does for any other connection. the mask cannot reach 0 by this: the buffer is non-empty and _flush keeps write interest equal to that, so write interest is registered, and for a connection already being read nothing changes
+                self._loop.set_read_interest(conn, True)
+            # write interest is not set for these: _flush leaves it equal to whether the buffer is non-empty after every send, and the only two places a reply is queued -- _dispatch_batch, and the protocol error in _read_and_dispatch -- each end in a _flush, so a connection that owes bytes is already registered for EVENT_WRITE. read interest does not last the drain: end of input on a connection that owes bytes clears it, leaving that connection registered for writing only, and the _draining guard in _flush keeps the resume there from undoing that. when its buffer empties _flush clears the write bit too, which leaves mask 0 and the applier spells that unregistered. the connection is still open and still in the set, and a connection that owes nothing has nothing left to wake the loop for, so that is the intended end of its part in the drain and not a lost registration
             # run_once() alone, not the main loop's pairing with _tick(): a tick here would run the expiry sweep, whose DELs after the snapshot are writes no snapshot holds, and a periodic save inside a shutdown that has already saved. the deadline is read between passes, so the bound is the timeout plus one select timeout
             while any(conn.write_buffer for conn in self._connections) and time.monotonic() < deadline:
                 self._loop.run_once()
@@ -871,7 +1044,7 @@ class Server:
             closed_owing = sum(1 for conn in owing if conn.closed and conn.write_buffer)
             still_owing = sum(1 for conn in owing if not conn.closed and conn.write_buffer)
             incomplete = bool(closed_owing or still_owing)
-            # in a finally so that it is the only line this writes however it ends, including a pass that raises, and a WARNING whenever any connection was owed bytes it did not get -- closed while owed them (a peer that went away, an output limit, an unhandled error) or still owed them at the deadline -- so a clean shutdown stays quiet and a loss is not
+            # in a finally so that it is the only line this writes however it ends, including a pass that raises. it is a WARNING whenever any connection was owed bytes it did not get -- closed while owed them (a peer that went away, an output limit, an unhandled error) or still owed them at the deadline -- and INFO when none was, so the level says whether anything was lost
             logger.log(
                 logging.WARNING if incomplete else logging.INFO,
                 "shutdown drain %s; connections closed while owed bytes: %d; connections still owed bytes: %d",
@@ -949,16 +1122,30 @@ class Server:
 
 
 def main(argv=None) -> None:
-    args = build_arg_parser().parse_args(argv)
+    parser = build_arg_parser()
+    args = parser.parse_args(argv)
+    try:
+        _check_water_marks(
+            args.write_buffer_high_water, args.write_buffer_low_water,
+            "write buffer high water", "write buffer low water")
+    except ValueError as exc:
+        # caught around this call alone and not around the construction below, which would fold every other ValueError into a one-line message. a pair of flags that contradict each other is a usage error and exits 2, where a corrupt snapshot is not and exits 1
+        parser.error(str(exc))
+    # the one place logging is configured. importing this module must leave the host application's logging alone, and Server reads no level: it logs, and whoever started the process decided what is shown
+    logging.basicConfig(level=args.log_level)
     try:
         server = Server(
-            args.port, args.output_buffer_limit, args.max_value_size, args.max_multibulk,
+            args.port, args.write_buffer_limit, args.max_value_size, args.max_multibulk,
             snapshot_path=args.snapshot_path,
             snapshot_interval=args.snapshot_interval,
             expiry_sweep_interval=args.expiry_sweep_interval,
             ignore_snapshot=args.ignore_snapshot,
             shutdown_drain_timeout=args.shutdown_drain_timeout,
             max_connections=args.max_connections,
+            write_buffer_high_water=args.write_buffer_high_water,
+            write_buffer_low_water=args.write_buffer_low_water,
+            incomplete_command_timeout=args.incomplete_command_timeout,
+            host=args.host,
         )
     except persistence.SnapshotError as exc:
         # this specific exception, not a bare Exception: anything else raised while

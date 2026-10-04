@@ -46,6 +46,9 @@ REPO_ROOT = pathlib.Path(__file__).resolve().parent.parent
 # on top of the drain timeout and one select timeout: the shutdown save of a few MiB, which ends in an fsync that is slow on some filesystems, and the process's own teardown
 _MARGIN_SECONDS = 3.0
 _VALUE_BYTES = 4 << 20
+# the stall these tests build -- tens of MiB of replies owed to a client that reads none of them -- is the state the high-water mark exists to prevent. at the defaults a connection is paused after the first large reply, the rest of its requests are never dispatched, and the server owes one reply where the test counts on many. the tests that follow are about the drain and not about the water marks, so the marks and the limit are switched off for them; a test that only needs the server to owe something at the moment of the stop runs at the defaults
+_NO_BACKPRESSURE_FLAGS = ("--write-buffer-limit", "0", "--write-buffer-high-water", "0")
+_NO_BACKPRESSURE = {"write_buffer_limit": 0, "write_buffer_high_water": 0}
 
 
 def _resp(*parts):
@@ -205,7 +208,7 @@ def test_the_drain_bound_is_asserted_on_a_thread_join_not_a_sleep(start):
 
 
 def test_a_cooperative_client_receives_its_whole_reply_before_exit(start, tmp_path):
-    proc, port = start("--snapshot-interval", "3600", "--shutdown-drain-timeout", "10")
+    proc, port = start("--snapshot-interval", "3600", "--shutdown-drain-timeout", "10", *_NO_BACKPRESSURE_FLAGS)
     replies = 8
     client = _stalled_client(port, replies)
     try:
@@ -225,7 +228,7 @@ def test_a_cooperative_client_receives_its_whole_reply_before_exit(start, tmp_pa
 
 def test_a_cooperative_client_exits_well_inside_the_timeout(start):
     drain = 10
-    proc, port = start("--snapshot-interval", "3600", "--shutdown-drain-timeout", str(drain))
+    proc, port = start("--snapshot-interval", "3600", "--shutdown-drain-timeout", str(drain), *_NO_BACKPRESSURE_FLAGS)
     idle = socket.create_connection(("127.0.0.1", port))
     replies = 2
     client = _stalled_client(port, replies)
@@ -247,7 +250,7 @@ def test_a_cooperative_client_exits_well_inside_the_timeout(start):
 
 def test_a_request_arriving_during_the_drain_does_not_cost_the_client_its_replies(start, tmp_path):
     replies = 4
-    proc, port = start("--snapshot-interval", "3600", "--shutdown-drain-timeout", "20")
+    proc, port = start("--snapshot-interval", "3600", "--shutdown-drain-timeout", "20", *_NO_BACKPRESSURE_FLAGS)
     client = _stalled_client(port, replies)
     expected = _bulk(b"x" * _VALUE_BYTES) * replies
     received = bytearray()
@@ -458,7 +461,7 @@ def test_the_listener_is_unregistered_before_the_save(tmp_path, scene_for):
 
 
 def test_a_connection_attempted_during_the_drain_is_not_accepted(tmp_path, scene_for):
-    server = _server(tmp_path)
+    server = _server(tmp_path, **_NO_BACKPRESSURE)
     scene = scene_for(server)
     passes = []
     late_connected = threading.Event()
@@ -490,7 +493,7 @@ def test_a_connection_attempted_during_the_drain_is_not_accepted(tmp_path, scene
 
 
 def test_the_save_runs_before_the_drain_not_after(tmp_path, scene_for):
-    server = _server(tmp_path)
+    server = _server(tmp_path, **_NO_BACKPRESSURE)
     scene = scene_for(server)
     snapshot = tmp_path / "dump.mrdb"
     at_entry = {}
@@ -617,7 +620,8 @@ def test_no_snapshot_is_written_when_no_path_is_configured(tmp_path, scene_for, 
 def test_a_failing_shutdown_save_still_drains_and_still_exits(tmp_path, scene_for):
     snapdir = tmp_path / "snap"
     snapdir.mkdir()
-    server = _server(tmp_path, snapshot_path=str(snapdir / "dump.mrdb"), shutdown_drain_timeout=5)
+    server = _server(tmp_path, snapshot_path=str(snapdir / "dump.mrdb"), shutdown_drain_timeout=5,
+                     **_NO_BACKPRESSURE)
     scene = scene_for(server)
     outcome = {}
 
@@ -708,7 +712,7 @@ def test_a_drain_that_raises_still_logs_its_one_line(tmp_path, scene_for):
 
 
 def test_a_connection_owing_nothing_is_closed_before_the_drain_loop(tmp_path, scene_for):
-    server = _server(tmp_path)
+    server = _server(tmp_path, **_NO_BACKPRESSURE)
     scene = scene_for(server)
     first_pass = []
     real_run_once = server._loop.run_once
@@ -753,7 +757,7 @@ def test_a_connection_owing_nothing_is_closed_before_the_drain_loop(tmp_path, sc
         assert quiet.recv(1) == b""
 
 def test_a_close_raising_at_teardown_still_closes_every_connection_that_owed_bytes(tmp_path, scene_for):
-    server = _server(tmp_path)
+    server = _server(tmp_path, **_NO_BACKPRESSURE)
     scene = scene_for(server)
     held = []
     owing_at_the_deadline = []
@@ -797,7 +801,7 @@ def test_a_close_raising_at_teardown_still_closes_every_connection_that_owed_byt
 
 
 def test_the_drain_dispatches_no_command(tmp_path, scene_for, monkeypatch):
-    server = _server(tmp_path)
+    server = _server(tmp_path, **_NO_BACKPRESSURE)
     scene = scene_for(server)
     dispatched = []
     real_dispatch = commands.dispatch
@@ -859,7 +863,7 @@ def test_a_zero_drain_timeout_skips_the_drain_entirely(tmp_path, scene_for):
     for timeout in (0, 1):
         home = tmp_path / ("timeout-%d" % timeout)
         home.mkdir()
-        server = _server(home, shutdown_drain_timeout=timeout)
+        server = _server(home, shutdown_drain_timeout=timeout, **_NO_BACKPRESSURE)
         scene = scene_for(server)
         inside = []
         count = [0]
@@ -914,7 +918,7 @@ def _vanish(scene, client, expected, home):
 def _drain_lines(tmp_path, scene_for, name, timeout, act=None):
     home = tmp_path / name
     home.mkdir()
-    server = _server(home, shutdown_drain_timeout=timeout)
+    server = _server(home, shutdown_drain_timeout=timeout, **_NO_BACKPRESSURE)
     scene = scene_for(server)
     real_drain = server._drain_for
 
@@ -948,7 +952,7 @@ def test_the_drain_logs_exactly_one_line_however_it_ends(tmp_path, scene_for):
     message = drained[0].getMessage()
     assert drained[0].levelno == logging.INFO and message.startswith("shutdown drain complete"), message
     assert message.endswith(": 0"), message
-    # a loss is a WARNING and a clean ending is not, so the one line a default configuration shows is the one that says something was lost
+    # a loss is a WARNING and a clean ending is not, so a configuration that shows warnings and above shows the line that says something was lost and not the one that says nothing was
     for ending, records in (("timed out", timed_out), ("skipped", skipped)):
         message = records[0].getMessage()
         assert records[0].levelno == logging.WARNING, (ending, message)
@@ -984,7 +988,7 @@ def test_a_client_that_half_closes_during_the_drain_still_receives_every_reply(t
     assert len(ends_of_input) == 1, "the end of input was read %d times" % len(ends_of_input)
 
 def test_eof_outside_the_drain_with_owed_bytes_closes_the_connection(tmp_path, scene_for):
-    server = _server(tmp_path)
+    server = _server(tmp_path, **_NO_BACKPRESSURE)
     scene = scene_for(server)
     outcome = {}
 
@@ -1006,6 +1010,8 @@ def test_eof_outside_the_drain_with_owed_bytes_closes_the_connection(tmp_path, s
 
 def test_a_client_that_disappears_during_the_drain_is_reported_as_a_loss(tmp_path, scene_for):
     records = _drain_lines(tmp_path, scene_for, "vanished", 5, act=_vanish)
+    # the drain writes exactly one line of its own. the connection that vanished also logs its close, at INFO, which is not the drain's, so that line is set aside and whatever else was written during the drain has to be the drain's one line: a second line of any other text fails the count
+    records = [r for r in records if not r.getMessage().startswith("closed connection")]
     assert len(records) == 1, [r.getMessage() for r in records]
     # closed with its replies queued, and nothing is still owed once it is gone: a line that counted only what remained at the end would call this a clean shutdown, which is exactly the case it exists to report
     assert records[0].levelno == logging.WARNING, records[0].getMessage()
@@ -1013,7 +1019,7 @@ def test_a_client_that_disappears_during_the_drain_is_reported_as_a_loss(tmp_pat
     assert _drain_counts(records[0]) == (1, 0), records[0].getMessage()
 
 def test_a_connection_fully_served_and_then_closed_is_not_counted_as_a_loss(tmp_path, scene_for):
-    server = _server(tmp_path, shutdown_drain_timeout=10)
+    server = _server(tmp_path, shutdown_drain_timeout=10, **_NO_BACKPRESSURE)
     scene = scene_for(server)
     real_drain = server._drain_for
 
@@ -1039,6 +1045,8 @@ def test_a_connection_fully_served_and_then_closed_is_not_counted_as_a_loss(tmp_
             assert len(_read_total(owing, expected)) == expected
 
         scene.run(scenario)
+    # the drain writes exactly one line of its own. the connection that was served and closed while the drain waited on the other also logs its close, at INFO, which is not the drain's, so that line is set aside and whatever else was written during the drain has to be the drain's one line: a second line of any other text fails the count
+    log.records = [r for r in log.records if not r.getMessage().startswith("closed connection")]
     assert len(log.records) == 1, [r.getMessage() for r in log.records]
     # closed with an empty buffer is closed after everything was handed to the kernel, and only a close that discarded a reply is a loss: counting this one would report a clean shutdown as incomplete
     assert log.records[0].levelno == logging.INFO, log.records[0].getMessage()
@@ -1047,7 +1055,7 @@ def test_a_connection_fully_served_and_then_closed_is_not_counted_as_a_loss(tmp_
 
 def test_the_drain_discards_what_arrives_instead_of_holding_it(tmp_path, scene_for, monkeypatch):
     flood = 8 << 20
-    server = _server(tmp_path, shutdown_drain_timeout=10)
+    server = _server(tmp_path, shutdown_drain_timeout=10, **_NO_BACKPRESSURE)
     scene = scene_for(server)
     left_standing = []
     read_in_drain = [0]
@@ -1087,7 +1095,7 @@ def test_the_drain_discards_what_arrives_instead_of_holding_it(tmp_path, scene_f
 
 
 def test_the_drain_waits_for_every_connection_that_owes_bytes(tmp_path, scene_for):
-    server = _server(tmp_path, shutdown_drain_timeout=10)
+    server = _server(tmp_path, shutdown_drain_timeout=10, **_NO_BACKPRESSURE)
     scene = scene_for(server)
     outcome = {}
 

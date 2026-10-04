@@ -599,6 +599,106 @@ def test_open_listener_raises_listen_failed_and_closes_the_socket_it_opened():
         squatter.close()
 
 
+def _can_bind(address):
+    # asked of a socket and not inferred from the platform: whether this machine will let a
+    # listener hold the address
+    probe = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    try:
+        probe.bind((address, 0))
+    except OSError:
+        return False
+    finally:
+        probe.close()
+    return True
+
+
+def test_a_server_given_a_name_listens_on_the_address_it_resolves_to():
+    # the host reaches bind() as given, so a name works where an address does. "localhost"
+    # resolves to the loopback address the default is, which exposes nothing the default does
+    # not, and is not the string the default is spelt as
+    server = Server(0, host="localhost")
+    try:
+        listener = server._open_listener()
+        try:
+            host, port = listener.getsockname()[:2]
+            assert host == "127.0.0.1", host
+            socket.create_connection(("127.0.0.1", port), timeout=5).close()
+        finally:
+            listener.close()
+    finally:
+        server._loop.close()
+
+
+def test_a_server_given_a_second_loopback_address_listens_there_and_nowhere_else():
+    # the strongest form of "the host is carried": an address that is not the default's, bound
+    # and connected to, with the default's refused at the same port. Linux gives every address in
+    # 127.0.0.0/8 to the loopback interface, so a second one is available and exposes nothing
+    # beyond this machine. macOS gives lo0 only 127.0.0.1, and there the neighbouring tests are
+    # what show the host being carried
+    if not _can_bind("127.0.0.2"):
+        pytest.skip("this machine's loopback interface holds only 127.0.0.1")
+    server = Server(0, host="127.0.0.2")
+    try:
+        listener = server._open_listener()
+        try:
+            host, port = listener.getsockname()[:2]
+            assert host == "127.0.0.2", host
+            socket.create_connection(("127.0.0.2", port), timeout=5).close()
+            with pytest.raises(ConnectionRefusedError):
+                socket.create_connection(("127.0.0.1", port), timeout=5)
+        finally:
+            listener.close()
+    finally:
+        server._loop.close()
+
+
+def test_a_server_binds_the_host_it_was_given_and_names_it_when_that_fails():
+    # an address no interface here holds cannot be bound, so a bind that reached the default
+    # instead would succeed and this would not raise; and the line that reports the failure
+    # names the address that failed. the one address in the range reserved for documentation
+    # (RFC 5737) is used because nothing is ever assigned it, and a machine that binds
+    # addresses it does not hold -- ip_nonlocal_bind on Linux -- has nothing to refuse it
+    unowned = "192.0.2.1"
+    if _can_bind(unowned):
+        pytest.skip("this machine binds addresses it does not hold")
+    server = Server(0, host=unowned)
+    try:
+        with pytest.raises(ListenFailed) as refusal:
+            server._open_listener()
+        assert str(refusal.value).startswith("cannot listen on %s:0: " % unowned), refusal.value
+        assert "127.0.0.1" not in str(refusal.value), refusal.value
+    finally:
+        server._loop.close()
+
+
+def test_main_names_the_host_it_was_given_on_the_line_a_failed_bind_exits_with(
+        monkeypatch, tmp_path):
+    # the failed-bind test above reads the line for the default host, which is the one value a
+    # host that main() never passed along would also produce. "localhost" is held at 127.0.0.1
+    # by a socket of the test's own, so the bind fails whichever of the two names it is given,
+    # and the only thing that can put "localhost" on the line is the host reaching the Server
+    monkeypatch.setattr(logging, "basicConfig", lambda **kwargs: None)
+    squatter = socket.socket()
+    squatter.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    squatter.bind(("127.0.0.1", 0))
+    squatter.listen(1)
+    port = squatter.getsockname()[1]
+    try:
+        err = io.StringIO()
+        try:
+            with contextlib.redirect_stderr(err):
+                main(["--host", "localhost", "--port", str(port), "--snapshot-interval", "0",
+                      "--snapshot-path", str(tmp_path / "dump.mrdb")])
+            pytest.fail("main() started on a port another socket already holds")
+        except SystemExit as exc:
+            assert exc.code == 1, exc.code
+        output = err.getvalue()
+        assert output.startswith("error: cannot listen on localhost:%d: " % port), output
+        assert output.count("\n") == 1, output
+    finally:
+        squatter.close()
+
+
 def test_a_close_that_raises_still_leaves_the_set_clean():
     # Connection.close() sets its flag before it touches the socket, so a raise there would strand
     # the connection in _connections with every later _close returning at the idempotence guard
@@ -664,9 +764,9 @@ def test_the_boundary_closes_one_connection_and_leaves_the_others(caplog):
     finally:
         registry.COMMANDS[b"ECHO"] = original
 
-    # the boundary logs at ERROR with the traceback. caplog rather than stderr: pytest attaches a
-    # root handler, so logging.lastResort -- which carries it to stderr in the real server -- is
-    # never reached under the suite
+    # the boundary logs at ERROR with the traceback. caplog rather than stderr: pytest attaches its
+    # own handler to the root logger, and the stderr handler main() configures for the real server
+    # is not the one that receives the record under the suite
     boundary = [r for r in caplog.records if r.levelname == "ERROR" and r.exc_info]
     assert boundary, caplog.records
     assert boundary[0].exc_info[0] is ZeroDivisionError, boundary[0].exc_info
@@ -981,13 +1081,13 @@ def test_one_readable_event_dispatches_every_buffered_command():
         assert replies == b"+PONG\r\n" * N, (len(replies), N * 7)
 
 
-def test_one_batch_cannot_queue_past_the_output_buffer_limit(server_and_client):
+def test_one_batch_cannot_queue_past_the_write_buffer_limit(server_and_client):
     # the limit is consulted inside the dispatch loop as well as after the batch, because
     # one recv() can carry thousands of commands: checked only after the batch, a client
     # that stops reading gets the whole batch queued first, and a 4 MiB limit was measured
     # letting 104 MiB accumulate before it noticed
     server, client = server_and_client
-    server.output_buffer_limit = 64 * 1024
+    server.write_buffer_limit = 64 * 1024
     conn, = server._connections
     value = b"v" * 32768
     client.sendall(b"*3\r\n$3\r\nSET\r\n$1\r\nk\r\n$%d\r\n" % len(value) + value + b"\r\n")
@@ -1001,7 +1101,7 @@ def test_one_batch_cannot_queue_past_the_output_buffer_limit(server_and_client):
     assert conn.closed, "a batch must not queue past the limit unchecked"
     assert len(conn.write_buffer) < 40 * len(value), (
         "queued %d bytes against a %d byte limit -- the in-loop check did not fire"
-        % (len(conn.write_buffer), server.output_buffer_limit)
+        % (len(conn.write_buffer), server.write_buffer_limit)
     )
 
 
@@ -1013,7 +1113,7 @@ def test_a_pipeline_whose_replies_keep_draining_is_never_closed_by_the_limit(ser
     # closed like any other, which redis-server 7.2.7 does too under an equivalent
     # client-output-buffer-limit.
     server, client = server_and_client
-    server.output_buffer_limit = 4096
+    server.write_buffer_limit = 4096
     conn, = server._connections
     client.sendall(b"*1\r\n$4\r\nPING\r\n" * 2000)
     seen = b""

@@ -193,9 +193,9 @@ def test_an_inline_line_exactly_at_the_ceiling_is_accepted():
 
 def test_an_unterminated_inline_line_is_bounded_by_no_size():
     # a line that has not ended has no declared length to compare against anything, so it
-    # stays unbounded here, deferred to the future --incomplete-command-timeout flag.
-    # this test's whole job is to fail if that deferral is closed by accident -- a pinned
-    # absence rather than a pinned behaviour, and it reads as deletable without this
-    # comment
+    # stays unbounded in size here and is bounded in time by --incomplete-command-timeout.
+    # this test's whole job is to fail if the parser is given a size bound for it by
+    # accident -- a pinned absence rather than a pinned behaviour, and it reads as deletable
+    # without this comment
     line = b"ECHO " + b"A" * (resp.MAX_INLINE_SIZE * 3)
     assert resp.parse_command(line) == (None, 0, 0)
