@@ -162,10 +162,12 @@ that a single line says how many times in a row it has now failed, once per hund
 That bound is not cosmetic. Logging writes to standard error with a blocking write, and
 this server has one thread, so a reader that stops — a stalled collector, a pipeline
 whose far end died — can fill its buffer and park the loop inside the tick, after which
-nothing is served and nothing more is logged. A failure that repeats on a timer is the
-one thing that can fill that buffer on its own, and the bound above stops it. The
-residual is that a buffer filled from elsewhere still parks the next write, and closing
-that needs either a descriptor this process does not own or a second thread. A save writes a
+nothing is served and nothing more is logged. A failure that repeats on a timer would
+write a traceback every interval for as long as the server ran, and the bound above stops
+that one; it is not the only writer that can fill the buffer, and the connection lines
+further down are the others. The residual is that a buffer filled from any of them still
+parks the next write, and closing that needs either a descriptor this process does not own
+or a second thread. A save writes a
 temporary file beside the snapshot, named after it, and renames it into place; a file
 left under that name, as a process killed mid-save leaves one, is never read or removed,
 and every start over the same path names it in a warning, so long as the directory can
