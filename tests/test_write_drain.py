@@ -402,7 +402,7 @@ def test_a_flush_during_the_drain_does_not_restore_reading_that_end_of_input_swi
     assert _mask(server, conn) == READ | WRITE
 
 
-def test_a_batch_that_pauses_the_connection_leaves_the_deadline_suspended(make_connection):
+def test_the_deadline_is_armed_before_the_dispatch_that_pauses_the_connection(make_connection):
     # the deadline for a half-sent command is armed when the batch is read and suspended by
     # the pause, and the order matters: a batch that fills the queue past the mark and ends
     # on the first half of a command pauses the connection while a command is outstanding,

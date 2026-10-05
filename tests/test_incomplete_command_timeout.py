@@ -15,14 +15,44 @@ pair without writing megabytes. Every Server a test builds closes its selector i
 finally.
 """
 
+import contextlib
 import selectors
 import socket
+import types
 
 import pytest
 
+import server as server_mod
 from connection import Connection
 from server import Server
-from tests.test_periodic_tasks import _injected_clock
+
+
+class _Clock:
+    def __init__(self, start=1_000.0):
+        self.t = start
+
+    def monotonic(self):
+        return self.t
+
+
+@contextlib.contextmanager
+def _injected_clock(start=1_000.0):
+    # the server module's own `time` is rebound, not time.monotonic itself: patching the
+    # real function reaches every module in this process.
+    # a local copy rather than an import of the same helper in tests/test_periodic_tasks.py:
+    # that name is private there, so reaching across for it means a rename in that file
+    # breaks this one silently, and this module would be the one that looked broken. the
+    # three-name namespace is the contract -- monotonic, time and sleep -- and a drift in it
+    # is a loud AttributeError here rather than a quiet wrong answer
+    clock = _Clock(start)
+    real = server_mod.time
+    server_mod.time = types.SimpleNamespace(
+        monotonic=clock.monotonic, time=real.time, sleep=real.sleep
+    )
+    try:
+        yield clock
+    finally:
+        server_mod.time = real
 
 TIMEOUT = 30
 START = 1_000.0
