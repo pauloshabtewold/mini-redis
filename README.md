@@ -5,34 +5,281 @@ over TCP, with **zero runtime dependencies**.
 
 ## Status
 
-Early. The server accepts connections, parses RESP2 correctly — multibulk arrays and
-inline commands, well-formed or not — and its command set is complete: twenty-six
-commands — `PING`, `ECHO`, `HELLO`, `SET`, `GET`, `DEL`, `EXISTS`, `TYPE`, `EXPIRE`,
-`PEXPIRE`, `PEXPIREAT`, `TTL`, `PTTL`, `INCR`, `DECR`, `LPUSH`, `RPUSH`, `LPOP`, `RPOP`,
-`LRANGE`, `LLEN`, `DBSIZE`, `KEYS`, `FLUSHALL`, `INFO`, `CONFIG`. Keys expire lazily, on
-lookup, and on a sampled active sweep: `--expiry-sweep-interval` bounds how often that
-sweep runs, not how long any one expired key stays resident. Each pass samples a few of
-the keys that carry a TTL and deletes the expired ones, so nothing bounds when a
-particular key is reclaimed — which is why expiry on lookup is still the load-bearing
-half: a key you ask for is never served stale, whatever the sweep has reached.
+This is `v1`, and it is finished. The server accepts connections, parses RESP2 correctly
+— multibulk arrays and inline commands, well-formed or not — and its command set is
+complete: twenty-six commands — `PING`, `ECHO`, `HELLO`, `SET`, `GET`, `DEL`, `EXISTS`,
+`TYPE`, `EXPIRE`, `PEXPIRE`, `PEXPIREAT`, `TTL`, `PTTL`, `INCR`, `DECR`, `LPUSH`,
+`RPUSH`, `LPOP`, `RPOP`, `LRANGE`, `LLEN`, `DBSIZE`, `KEYS`, `FLUSHALL`, `INFO`,
+`CONFIG`. Keys expire lazily, on lookup, and on a sampled active sweep:
+`--expiry-sweep-interval` bounds how often that sweep runs, not how long any one expired
+key stays resident. Each pass samples a few of the keys that carry a TTL and deletes the
+expired ones, so nothing bounds when a particular key is reclaimed — which is why expiry
+on lookup is still the load-bearing half: a key you ask for is never served stale,
+whatever the sweep has reached.
 
-One consequence of that command list is worth knowing before you reach for a client
-library. `INCRBY` and `DECRBY` are not among them, and `redis-py` defines `.incr()` and
-`.decr()` as aliases for them — so `r.incr("k")` puts `INCRBY` on the wire and comes back
-`ERR unknown command 'INCRBY'`, even though this server implements `INCR` and answers it
-correctly. `r.execute_command("INCR", "k")` reaches it. `redis-py`'s `.lpop(name, count)`
-has the same shape: it sends `LPOP name count` on the wire, and this server's exact
-two-argument arity for `LPOP` answers a wrong-number-of-arguments error rather than the
-two-element reply real Redis would give. The one that costs the most is `pipeline()`,
-whose `transaction` argument defaults to true: the default call wraps the batch in
-`MULTI`/`EXEC`, neither of which this server implements, so it fails on `EXEC`.
-`r.pipeline(transaction=False)` sends the same commands and works for a batch of some
-tens of thousands of small commands. It packs the whole batch and writes it before it
-reads any reply, which is the client the pause described under the water marks below
-leaves hanging, so a batch of hundreds of thousands can hang it at the shipped defaults;
-`--write-buffer-high-water 0` is what lets it complete. `redis-benchmark`'s default run
-completes `PING`, `SET`, `GET`, `INCR`, `LPUSH`, `RPUSH`, `LPOP` and `RPOP`, and exits at
-`SADD`, the first command in its sequence this server does not implement at all.
+Two parts of the design are not in it. Rate limiting and replication are specified in
+full and deliberately unbuilt, and [Designed and not built](#designed-and-not-built)
+says what that leaves behind in the code. [Benchmark](#benchmark) has what the server
+costs against real Redis, and [Limits](#limits) is the long list of what it does and
+does not do under pressure.
+
+## Benchmark
+
+I took these numbers with `redis-benchmark 7.2.7`, from Homebrew, against this server
+and against a private `redis-server 7.2.7`, each on a port of its own, on one Apple M2
+running macOS 14.2.1 over loopback, with this server under CPython 3.13.1.
+
+```
+$ redis-benchmark --version
+redis-benchmark 7.2.7
+```
+
+The reference ran with `--save ""` and `--appendonly no`, from a scratch directory. This
+server ran with `--snapshot-interval 0 --log-level WARNING`, also from a scratch
+directory. The invocation was the same against both, 100,000 requests per test over 50
+connections:
+
+```bash
+redis-benchmark -h 127.0.0.1 -p <port> -n 100000 -c 50 -P 1 -q \
+  -t ping_mbulk,set,get,incr,lpush,rpush,lpop,rpop,lrange_100,lrange_600
+```
+
+`-q` prints a rate and nothing else, so the table below comes from the same command
+without `-q`, the only form that reports the latency distribution; each row's rate and
+p99 come from the same run. The list is pinned because the tool's default run stops at
+`SADD`, the first command in its sequence this server does not implement (see
+[Limits](#limits)). Whether all ten tests actually ran was checked by reading the labels
+on the result lines and not the exit status, for the reason in the third finding below.
+
+| test | this server, requests per second | redis-server 7.2.7, requests per second | % of native | this server, p99 (ms) | redis-server 7.2.7, p99 (ms) |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| PING_MBULK | 84,962 | 115,875 | 73.3% | 1.247 | 0.567 |
+| SET | 61,805 | 117,786 | 52.5% | 1.887 | 0.455 |
+| GET | 74,349 | 106,724 | 69.7% | 1.503 | 0.927 |
+| INCR | 69,541 | 116,414 | 59.7% | 1.511 | 0.679 |
+| LPUSH | 70,922 | 109,170 | 65.0% | 1.351 | 0.663 |
+| RPUSH | 68,166 | 113,250 | 60.2% | 1.503 | 0.487 |
+| LPOP | 73,421 | 106,610 | 68.9% | 1.423 | 0.783 |
+| RPOP | 77,700 | 116,279 | 66.8% | 1.247 | 0.575 |
+| LRANGE_100 | 25,202 | 46,512 | 54.2% | 3.927 | 1.479 |
+| LRANGE_600 | 8,382 | 13,240 | 63.3% | 11.359 | 2.743 |
+
+With `-P 16`, the same command and the same list, so sixteen requests are in flight on
+each connection, `-q` stays on and there is no p99 to report:
+
+| test | this server, requests per second | redis-server 7.2.7, requests per second | % of native |
+| --- | ---: | ---: | ---: |
+| PING_MBULK | 336,700 | 1,428,571 | 23.6% |
+| SET | 200,401 | 1,063,830 | 18.8% |
+| GET | 253,807 | 1,162,791 | 21.8% |
+| INCR | 194,553 | 1,190,476 | 16.3% |
+| LPUSH | 204,499 | 980,392 | 20.9% |
+| RPUSH | 208,768 | 934,579 | 22.3% |
+| LPOP | 249,377 | 840,336 | 29.7% |
+| RPOP | 230,415 | 961,538 | 24.0% |
+| LRANGE_100 | 41,597 | 88,731 | 46.9% |
+| LRANGE_600 | 9,245 | 15,482 | 59.7% |
+
+These are two readings of one server, and only the second is the cost of the design. At
+`-c 50 -P 1` each client sends a request and waits for the reply, so both servers spend
+most of every request waiting on the loopback round trip, and the ratio measures the
+network about as much as it measures the server. This server ran at 52.5% to 73.3% of
+native there, median 64.1%, and that figure overstates how close it is. With `-P 16` the
+clients keep the server busy and the ratio is what a single-threaded Python interpreter
+costs per command: the eight small-reply commands, `PING_MBULK` through `RPOP`, ran at
+16.3% to 29.7% of native, median 22.1%, and the two `LRANGE` tests at 46.9% and 59.7%.
+Take the `-P 16` figure as what the design costs. The `-P 1` figure is what 50 clients
+that do not pipeline see over loopback.
+
+I fixed the ship threshold before measuring: 8% of native or better ships as it is, and
+a miss would have bought one profiling and optimisation session. Both readings clear it
+by a wide margin, so this is the version that shipped and no optimisation pass was run.
+I did not profile either: `py-spy` needs root on macOS, nothing in this project runs as
+root, and the profile existed only for a result that missed.
+
+Three facts make these numbers reportable, and each is stated because its absence would
+change them. The snapshot interval was `0` for every run of this server, so no periodic
+save fell inside a measurement: a save blocks the one thread that answers clients, and a
+run that crossed one would carry an unattributed stall inside its p99. The snapshot path
+was still empty after the runs, which is how I know none fired. The rate limiter is not
+built, so it was off by construction and not by configuration; a limiter that was on
+would have tripped under `-c 50` at once and the benchmark would have measured its
+rejection path. And the log level was `WARNING`, which leaves out the line this server
+writes at `INFO` for each connection it opens and closes.
+
+## Three findings
+
+Each of these came from testing something that looked fine, and none of them is visible
+in the code unless it is written down here.
+
+**A length-prefixed format does not make a checksum redundant.** The argument for
+leaving one out is that every length prefix is a bounds check, so a corrupt snapshot
+fails at a known offset. Truncation does: it is refused at every offset. A flipped bit
+mostly does not. I ran 3,000 single-bit-flip trials, one random bit each, against the
+shipping encoder: a 2,036-byte snapshot of 41 keys holding a list and a TTL, 16,288 bit
+positions. Decoded with the trailer recomputed over the corrupted bytes, which is what a
+length-prefixed format with no checksum amounts to, **81.0% of the flips were silently
+accepted as a snapshot holding different data** and only 19.0% were caught at all -- 475
+of those by a length prefix running off the end, 48 by a type byte that named no kind,
+and 5 by a key arriving twice. With the CRC32 trailer in place, all 3,000 were refused,
+100%. The reason is that most bytes in a snapshot are payload and not structure, so a
+flip inside a key, a value or an expiry passes every bounds check there is.
+`HELLOWORLD` came back as `HELLOWOVLD`; a key named `beta` came back as `beua`, so
+`GET beta` answered nil and a
+key nobody wrote existed; an expiry of 1700000000000 came back as 1699995805696.
+`tests/test_persistence_properties.py` pins both sides, and `docs/DESIGN.md` has the
+other half of the picture, the count and version fields, where the length prefixes do
+catch every flip.
+
+**A bare `send()` is not a write path.** Against a copy of this server whose only write
+path was one `send()` with nothing behind it to catch what the kernel would not take, a
+long pipeline of `ECHO`s written before the client read a byte lost a large share of its
+replies, a different share on every run. One reply arrived cut in half, and almost every
+later one was never sent at all, because a `send()` on a full socket raises
+`BlockingIOError` and writes nothing, so what is lost is a whole reply. Nothing about
+that is visible until a client's burst outruns its own reading, which is what any
+pipelining client library does. The write path here queues what the kernel will not take
+and sends it on the next writable event; `docs/DESIGN.md` has the counts and how they
+were taken.
+
+**`redis-benchmark` drops an unrecognised `-t` name and still exits 0.** Measured on
+7.2.7, the version the numbers above were taken with: `-t nosuchtest` printed nothing at
+all, wrote nothing to standard error and exited 0; `-t set,nosuchtest` ran `SET` and
+dropped the rest without a word, exit 0; and the pinned list with `lrange_100` misspelt
+as `lrange100` ran nine tests, printed a table that looks complete, and exited 0 with the
+`LRANGE_100` line simply absent. A missing test is invisible in a table of results,
+so neither the exit status nor the number of lines is a check, and I read the labels.
+The rule has three steps and they run in this order. Split the output into lines on `\r`
+as well as `\n`, because with `-q` each result is preceded by carriage-returned progress
+repaints. Discard every line that begins `LPUSH (needed to benchmark LRANGE)`: the tool
+prints it to seed the list for the two `LRANGE` tests, it contains the word `LPUSH`, and
+it appears whether or not the `LPUSH` test ran. Then require each of the ten names to
+begin one of the remaining lines, followed by `:` or ` (`, because the two `LRANGE`
+labels carry a parenthetical.
+
+On 7.2.7, at the pinned request count, the real run reports nothing missing, with 8
+lines carrying the seeding label. With `lpush` dropped from the list, so nine names, the
+tool still exits 0 and the rule reports `LPUSH` missing, while a plain search for
+`LPUSH` anywhere in the output and a rule that discards exactly one seeding line both
+report nothing missing. The number of seeding lines is not fixed, because the tool
+repaints that line while it seeds, so how many there are depends on how long seeding
+takes; at a small request count there can be just one, and the singular rule and the
+plural one agree. I verified the rule at the pinned count for that reason. Deleting the
+`\r` characters instead of splitting on them failed a correct run at small request
+counts on 6.2.14 and did not on 7.2.7 at 1,000, 2,000 or 100,000, so the split is kept
+as the reading that is right on both.
+
+## Designed and not built
+
+Two parts of the design are specified in full and deliberately unbuilt: a per-connection
+sliding-window rate limiter, and leader-follower replication. `ratelimit.py` and
+`replication.py` each hold a docstring and nothing else, and that is a decision and not
+an omission. I cut both on purpose, at the point where stopping left nothing half-built
+in the tree, and I do not intend to build them; this is `v1` and there is no later
+version in which they are finished.
+
+The limiter was to count requests per connection over a window, with a deque of
+timestamps popped from the left so that a check costs the same however busy the
+connection is, and to answer an over-limit request with an error while leaving the
+connection open. It would have been off by default, because a limit switched on trips
+under `redis-benchmark -c 50` immediately and the benchmark would then measure the
+rejection path. It limits a connection and not an address, so a client could reset its
+budget by reconnecting; I would have documented that rather than engineered it away.
+Replication was to be asynchronous: a follower connects, is sent the leader's keyspace
+in the snapshot format as one bulk string, and then receives a live stream of what each
+handler reports as its effects, plus the `DEL`s that expiry produces, in execution
+order. A follower would have applied that stream through its own dispatcher, and the
+leader's link to its own leader would have been a third kind of connection, exempt from
+the limits a client is under.
+
+Because the design was written before it was cut, three things in the code are present
+and cannot be reached, and I would rather say so than leave them to be found.
+
+`Connection` knows three roles, `client`, `follower` and `leader_link`, and the tests
+construct a connection with the second; nothing in the server does. Every accepted
+connection is a `client`, and no flag sets either of the other two: the flag that would
+have started a server as a follower was never written. The extra values are there
+because a check written against two roles misclassifies the link to a leader as an
+ordinary client, and with nothing to exempt they exempt nothing. The `rate_limit_state`
+and `replication_state` slots on `Connection` are the same kind of thing: they hold
+`None` and nothing reads them.
+
+Every command handler returns its reply together with an effects list, the commands a
+follower would need replayed. A write that takes effect fills it in and everything else
+returns it empty. `server.py` reads the list and throws it away, together with the
+store's own queue of expiry deletions, which it empties after each command only so that
+the queue cannot grow. Nothing consumes either. The shape stayed because the alternative
+was editing every handler a second time on the day something did, and because a key that
+expires on a `GET` has to produce a `DEL` with no write command in the request to carry
+it; `docs/DESIGN.md` has the reasoning.
+
+`PEXPIREAT` is registered for a stream that does not exist. It works as an ordinary
+command, and it is also the absolute form that `EXPIRE` and `PEXPIRE` report as their
+effect, so that a follower applying it later would compute the same deadline. The
+follower would have applied it through the same dispatcher a client uses. With no
+stream, that effect goes nowhere.
+
+## Alternatives I rejected
+
+Three questions come up whenever this design is described. Each has an answer that is a
+choice and not an oversight.
+
+**Why not several processes behind `SO_REUSEPORT`?** It is the obvious way past the GIL
+and it is perhaps twenty lines: start several processes and let the kernel spread
+incoming connections across their listening sockets. I rejected it because every process
+would hold its own keyspace. A `SET` on a connection the kernel sent to one process
+would be invisible to a `GET` on a connection it sent to another, so the result is
+several unrelated servers sharing a port and not one faster server, and making them
+agree needs cross-process coordination, which is a different and much larger project
+than this one. One thread also makes every command atomic by construction: `INCR` and
+`SET ... NX` need no lock because nothing else runs while they do. The price is the
+`-P 16` figure above, and I chose to publish it over buying it back with processes that
+no longer share anything.
+
+**Why does a snapshot block the loop, and why not `fork()`?** Real Redis calls `fork()`
+and lets a copy-on-write child serialize a point-in-time view while the parent keeps
+answering. That is the right answer at scale and the one this design gives up. I
+rejected it on cost and not on correctness: it needs a process boundary and a way to get
+the result back to the parent, and it interacts badly with a single-threaded parent's
+socket state, because the child inherits every open client connection and the listener.
+The alternatives that stay in one process and do not fork tear: serializing in chunks
+that yield between them lets a write land mid-save and produces a file that decodes
+cleanly into a keyspace that never existed. So the pause is accepted whole and priced,
+and the persistence paragraphs under [Limits](#limits) give what a save costs on a
+stated fixture. `docs/DESIGN.md` has the argument for why even a cheap in-process copy
+does not remove the pause.
+
+**Why would every reconnect cost a full sync, and why not `PSYNC`?** Replication is the
+unbuilt half, so this is a decision about a design that never ran. A follower that lost
+its connection to the leader would have asked for the whole keyspace again.
+`PSYNC`-style partial resync lets it say where it stopped instead, and it needs the
+leader to keep a backlog of the stream and to do offset bookkeeping so that it can
+answer. I rejected it because that machinery demonstrates nothing the full sync does
+not: the full sync already shows an architecture in which a follower converges on its
+leader after any interruption, and partial resync would only make reconnecting cheaper.
+The price would have been that every reconnect costs the leader a serialization and the
+follower a decode of the whole keyspace.
+
+## Limits
+
+One consequence of the command list under Status is worth knowing before you reach for a
+client library. `INCRBY` and `DECRBY` are not among them, and `redis-py` defines
+`.incr()` and `.decr()` as aliases for them — so `r.incr("k")` puts `INCRBY` on the wire
+and comes back `ERR unknown command 'INCRBY'`, even though this server implements `INCR`
+and answers it correctly. `r.execute_command("INCR", "k")` reaches it. `redis-py`'s
+`.lpop(name, count)` has the same shape: it sends `LPOP name count` on the wire, and
+this server's exact two-argument arity for `LPOP` answers a wrong-number-of-arguments
+error rather than the two-element reply real Redis would give. The one that costs the
+most is `pipeline()`, whose `transaction` argument defaults to true: the default call
+wraps the batch in `MULTI`/`EXEC`, neither of which this server implements, so it fails
+on `EXEC`. `r.pipeline(transaction=False)` sends the same commands and works for a batch
+of some tens of thousands of small commands. It packs the whole batch and writes it
+before it reads any reply, which is the client the pause described under the water marks
+below leaves hanging, so a batch of hundreds of thousands can hang it at the shipped
+defaults; `--write-buffer-high-water 0` is what lets it complete. `redis-benchmark`'s
+default run completes `PING`, `SET`, `GET`, `INCR`, `LPUSH`, `RPUSH`, `LPOP` and `RPOP`,
+and exits at `SADD`, the first command in its sequence this server does not implement at
+all.
 
 A `redis-py` client that asks for RESP3 by default, as the one this suite runs against
 does, sends `HELLO 3` as it connects, and this server answers `NOPROTO unsupported
@@ -80,8 +327,7 @@ already grown — real Redis has the same property and documents it. `INFO`'s
 `/proc`: it reads `/proc/self/statm` where that exists and falls back to
 `resource.getrusage(...).ru_maxrss`, a high-water mark, so the two figures agree right
 after a bulk load and diverge for a server that has since freed memory back to the
-allocator. `ratelimit.py` and `replication.py` are declared and empty: neither feature
-is built.
+allocator.
 
 **A queue of replies has two marks and a ceiling.** `--write-buffer-high-water BYTES`
 (default 1 MiB) stops reading a connection while more than BYTES of replies are queued
@@ -219,7 +465,8 @@ about 80.4 ms to deserialize, a 12.7 MiB payload, and about 117.2 MiB of peak re
 memory in a process that builds the keyspace, serializes it and then decodes the payload
 back into a second copy (`resource.getrusage(RUSAGE_CHILDREN).ru_maxrss`). The fixture
 is stated because the payload is a function of it, and the figures come from measuring
-the tree that ships.
+the tree that ships. These figures are published here, and `docs/DESIGN.md` cites
+them without repeating them.
 
 **Two more flags cover the way out and the way in.** `--shutdown-drain-timeout SECONDS`
 (default `5`) bounds the drain, which is the part of the way out that waits on clients,
@@ -387,6 +634,37 @@ The `listening on 127.0.0.1:<port>` line at startup is what tells you this one a
 .venv/bin/python -m pytest
 ```
 
+The four crash-consistency tests kill a real server with `SIGKILL` and check what a
+restart recovers. Each run takes seconds where the rest of the suite takes milliseconds,
+so `pyproject.toml` deselects them, and
+`python -m pytest -m manual tests/test_crash_consistency.py` selects them.
+
+### In a container
+
+```bash
+docker build -t mini-redis .
+docker run -d --name mini-redis -p 127.0.0.1:7000:6379 -v mini-redis-data:/data mini-redis
+redis-cli -p 7000 PING
+docker stop mini-redis
+```
+
+The image exposes port 6379, which the `-p` above publishes on loopback as 7000. It runs
+the server as a non-root user whose uid is fixed so that a volume written by one build
+is writable by the next, and keeps its snapshot at `/data/dump.mrdb`, inside a volume,
+so that stopping the container and starting another over the same volume keeps the
+keyspace. Inside the container the server listens on every interface, because a
+published port is unreachable otherwise, and it has no authentication: a bare
+`-p 6379:6379` offers every key to whatever can reach the host, so publish to loopback
+as above unless you mean otherwise.
+
+The `CMD` is in exec form on purpose. The server is then PID 1 and receives the
+`SIGTERM` that `docker stop` sends, which is what makes it save and drain on the way
+out. In shell form PID 1 is the shell, which does not forward the signal: `docker stop`
+took 10.23 s, the container exited 137 and no snapshot was written, against 0.23 s, exit
+0 and a snapshot written with the exec form. `docker stop` waits ten seconds by default
+before it sends `SIGKILL`, so a keyspace whose save takes longer than that needs
+`docker stop -t`.
+
 ## What's interesting here
 
 **Incremental RESP2 parsing.** `resp.py` parses a multibulk array a step at a time — header,
@@ -429,10 +707,12 @@ connection.py   per-connection socket, read/write buffers, lifecycle
 resp.py         RESP2 parser and serializer
 store.py        keyspace, expiry index, pending-effects queue
 persistence.py  versioned snapshot format, atomic save/load
-ratelimit.py    docstring only; rate limiting is not built
-replication.py  docstring only; replication is not built
+ratelimit.py    docstring only; designed in full and deliberately unbuilt
+replication.py  docstring only; designed in full and deliberately unbuilt
 commands/       __init__.py, registry.py, server.py, string.py and list.py; twenty-six commands total
-tests/          pytest suite, run in CI against Python 3.11 and 3.13
+Dockerfile      single-service image: non-root user, snapshot in a volume at /data
+.dockerignore   the build context is an allowlist of the files the image runs from
+tests/          pytest suite, run in CI against Python 3.11 and 3.13; the crash tests are manual
 ```
 
 [Design notes](docs/DESIGN.md) cover why each of these is shaped the way it is, and the
