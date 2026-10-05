@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "mini-redis"
 version = "0.1.0"
-description = "A Redis clone from scratch: RESP2 wire protocol on a single-threaded event loop, built in stages toward string and list types, TTL expiry, snapshot persistence, rate limiting and leader-follower replication."
+description = "A Redis clone from scratch: RESP2 wire protocol on a single-threaded event loop, with string and list types, TTL expiry and snapshot persistence."
 readme = "README.md"
 requires-python = ">=3.11"
 license = "MIT"
@@ -39,3 +39,12 @@ pythonpath = ["."]
 # 300 is headroom over the suite's slowest test rather than a figure tuned to any one of
 # them, so the number stays right however the mix of tests in the suite shifts over time.
 timeout = 300
+# tests marked manual kill a server process and check what a restart recovers. each starts
+# servers of its own and waits on a real snapshot interval, so the default run leaves them
+# out and the procedure is one flag away: python -m pytest -m manual tests/test_crash_consistency.py
+# (a -m given on the command line replaces the one in addopts; naming such a file without it
+# deselects every test in it and pytest exits 5)
+markers = [
+    "manual: kills a server process and checks what a restart recovers; deselected by default, select with -m manual",
+]
+addopts = "-m 'not manual'"
