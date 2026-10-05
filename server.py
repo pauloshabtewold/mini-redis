@@ -858,8 +858,9 @@ class Server:
             # effects the lookups inside THIS command produced, so they precede the
             # command's own -- an INCR that lazily expired its key must be preceded by the
             # DEL, or a follower ends with the key absent while this server holds the new
-            # value. both lists are discarded because nothing propagates yet -- that lands
-            # in a later feature -- and the drain still runs because lazy expiry fills the
+            # value. both lists are discarded because nothing consumes them: the only
+            # reader an effect was ever for is replication, which is specified in full and
+            # deliberately unbuilt, and the drain still runs because lazy expiry fills the
             # queue from here on and nothing else would ever empty it
             self._store.take_effects()
             conn.queue(response)
@@ -905,9 +906,10 @@ class Server:
         # its own reading would create, and both sides wait forever. the pause below
         # refuses to read anyway and accepts that cost, because it holds a slow reader
         # where the limit alone would close it; docs/DESIGN.md has why. the reference
-        # closes here too. replication will need its own links exempted from this, on the
-        # same reasoning that keeps them off the rate limiter -- a follower that falls
-        # behind is not a client that has stopped reading
+        # closes here too. a follower link would have needed exempting from this, on the
+        # same reasoning that would have kept it off the rate limiter -- a follower that
+        # falls behind is not a client that has stopped reading -- but replication is
+        # specified in full and deliberately unbuilt, so there is no such link to exempt
         if self.write_buffer_limit and len(conn.write_buffer) > self.write_buffer_limit:
             logger.warning(
                 "closing %s: %d bytes of queued replies exceeds the %d byte limit",

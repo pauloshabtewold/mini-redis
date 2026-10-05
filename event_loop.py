@@ -18,7 +18,7 @@ class EventLoop:
     and nothing else. The callback bodies belong to server.py,
     because the alternative, which is putting the periodic tick here, where
     select() returns, makes the thinnest module in the project import
-    the store, persistence, the command layer and eventually replication.
+    the store, persistence and the command layer.
     The same rule sets the annotations below, where on_accept takes the
     listening socket and the other two take the ready Connection, but the
     listener is typed Any rather than socket.socket, because naming that
