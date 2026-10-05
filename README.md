@@ -46,7 +46,18 @@ redis-benchmark -h 127.0.0.1 -p <port> -n 100000 -c 50 -P 1 -q \
 
 `-q` prints a rate and nothing else, so the table below comes from the same command
 without `-q`, the only form that reports the latency distribution; each row's rate and
-p99 come from the same run. The list is pinned because the tool's default run stops at
+p99 come from the same run. **Each row is one run, and one run is worth less than it
+looks on this machine.** Re-running the whole set moved individual rates by as much as
+twenty per cent and some p99 figures by half again -- `PING_MBULK` came back at 65,147
+and 76,161 against the 84,962 below, and the reference's `LRANGE_600` p99 at 4.255 ms and
+3.783 ms against 2.743 ms -- on a laptop carrying other work, which is what a laptop
+always is. What survived every repetition is the shape rather than the cell: the median
+share of native stayed within about a point of the figure quoted here, every test cleared
+the threshold with room to spare, and this server's p99 stayed two to three times the
+reference's on the small commands. Read a row as the order of magnitude it establishes,
+not as a number to compare against your own hardware.
+
+The list is pinned because the tool's default run stops at
 `SADD`, the first command in its sequence this server does not implement (see
 [Limits](#limits)). Whether all ten tests actually ran was checked by reading the labels
 on the result lines and not the exit status, for the reason in the third finding below.
