@@ -342,11 +342,22 @@ connection opened and each closed to what WARNING shows. Those two lines have no
 bound of their own, unlike the refusal and task-failure lines above, and each is a
 blocking write to standard error on the one thread this server has: a client that
 connects and disconnects in a loop can fill a stalled reader's buffer by itself and park
-the loop, which is the hazard those bounds exist for, and `--log-level WARNING` is what
-removes it. DEBUG adds a line per dispatched command naming it and counting its
-arguments, never showing a key or a value, and that call sits behind a level check, so
-at INFO nothing is built for it. An unknown level is a usage error and exits 2. Neither
-flag takes a number, so neither has a `0` to misread.
+the loop, which is the hazard those bounds exist for. `--log-level WARNING` removes
+those two lines, and with them the line a clean shutdown drain writes, which is also
+INFO; it does not remove the hazard. Two WARNING lines are the same kind of writer: one
+per connection, with no count bound of their own. One is written when a connection is
+closed for holding a half-sent command past `--incomplete-command-timeout`, and a
+client reaches it by connecting, sending half a command and waiting out the timeout.
+The other is written when a connection is closed for queued replies still over
+`--write-buffer-limit`, and a client reaches it by asking for a reply bigger than the
+limit plus whatever the kernel takes. A client that does either in a loop still drives
+a blocking write per connection at WARNING. That is a residual this server accepts and
+does not bound: the refusal and task-failure lines above are counted, these two are
+not, and the write is the same blocking one on the same thread. DEBUG adds a line per
+dispatched command naming it and counting its arguments, never showing a key or a value,
+and that call sits behind a level check, so at INFO nothing is built for it. An unknown
+level is a usage error and exits 2. Neither flag takes a number, so neither has a `0`
+to misread.
 
 ## Quickstart
 

@@ -552,6 +552,160 @@ def test_a_value_at_the_size_cap_is_stored_and_not_readable_back_past_the_write_
         ), "the connection was not closed for exceeding the limit"
 
 
+# --- many small elements are one reply -----------------------------------------------------
+#
+# the size cap holds each element of a list and each key, and nothing holds the number of them,
+# so one LRANGE or one KEYS reply can be as long as the keyspace has grown and is judged whole,
+# after the send, like any other. these two tests pin that for the shapes the string case above
+# does not reach. every element is a small fraction of the cap and of the limit, so none of them
+# can be what closes the connection: the sum is
+
+# 4096 of 4 KiB is 16 MiB, past what a loopback pair takes from a peer that reads nothing, which
+# is the premise the limit is judged on. the cap and the limit are the string case's
+ELEMENT_SIZE = 4096
+ELEMENT_COUNT = 4096
+SMALL_CAP = 131072
+SMALL_LIMIT = 65536
+# what one RPUSH or one batch of SETs carries, kept well inside what the kernel takes from a
+# client the server is not running for, since one thread plays both ends
+BATCH = 8
+
+
+def bulk(value):
+    return b"$%d\r\n%s\r\n" % (len(value), value)
+
+
+def array(items):
+    return b"*%d\r\n" % len(items) + b"".join(bulk(item) for item in items)
+
+
+def command(*parts):
+    return array(parts)
+
+
+def exchange(server, client, request, wanted):
+    """Send a request and return the first `wanted` bytes of what comes back.
+
+    The server runs once, then the client waits on its own socket for the reply, and the
+    server runs again only if the reply is not there. `receive` does it the other way round and
+    pumps after every look, so a reply that is still in flight on loopback costs a pass that
+    waits out the loop's whole select timeout with nothing to do, once per round trip, and a
+    few hundred of those are seconds
+    """
+    client.sendall(request)
+    received = bytearray()
+    deadline = time.monotonic() + PATIENCE_SECONDS
+    while len(received) < wanted:
+        if time.monotonic() > deadline:
+            raise AssertionError("received %d of %d bytes" % (len(received), wanted))
+        pump(server, times=1)
+        ready, _, _ = select.select([client], [], [], 0.005)
+        if ready:
+            received.extend(take(client, wanted - len(received)))
+    return bytes(received)
+
+
+def small_elements(prefix):
+    # distinct, so that a reply that arrives out of order or short is not mistaken for a whole one
+    return [prefix + b"%08d" % i + b"e" * (ELEMENT_SIZE - 8 - len(prefix)) for i in range(ELEMENT_COUNT)]
+
+
+def assert_each_is_small(items, what):
+    # an eighth of the limit and a sixteenth of the cap, framing included, so that no one of
+    # them can be what closes the connection and nothing but their number can
+    assert all(len(bulk(item)) * 8 <= SMALL_LIMIT and len(item) * 16 <= SMALL_CAP for item in items), (
+        "%s is big enough to be what closes the connection, so this proves nothing about sums" % what)
+
+
+def test_a_list_of_small_elements_is_stored_and_not_readable_back_past_the_write_buffer_limit(caplog):
+    # --max-value-size holds each element and nothing holds the list, so LRANGE 0 -1 is one
+    # reply as long as the list is. README says a list far under the cap can be stored and not
+    # read back at any finite limit, and 0 reads it back
+    elements = small_elements(b"")
+    assert_each_is_small(elements, "an element")
+    with serving(max_value_size=SMALL_CAP, write_buffer_limit=SMALL_LIMIT) as (server, client, conn, connect):
+        for first in range(0, ELEMENT_COUNT, BATCH):
+            pushed = elements[first:first + BATCH]
+            length = b":%d\r\n" % (first + len(pushed))
+            assert exchange(server, client, command(b"RPUSH", b"lst", *pushed), len(length)) == length
+        assert len(server._store.lookup(b"lst")) == ELEMENT_COUNT, "the list was refused, so there is nothing to read back"
+
+        # the control: the same list, a slice of it that fits under the limit, on the same connection
+        head = elements[:4]
+        assert len(array(head)) < SMALL_LIMIT
+        client.sendall(command(b"LRANGE", b"lst", b"0", b"3"))
+        assert receive(server, client, len(array(head))) == array(head)
+        assert not conn.closed, "a reply under the limit closed the connection"
+
+        whole = array(elements)
+        assert len(whole) > SMALL_LIMIT * 100, "the reply is not far enough over the limit to be past the kernel"
+        client.sendall(command(b"LRANGE", b"lst", b"0", b"-1"))
+        pump_until(server, lambda: conn.closed, "the connection to be closed by the limit")
+
+        delivered = read_to_the_end(client)
+        assert 0 < len(delivered) < len(whole), "every element was delivered"
+        assert delivered == whole[:len(delivered)], "what was delivered is a prefix of the reply"
+        assert any(
+            "exceeds the 65536 byte limit" in record.getMessage() for record in caplog.records
+        ), "the connection was not closed for exceeding the limit"
+
+        # closing the client does not unstore the list, and the server goes on serving others
+        other = connect()
+        pump(server)
+        other.sendall(command(b"LLEN", b"lst"))
+        assert receive(server, other, len(b":%d\r\n" % ELEMENT_COUNT)) == b":%d\r\n" % ELEMENT_COUNT
+
+        # and 0 is what reads every element back: the limit is the only thing that changed
+        server.write_buffer_limit = 0
+        other.sendall(command(b"LRANGE", b"lst", b"0", b"-1"))
+        assert_same_stream(receive(server, other, len(whole)), whole)
+
+
+def test_a_keys_reply_of_small_keys_is_judged_whole_against_the_write_buffer_limit(caplog):
+    # the same sum, reached through the keyspace: no key is larger than a fraction of the cap
+    # and KEYS * lists every one of them as one array. its order is not part of the contract,
+    # so what is compared is the set, and the closed connection is checked by its length
+    names = small_elements(b"key-")
+    assert_each_is_small(names, "a key")
+    head = b"*%d\r\n" % ELEMENT_COUNT
+    size = len(head) + sum(len(bulk(name)) for name in names)
+    with serving(max_value_size=SMALL_CAP, write_buffer_limit=SMALL_LIMIT) as (server, client, conn, connect):
+        for first in range(0, ELEMENT_COUNT, BATCH):
+            stored = names[first:first + BATCH]
+            request = b"".join(command(b"SET", name, b"v") for name in stored)
+            assert exchange(server, client, request, 5 * len(stored)) == b"+OK\r\n" * len(stored)
+        assert server._store.live_count() == ELEMENT_COUNT, "a key was refused, so KEYS has fewer to list"
+
+        # the control: the same keyspace, a reply from it that fits under the limit
+        client.sendall(command(b"KEYS", b"key-00000000*"))
+        assert receive(server, client, len(array(names[:1]))) == array(names[:1])
+        assert not conn.closed, "a reply under the limit closed the connection"
+
+        assert size > SMALL_LIMIT * 100, "the reply is not far enough over the limit to be past the kernel"
+        client.sendall(command(b"KEYS", b"*"))
+        pump_until(server, lambda: conn.closed, "the connection to be closed by the limit")
+
+        delivered = read_to_the_end(client)
+        assert delivered.startswith(head), delivered[:32]
+        assert 0 < len(delivered) < size, "every key was delivered"
+        assert any(
+            "exceeds the 65536 byte limit" in record.getMessage() for record in caplog.records
+        ), "the connection was not closed for exceeding the limit"
+
+        other = connect()
+        pump(server)
+        other.sendall(command(b"DBSIZE"))
+        assert receive(server, other, len(b":%d\r\n" % ELEMENT_COUNT)) == b":%d\r\n" % ELEMENT_COUNT
+
+        server.write_buffer_limit = 0
+        other.sendall(command(b"KEYS", b"*"))
+        reply = receive(server, other, size)
+        assert len(reply) == size and reply.startswith(head), (len(reply), size)
+        step = len(bulk(names[0]))
+        listed = {reply[at:at + step] for at in range(len(head), size, step)}
+        assert listed == {bulk(name) for name in names}, "KEYS read back a different set of keys"
+
+
 # --- a paused connection is still a connection --------------------------------------------
 
 

@@ -337,31 +337,41 @@ def test_the_sweep_drains_the_effect_queue_once_per_tick_not_once_per_sampling_p
             server._loop.close()
 
 
-def test_a_negative_interval_is_refused_at_the_cli_and_in_the_constructor():
-    for flag, label in (("--snapshot-interval", "snapshot interval"),
-                        ("--expiry-sweep-interval", "expiry sweep interval")):
-        err = io.StringIO()
-        try:
-            with contextlib.redirect_stderr(err):
-                build_arg_parser().parse_args([flag, "-1"])
-            pytest.fail("%s -1 was accepted" % flag)
-        except SystemExit as exc:
-            assert exc.code == 2, (flag, exc.code)
-        text = err.getvalue()
-        assert "%s cannot be negative; 0 disables the check, not -1" % label in text, (
-            flag, text)
-        assert "_check_not_negative" not in text and "_numeric_limit" not in text, (
-            "a private validator's name leaked into a user-facing message", text)
+# each flag carries its own ending, spelled out in full and not read from the module under test: the sweep's 0 turns the sweep off, and the snapshot's 0 turns off only the periodic save, so a clean stop still saves. an assertion on "cannot be negative" alone would pass for either ending, and for the ending of any other flag, so a flag handed another's message would go unnoticed
+_NEGATIVE_INTERVAL_REFUSALS = (
+    pytest.param(
+        "--snapshot-interval", "snapshot_interval",
+        "-1 does not turn saving off, and 0 stops only the periodic save",
+        id="snapshot-interval"),
+    pytest.param(
+        "--expiry-sweep-interval", "expiry_sweep_interval",
+        "0 disables the check, not -1",
+        id="expiry-sweep-interval"),
+)
 
-    for kwargs, label in (({"snapshot_interval": -1}, "snapshot_interval"),
-                          ({"expiry_sweep_interval": -1}, "expiry_sweep_interval")):
-        try:
-            Server(0, **kwargs)
-        except ValueError as exc:
-            assert str(exc) == (
-                "%s cannot be negative; 0 disables the check, not -1" % label), str(exc)
-        else:
-            pytest.fail("Server(0, **%r) was accepted" % kwargs)
+
+@pytest.mark.parametrize("flag, kwarg, ending", _NEGATIVE_INTERVAL_REFUSALS)
+def test_a_negative_interval_is_refused_at_the_cli_and_in_the_constructor(flag, kwarg, ending):
+    err = io.StringIO()
+    try:
+        with contextlib.redirect_stderr(err):
+            build_arg_parser().parse_args([flag, "-1"])
+        pytest.fail("%s -1 was accepted" % flag)
+    except SystemExit as exc:
+        assert exc.code == 2, (flag, exc.code)
+    text = err.getvalue()
+    # through the end of the line, so the ending is exactly this flag's and nothing follows it
+    assert "argument %s: %s cannot be negative; %s\n" % (flag, flag[2:].replace("-", " "), ending) in text, (
+        flag, text)
+    assert "_check_not_negative" not in text and "_numeric_limit" not in text, (
+        "a private validator's name leaked into a user-facing message", text)
+
+    try:
+        Server(0, **{kwarg: -1})
+    except ValueError as exc:
+        assert str(exc) == "%s cannot be negative; %s" % (kwarg, ending), str(exc)
+    else:
+        pytest.fail("Server(0, %s=-1) was accepted" % kwarg)
 
 
 def test_the_cli_snapshot_path_default_and_the_constructor_default_differ():

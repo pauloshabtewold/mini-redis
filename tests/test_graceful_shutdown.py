@@ -46,7 +46,9 @@ REPO_ROOT = pathlib.Path(__file__).resolve().parent.parent
 # on top of the drain timeout and one select timeout: the shutdown save of a few MiB, which ends in an fsync that is slow on some filesystems, and the process's own teardown
 _MARGIN_SECONDS = 3.0
 _VALUE_BYTES = 4 << 20
-# the stall these tests build -- tens of MiB of replies owed to a client that reads none of them -- is the state the high-water mark exists to prevent. at the defaults a connection is paused after the first large reply, the rest of its requests are never dispatched, and the server owes one reply where the test counts on many. the tests that follow are about the drain and not about the water marks, so the marks and the limit are switched off for them; a test that only needs the server to owe something at the moment of the stop runs at the defaults
+# how many replies _stalled_client asks for when a test does not say, which is the three tests that run at the shipped defaults and so under the 32 MiB --write-buffer-limit. one reply is 4,194,316 bytes: the 10-byte header "$4194304\r\n", the 4 MiB value and a 2-byte terminator. eight of them are 33,554,528 bytes, 96 over the limit's 33,554,432, and a connection is judged after the kernel has taken what it will, so eight read as one batch were closed at the eighth unless the kernel had taken at least 96 bytes of them -- and a connection closed there leaves the drain nothing to wait on. a loopback pair takes hundreds of kilobytes, so that never failed, which is the trouble: it passed on what the kernel absorbs and not on the arithmetic. four are 16,777,264 bytes, half the limit, and no amount the kernel absorbs or declines moves that across it. none of the three needs more than something owed at the moment of the stop. keep the product of this and the reply size well under the limit; the callers that switch the limit off pass a count of their own
+_DEFAULT_STALL_REPLIES = 4
+# the stall these tests build -- tens of MiB of replies owed to a client that reads none of them -- is the state the high-water mark exists to prevent. at the defaults a connection is paused after the first large reply, the rest of its requests are never dispatched, and the server owes one reply where the test counts on many. the tests that follow are about the drain and not about the water marks, so the marks and the limit are switched off for them; a test that only needs the server to owe something at the moment of the stop runs at the defaults, and keeps its stall well under the limit: see _DEFAULT_STALL_REPLIES
 _NO_BACKPRESSURE_FLAGS = ("--write-buffer-limit", "0", "--write-buffer-high-water", "0")
 _NO_BACKPRESSURE = {"write_buffer_limit": 0, "write_buffer_high_water": 0}
 
@@ -116,8 +118,8 @@ def start(tmp_path):
         _reap(proc)
 
 
-def _stalled_client(port, replies=8):
-    # asks for a 4 MiB value back several times and reads none of it, so the server owes tens of MiB that nothing will take
+def _stalled_client(port, replies=_DEFAULT_STALL_REPLIES):
+    # asks for a 4 MiB value back several times and reads none of it, so the server owes megabytes that nothing will take
     client = socket.create_connection(("127.0.0.1", port))
     client.settimeout(10)
     client.sendall(_resp(b"SET", b"k", b"hello"))
@@ -143,7 +145,7 @@ def test_a_stalled_client_does_not_hold_the_server_past_the_drain_timeout(start)
         client.close()
     assert returned, "the server was still running after the drain timeout plus a margin"
     assert rc == 0, rc
-    # not before the timeout either: a server that owes a client eight unread replies and is gone in a tenth of a second drained nothing
+    # not before the timeout either: a server that owes a client unread replies and is gone in a tenth of a second drained nothing
     assert elapsed >= drain - 0.1, elapsed
 
 

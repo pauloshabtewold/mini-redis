@@ -126,12 +126,14 @@ def _port(value: str) -> int:
     return number
 
 
-# the ending of every negative-value refusal but two: for the flags this rule was written for, 0 is the value that turns the check off, and it is the one the operator is steered to
+# the ending of every negative-value refusal but three: for the flags this rule was written for, 0 is the value that turns the check off, and it is the one the operator is steered to
 _ZERO_DISABLES = "0 disables the check, not %d"
 # --shutdown-drain-timeout's own ending, because its 0 is the restrictive value: no drain at all, so whatever the kernel will not take in one pass is discarded. -1 is the likeliest spelling of "unlimited" and is exactly what is refused here, so the shared ending would send the operator from the value they typed to the one that does the opposite of what they meant
 _ZERO_SKIPS_THE_DRAIN = "%d does not mean unlimited, and 0 means no drain at all"
 # --write-buffer-low-water's own ending, because its 0 disables nothing: with the pause on it means resume only once the queue is empty, the most conservative resume, so the shared ending would send an operator who typed -1 to a value that does not switch anything off
 _ZERO_RESUMES_WHEN_EMPTY = "%d does not turn anything off, and 0 means resume only when the queue is empty"
+# --snapshot-interval's own ending, because its 0 turns off the periodic save and no more: a clean stop still saves, unless --ignore-snapshot is set as well, so the shared ending would send an operator who typed -1 to a value that does not stop saving
+_ZERO_STOPS_THE_PERIODIC_SAVE = "%d does not turn saving off, and 0 stops only the periodic save"
 
 
 def _check_not_negative(value: int, label: str, ending: str = _ZERO_DISABLES) -> None:
@@ -291,7 +293,7 @@ def _max_multibulk(value: str) -> int:
 
 
 def _snapshot_interval(value: str) -> int:
-    number = _numeric_limit(value, "snapshot interval", "seconds")
+    number = _numeric_limit(value, "snapshot interval", "seconds", _ZERO_STOPS_THE_PERIODIC_SAVE)
     try:
         _check_schedulable(number, "snapshot interval", "seconds")
     except ValueError as exc:
@@ -341,7 +343,15 @@ def _host(value: str) -> str:
 def build_arg_parser() -> argparse.ArgumentParser:
     # separate from main() so the parser can be inspected without running the server.
     parser = argparse.ArgumentParser()
-    parser.add_argument("--port", type=_port, default=DEFAULT_PORT)
+    parser.add_argument(
+        "--port",
+        type=_port,
+        default=DEFAULT_PORT,
+        help=f"the TCP port to listen on, 0 to 65535; the default is {DEFAULT_PORT}. "
+             "0 is not a way to switch anything off here: it asks the kernel to choose a "
+             "free port, and the line the server prints once it is listening, listening "
+             "on HOST:PORT, names the one it got",
+    )
     parser.add_argument(
         "--write-buffer-limit",
         type=_write_buffer_limit,
@@ -461,9 +471,11 @@ def build_arg_parser() -> argparse.ArgumentParser:
         default=DEFAULT_INCOMPLETE_COMMAND_TIMEOUT_SECONDS,
         metavar="SECONDS",
         help="close a connection that has held a partly sent command for more than "
-             "SECONDS, counted from when the command began and not from its latest byte; "
-             "time spent paused by --write-buffer-high-water is not counted. 0 means no "
-             "limit, and nothing is closed for it",
+             "SECONDS, counted from when the command began and not from its latest byte. "
+             "the count stops while --write-buffer-high-water has the connection paused "
+             "and starts over from zero when reading resumes, so time held before a "
+             "pause is not carried across it. 0 means no limit, and nothing is closed "
+             "for it",
     )
     parser.add_argument(
         "--host",
@@ -483,7 +495,11 @@ def build_arg_parser() -> argparse.ArgumentParser:
         default=DEFAULT_LOG_LEVEL,
         help="how much to log, in any case. INFO reports each connection opened and "
              "closed; DEBUG adds a line per dispatched command naming the command and "
-             "its argument count, never a key or a value",
+             "its argument count, never a key or a value. the shutdown drain writes one "
+             "line per stop, INFO when it lost nothing and WARNING when it lost "
+             "something, so WARNING hides the confirmation of a clean stop along with "
+             "the per-connection lines and shows that line only when something was "
+             "lost; ERROR hides it either way",
     )
     return parser
 
@@ -531,7 +547,7 @@ class Server:
         self.max_value_size = max_value_size
         _check_not_negative(max_multibulk, "max_multibulk")
         self.max_multibulk = max_multibulk
-        _check_not_negative(snapshot_interval, "snapshot_interval")
+        _check_not_negative(snapshot_interval, "snapshot_interval", _ZERO_STOPS_THE_PERIODIC_SAVE)
         _check_schedulable(snapshot_interval, "snapshot_interval", "seconds")
         self.snapshot_interval = snapshot_interval
         _check_not_negative(expiry_sweep_interval, "expiry_sweep_interval")
@@ -1050,7 +1066,7 @@ class Server:
             closed_owing = sum(1 for conn in owing if conn.closed and conn.write_buffer)
             still_owing = sum(1 for conn in owing if not conn.closed and conn.write_buffer)
             incomplete = bool(closed_owing or still_owing)
-            # in a finally so that it is the only line this writes however it ends, including a pass that raises. it is a WARNING whenever any connection was owed bytes it did not get -- closed while owed them (a peer that went away, an output limit, an unhandled error) or still owed them at the deadline -- and INFO when none was, so the level says whether anything was lost
+            # in a finally so that it is the only line this writes however it ends, including a pass that raises. it is a WARNING whenever any connection was owed bytes it did not get -- closed while owed them (a peer that went away, the write-buffer limit, an unhandled error) or still owed them at the deadline -- and INFO when none was, so the level says whether anything was lost
             logger.log(
                 logging.WARNING if incomplete else logging.INFO,
                 "shutdown drain %s; connections closed while owed bytes: %d; connections still owed bytes: %d",
