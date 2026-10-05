@@ -1,0 +1,26 @@
+# An allowlist: the build context is the files the image runs from and nothing else.
+# Everything is left out first, then the files the image needs are let back in.
+*
+
+# what `pip install .` reads
+!pyproject.toml
+!README.md
+!LICENSE
+
+# what the server runs from; the module list is pyproject.toml's py-modules and packages
+!server.py
+!event_loop.py
+!connection.py
+!resp.py
+!store.py
+!persistence.py
+!ratelimit.py
+!replication.py
+!commands/*.py
+
+# named again after the allowlist, so that widening it cannot bring these back
+.git
+.venv
+**/__pycache__
+**/*.pyc
+**/*.mrdb
