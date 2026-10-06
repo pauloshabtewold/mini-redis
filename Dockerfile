@@ -24,7 +24,12 @@ RUN groupadd --gid 10001 mini-redis \
 # Dependency layer. The project has no runtime dependencies today; the list is read from
 # pyproject.toml so that one added later is installed here, and this layer is rebuilt
 # only when pyproject.toml changes, not when the source does.
-COPY pyproject.toml README.md LICENSE ./
+# pyproject.toml alone, and not README.md and LICENSE beside it: they are what `pip install .`
+# reads for the long description and the licence, the source layer's own COPY brings them,
+# and copying them here instead busts this layer on every edit to the published front page,
+# which is the file this project changes most. The comment above is only true of a COPY that
+# names the one file the RUN below actually reads.
+COPY pyproject.toml ./
 RUN python -c 'import tomllib; print("\n".join(tomllib.load(open("pyproject.toml", "rb"))["project"]["dependencies"]))' > /tmp/requirements.txt \
     && pip install --no-compile -r /tmp/requirements.txt \
     && rm /tmp/requirements.txt
