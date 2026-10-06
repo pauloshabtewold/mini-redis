@@ -374,8 +374,16 @@ paused instead. What the limit catches is a reply larger than it is, or the repl
 one read's worth of pipelined requests, which the pause cannot unqueue once they are
 parsed. What the pause does not do is hold such a client anywhere near the high-water
 mark. The batch that crossed the mark is still dispatched whole, so a paused connection
-holds the mark plus that batch — measured at the shipped defaults, up to 31.5 MiB
-against the 32 MiB limit, thirty-one times the mark and 98% of the ceiling. The pause keeps
+holds the mark plus that batch — bounded at the shipped defaults by the limit itself, 32 MiB,
+thirty-two times the mark and the whole of the ceiling, because a connection that survives its
+batch is by definition one whose last flush found the queue not exceeding the limit. That is a
+bound from the mechanism and not the largest thing measured: over 152 observations sweeping the
+batch from 28 to 40 replies, the most a still-open paused connection held was 33,239,356 bytes,
+99.1% of it, and the running maximum was still rising at the last observation. Take the 32 MiB as
+the bound and the 99.1% as how close a sample gets. The transient peak before the limit closes a
+connection is bounded by the limit plus one reply, 34,603,020 bytes at 1 MiB replies, and was
+measured to within 37,692 bytes of that. Neither bound was exceeded in the 152, and the pause
+fired exactly once in every one. The pause keeps
 a client that stops reading from being closed by the limit; it does not keep it far away
 from the limit. The 32 MiB default is a choice, and a departure from the reference,
 which leaves an ordinary client's output buffer unlimited. This server does not: nothing
@@ -405,8 +413,8 @@ queued for it, at least the high-water mark's worth plus whatever the one batch 
 crossed the mark queued, until it disconnects. That is bounded: per connection by the
 mark plus that batch, which the limit in turn caps at the limit plus one reply while the
 limit is on, and over all connections by `--max-connections`. Read that bound as the
-product it is: the 31.5 MiB above, times the default `--max-connections 1024`, puts the
-aggregate near 31.5 GiB — far past the memory of any machine this is likely to run on, and
+product it is: the 32 MiB above, times the default `--max-connections 1024`, puts the
+aggregate at 32 GiB — far past the memory of any machine this is likely to run on, and
 the cap is what bounds the count of connections, not what makes the total small.
 Ninety-six paused connections drove 2.9 GB into swap on an 8 GiB machine, with every one
 still open and a fresh client still answered in six milliseconds. That a client is held
