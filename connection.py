@@ -13,6 +13,25 @@ import resp
 RECV_SIZE = 65536
 
 
+def unread_in_kernel(sock: socket.socket) -> int:
+    # how many bytes the peer has sent that this process has not read, asked of the kernel rather
+    # than read out of it, so it costs one syscall and takes nothing out of the receive queue.
+    # 0 rather than a raise, because the callers are assembling a figure for one log line at a
+    # stop and a report that raises on the way out is worse than one that is short: OSError for a
+    # kernel that refuses the question on some descriptor this never sees, and ValueError because
+    # that -- not OSError -- is what ioctl raises for a socket object whose descriptor is already
+    # closed, which is reachable from a scripted socket in the suite and would otherwise escape
+    # the one finally clause the drain writes its line from
+    held = array.array("i", [0])
+    try:
+        fcntl.ioctl(sock.fileno(), termios.FIONREAD, held, True)
+    except (OSError, ValueError):
+        return 0
+    # a signed 32-bit field, which is what FIONREAD writes on both platforms this runs on; a
+    # receive queue past 2 GiB would be misreported and no socket option here allows one
+    return held[0]
+
+
 class Role(enum.StrEnum):
     """A connection's place in the topology.
 
@@ -88,6 +107,14 @@ class Connection:
         # the argv here is what keeps locating N elements O(N) rather than O(N) per element
         self._argv: list[bytes] | None = None
         self._elements_remaining = 0
+        # bytes already taken out of the read buffer that belong to a command which has not
+        # completed: a multibulk's consumed header and its finished elements. the read buffer
+        # alone understates what a connection holds for exactly the reason has_incomplete_command
+        # below reads _argv as well, and the shutdown drain reports these bytes as discarded, so
+        # the quantity has to be kept rather than inferred -- take_commands deletes the bytes it
+        # consumes and nothing afterwards can recover the count. this module maintains it; the
+        # server reads it and zeroes it once it has been counted
+        self.consumed_for_incomplete_command = 0
         self.closed = False
         self.role = role
         # filled and interpreted only by their owning module
@@ -120,12 +147,7 @@ class Connection:
         # line and a report that raises on the way out is worse than one that is short
         if self.closed:
             return 0
-        held = array.array("i", [0])
-        try:
-            fcntl.ioctl(self._sock.fileno(), termios.FIONREAD, held, True)
-        except OSError:
-            return 0
-        return held[0]
+        return unread_in_kernel(self._sock)
 
     @property
     def has_incomplete_command(self) -> bool:
@@ -172,11 +194,17 @@ class Connection:
                     self._parse_needed = 0
                     self._scan_from = 0
                     del self.read_buffer[:consumed]
+                    # this element's bytes have left the buffer and belong to a command that is
+                    # still arriving, so they move from the buffer's length into the count below
+                    self.consumed_for_incomplete_command += consumed
                     self._argv.append(body)
                     self._elements_remaining -= 1
                     if self._elements_remaining == 0:
                         commands.append(self._argv)
                         self._argv = None
+                        # the command is whole and is on its way to be dispatched, so nothing is
+                        # held for it any more
+                        self.consumed_for_incomplete_command = 0
                 elif self.read_buffer[0:1] == b"*":
                     count, consumed, needed = resp.parse_multibulk_header(
                         self.read_buffer, self._scan_from, max_multibulk=max_multibulk
@@ -192,6 +220,11 @@ class Connection:
                     if count:
                         self._argv = []
                         self._elements_remaining = count
+                        # the header's own bytes are the first thing held for this command
+                        self.consumed_for_incomplete_command += consumed
+                    else:
+                        # nothing is outstanding: the header was the whole of it
+                        self.consumed_for_incomplete_command = 0
                 else:
                     argv, consumed, needed = resp.parse_command(
                         self.read_buffer, self._scan_from,
@@ -207,6 +240,9 @@ class Connection:
                     self._scan_from = 0
                     # progress is driven by `consumed`, not by `argv`
                     del self.read_buffer[:consumed]
+                    # an inline step leaves nothing outstanding: it either completed a command or
+                    # consumed an empty line, and a multibulk cannot be in progress on this branch
+                    self.consumed_for_incomplete_command = 0
                     if argv is not None:
                         commands.append(argv)
         except resp.ProtocolError as exc:

@@ -11,8 +11,10 @@ back.
 The ones that have to see inside the sequence -- the order of its steps, what the selector
 holds when the save runs -- run `Server.run()` on the test's own thread, because it
 installs signal handlers and only the main thread may, while a second thread plays the
-clients and asks it to stop. The rest never run a server: they build a parser or a
-`Server` and check how `--shutdown-drain-timeout` is validated and what its default is.
+clients and asks it to stop. The ones about a stop that arrives before `run()` is reached
+run `main()` there instead, with the signal sent from inside the snapshot load. The rest
+never run a server: they build a parser or a `Server` and check how
+`--shutdown-drain-timeout` is validated and what its default is.
 Everything the first two kinds start keeps its snapshot inside the test's own
 `tmp_path`, because every SIGTERM now saves one.
 """
@@ -35,6 +37,7 @@ import pytest
 
 import commands
 import persistence
+import server as server_module
 from connection import Connection
 from server import (
     DEFAULT_SHUTDOWN_DRAIN_TIMEOUT_SECONDS, MAX_SCHEDULABLE_INTERVAL, SELECT_TIMEOUT_SECONDS,
@@ -287,6 +290,64 @@ def test_a_request_arriving_during_the_drain_does_not_cost_the_client_its_replie
     assert (returned, rc) == (True, 0)
 
 
+# the load is slowed by the driver and not by a snapshot big enough to be slow, because the window under test is the one inside Server's construction and a stop sent at a marker the process itself prints lands in it on every run, where one sent on a timer lands in it on a good day. the driver is main() unchanged: only persistence.load is wrapped, to say it has begun and to take longer
+_LOAD_SECONDS = 1.0
+_SLOW_LOAD_THEN_MAIN = """
+import sys, time
+sys.path.insert(0, %r)
+import persistence, server
+
+real_load = persistence.load
+
+
+def slow_load(path):
+    print("loading", flush=True)
+    time.sleep(%r)
+    return real_load(path)
+
+
+persistence.load = slow_load
+server.main(sys.argv[1:])
+"""
+
+
+def test_a_sigterm_during_a_slow_snapshot_load_is_honoured_and_not_discarded(tmp_path):
+    # the load runs inside Server's construction, ahead of the handlers run() installs, so a SIGTERM
+    # that arrived during it had its default disposition: the process ended with no save, and as PID 1
+    # in a container the kernel discarded it outright and the container served on until SIGKILL. the
+    # window scaled with the snapshot. what is asserted is the process's own account of it: a clean
+    # exit, the snapshot written by the stop, and the drain's one line
+    snapshot = tmp_path / "dump.mrdb"
+    older = Store()
+    older.write(b"before", b"1", keep_ttl=False)
+    persistence.save(older, str(snapshot))
+    an_hour_ago = time.time() - 3600
+    os.utime(snapshot, (an_hour_ago, an_hour_ago))
+
+    proc = subprocess.Popen(
+        [sys.executable, "-c", _SLOW_LOAD_THEN_MAIN % (str(REPO_ROOT), _LOAD_SECONDS),
+         "--port", "0", "--snapshot-path", str(snapshot)],
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE, cwd=tmp_path)
+    try:
+        ready, _, _ = select.select([proc.stdout], [], [], 10)
+        line = proc.stdout.readline() if ready else b""
+        assert line == b"loading\n", ("the load never began", line)
+        signalled = time.time()
+        proc.send_signal(signal.SIGTERM)
+        returned, rc = _returns_within(proc, _LOAD_SECONDS + SELECT_TIMEOUT_SECONDS + _MARGIN_SECONDS)
+        # read only once it has exited, since a process that is still running would hold this read open for ever
+        stderr = proc.stderr.read().decode() if returned else ""
+    finally:
+        _reap(proc)
+        proc.stderr.close()
+    assert returned, "the server was still running after the load and a margin: the stop was lost"
+    assert rc == 0, (rc, stderr)
+    lines = [entry for entry in stderr.splitlines() if "shutdown drain" in entry]
+    assert len(lines) == 1 and "shutdown drain complete" in lines[0], stderr
+    assert os.path.getmtime(snapshot) >= signalled - 1.0, "the snapshot on disk is the one from before the signal"
+    assert set(persistence.load(str(snapshot)).live_keys()) == {b"before"}
+
+
 # --- the tests below run Server.run() on this thread, with a second thread as the clients
 
 
@@ -501,12 +562,12 @@ def test_the_save_runs_before_the_drain_not_after(tmp_path, scene_for):
     at_entry = {}
     real_drain = server._drain_for
 
-    def spying_drain(seconds):
+    def spying_drain(seconds, listener=None):
         # asked of the filesystem and not of a flag: what matters is that the bytes were on disk when the drain began
         at_entry["exists"] = snapshot.exists()
         if at_entry["exists"]:
             at_entry["keys"] = set(persistence.load(str(snapshot)).live_keys())
-        real_drain(seconds)
+        real_drain(seconds, listener)
 
     server._drain_for = spying_drain
 
@@ -651,7 +712,7 @@ def test_a_drain_that_raises_still_closes_the_listener_and_the_selector(tmp_path
     server = _server(tmp_path)
     scene = scene_for(server)
 
-    def exploding_drain(seconds):
+    def exploding_drain(seconds, listener=None):
         raise RuntimeError("drain exploded")
 
     server._drain_for = exploding_drain
@@ -688,10 +749,10 @@ def test_a_drain_that_raises_still_logs_its_one_line(tmp_path, scene_for):
     real_drain = server._drain_for
 
     with _server_log(collecting=False) as log:
-        def spying_drain(seconds):
+        def spying_drain(seconds, listener=None):
             log.collecting = True
             try:
-                real_drain(seconds)
+                real_drain(seconds, listener)
             finally:
                 log.collecting = False
 
@@ -767,9 +828,9 @@ def test_a_close_raising_at_teardown_still_closes_every_connection_that_owed_byt
     real_drain = server._drain_for
     real_unregister = server._loop.unregister
 
-    def spying_drain(seconds):
+    def spying_drain(seconds, listener=None):
         try:
-            real_drain(seconds)
+            real_drain(seconds, listener)
         finally:
             owing_at_the_deadline.extend(c for c in held if not c.closed and c.write_buffer)
             drained.append(True)
@@ -826,10 +887,10 @@ def test_the_drain_dispatches_no_command(tmp_path, scene_for, monkeypatch):
             stopped.append(server._draining)
         real_run_once()
 
-    def spying_drain(seconds):
+    def spying_drain(seconds, listener=None):
         inside.append(True)
         try:
-            real_drain(seconds)
+            real_drain(seconds, listener)
         finally:
             inside.pop()
 
@@ -872,10 +933,10 @@ def test_a_zero_drain_timeout_skips_the_drain_entirely(tmp_path, scene_for):
         real_drain = server._drain_for
         real_run_once = server._loop.run_once
 
-        def spying_drain(seconds, real_drain=real_drain, inside=inside):
+        def spying_drain(seconds, listener=None, real_drain=real_drain, inside=inside):
             inside.append(True)
             try:
-                real_drain(seconds)
+                real_drain(seconds, listener)
             finally:
                 inside.pop()
 
@@ -925,10 +986,10 @@ def _drain_lines(tmp_path, scene_for, name, timeout, act=None):
     real_drain = server._drain_for
 
     with _server_log(collecting=False) as log:
-        def spying_drain(seconds):
+        def spying_drain(seconds, listener=None):
             log.collecting = True
             try:
-                real_drain(seconds)
+                real_drain(seconds, listener)
             finally:
                 log.collecting = False
 
@@ -1039,10 +1100,10 @@ def test_a_connection_fully_served_and_then_closed_is_not_counted_as_a_loss(tmp_
     real_drain = server._drain_for
 
     with _server_log(collecting=False) as log:
-        def spying_drain(seconds):
+        def spying_drain(seconds, listener=None):
             log.collecting = True
             try:
-                real_drain(seconds)
+                real_drain(seconds, listener)
             finally:
                 log.collecting = False
 
@@ -1127,6 +1188,240 @@ def test_the_drain_waits_for_every_connection_that_owes_bytes(tmp_path, scene_fo
     scene.run(scenario)
     assert outcome["first"] == outcome["expected"]
     assert outcome["second"] == outcome["expected"], "the drain ended with the second connection still owed bytes"
+
+
+def test_clients_that_connect_after_the_stop_and_are_never_accepted_are_counted_in_the_drains_line(tmp_path, scene_for):
+    # the listener leaves the select set when the loop stops and stays open until the teardown, so the
+    # kernel goes on completing handshakes into its backlog for the whole of the save and the drain.
+    # those clients are never accepted, never read and never answered, and the listener's close resets
+    # them. measured, three of them sent 201,000 bytes of complete requests that the line reported as 0.
+    # they connect once the drain has made two passes, so the sweep at its entry has come and gone, and
+    # this runs through run() and a real listener, which is the one place the listener's hand-over to
+    # the drain is seen
+    server = _server(tmp_path, shutdown_drain_timeout=10, **_NO_BACKPRESSURE)
+    scene = scene_for(server)
+    sizes = (30_000, 70_000, 101_000)
+    passes = []
+    real_run_once = server._loop.run_once
+    real_drain = server._drain_for
+
+    def counting_run_once():
+        # the drain's passes and none of the main loop's, since the flag is set only on the way into it
+        if server._draining:
+            passes.append(1)
+        real_run_once()
+
+    server._loop.run_once = counting_run_once
+
+    with _server_log(collecting=False) as log:
+        def spying_drain(seconds, listener=None):
+            log.collecting = True
+            try:
+                real_drain(seconds, listener)
+            finally:
+                log.collecting = False
+
+        server._drain_for = spying_drain
+
+        def scenario():
+            client, expected = scene.stall()
+            server._request_stop(None, None)
+            scene.wait_for(lambda: len(passes) >= 2, "the drain to be running")
+            for size in sizes:
+                scene.connect().sendall(b"x" * size)
+            # a pause and not a wait on anything: the connection is in nobody's hands, so there is
+            # nothing on this side to ask when loopback has delivered a client's last byte to it, and a
+            # count taken at once is short on a few runs in a hundred. the drain is held open by a
+            # client that has read nothing, so the pause costs the test nothing
+            time.sleep(0.2)
+            assert len(_read_total(client, expected)) == expected
+
+        scene.run(scenario)
+    lines = [r for r in log.records if "shutdown drain" in r.getMessage()]
+    assert len(lines) == 1, [r.getMessage() for r in log.records]
+    assert _drain_discarded(lines[0]) == sum(sizes), lines[0].getMessage()
+    # the clients were owed nothing, so the line is the clean one: the figure beside the counts is what says they were thrown away
+    assert lines[0].levelno == logging.INFO and _drain_counts(lines[0]) == (0, 0), lines[0].getMessage()
+
+
+# --- the tests below run main() on this thread, with the stop signal arriving while it builds the server
+
+
+class _StopHandlers:
+    # what the process held for the two stop signals before main() ran, stood in for by handlers of the test's own and not the defaults, so that a main() that failed to install its recording one costs the test an assertion and not the pytest process, which a default-disposition SIGTERM would end
+    def __init__(self):
+        self.reached = []
+        self.ours = {signum: self.note for signum in (signal.SIGINT, signal.SIGTERM)}
+
+    def note(self, signum, frame):
+        self.reached.append(signum)
+
+    def held(self):
+        return {signum: signal.getsignal(signum) for signum in (signal.SIGINT, signal.SIGTERM)}
+
+
+@pytest.fixture
+def stop_handlers():
+    handlers = _StopHandlers()
+    previous = {signum: signal.signal(signum, handler) for signum, handler in handlers.ours.items()}
+    yield handlers
+    for signum, handler in previous.items():
+        signal.signal(signum, handler)
+
+
+@pytest.fixture
+def servers_main_builds(monkeypatch):
+    # the Servers main() constructs, so that every one has its loop closed whether or not run() got as far as closing it
+    built = []
+
+    class Recording(Server):
+        def __init__(self, *args, **kwargs):
+            super().__init__(*args, **kwargs)
+            built.append(self)
+
+    monkeypatch.setattr(server_module, "Server", Recording)
+    yield built
+    for server in built:
+        server._loop.close()
+
+
+def _stop_while_main_loads_the_snapshot(home, monkeypatch, signum):
+    snapshot = home / "dump.mrdb"
+    older = Store()
+    older.write(b"before", b"1", keep_ttl=False)
+    persistence.save(older, str(snapshot))
+    an_hour_ago = time.time() - 3600
+    os.utime(snapshot, (an_hour_ago, an_hour_ago))
+    real_load = persistence.load
+
+    def load_then_stopped(path):
+        # from inside Server's construction, which is where the load runs and where the stop used to find no handler. the signal is a real one and so is the handler that takes it
+        os.kill(os.getpid(), signum)
+        return real_load(path)
+
+    def the_loop_body_ran(self):
+        # the tick follows every pass of the loop and the drain never makes one, so reaching it means the loop was entered and the stop was not honoured. raised and not recorded, because a loop that is entered here never ends
+        raise AssertionError("the loop ran: the stop that arrived during startup was not honoured")
+
+    # a context, so that the tick is the real one again for a test that runs a server afterwards
+    with monkeypatch.context() as patched:
+        patched.setattr(persistence, "load", load_then_stopped)
+        patched.setattr(Server, "_tick", the_loop_body_ran)
+        patched.setattr(logging, "basicConfig", lambda **kwargs: None)
+        signalled = time.time()
+        with _server_log() as log:
+            server_module.main(["--port", "0", "--snapshot-path", str(snapshot)])
+    return snapshot, signalled, log.records
+
+
+@pytest.mark.parametrize("signum", [signal.SIGTERM, signal.SIGINT], ids=["SIGTERM", "SIGINT"])
+def test_a_stop_that_arrives_while_main_loads_the_snapshot_is_honoured_by_run(
+        tmp_path, monkeypatch, servers_main_builds, stop_handlers, signum):
+    # main() returning at all is the clean exit: a stop that was lost leaves run() in its loop, which
+    # the tick above turns into a failure rather than a hang
+    snapshot, signalled, records = _stop_while_main_loads_the_snapshot(tmp_path, monkeypatch, signum)
+    assert len(servers_main_builds) == 1
+    lines = [r for r in records if "shutdown drain" in r.getMessage()]
+    assert len(lines) == 1, [r.getMessage() for r in records]
+    assert lines[0].levelno == logging.INFO and lines[0].getMessage().startswith("shutdown drain complete"), lines[0].getMessage()
+    assert _drain_counts(lines[0]) == (0, 0), lines[0].getMessage()
+    # the ordinary way out taken whole: the stop saves, and the snapshot is the one this process wrote and not the one it started from
+    assert os.path.getmtime(snapshot) >= signalled - 1.0, "the snapshot on disk is the one from before the stop"
+    assert set(persistence.load(str(snapshot)).live_keys()) == {b"before"}
+    assert stop_handlers.reached == [], "the signal reached the handler main() found, so main() had installed none"
+
+
+def test_the_stop_recorded_during_startup_is_consumed_so_the_next_run_in_the_process_still_serves(
+        tmp_path, monkeypatch, servers_main_builds, stop_handlers, scene_for):
+    # one stop is one stop: a request that run() read and left set would end the next Server run in this
+    # process before its loop was entered, which is how a long-lived embedding program or a suite finds
+    # out. the second server is built and run directly, because a second main() would clear the record
+    # itself on the way in and hide a run() that did not
+    first = tmp_path / "first"
+    first.mkdir()
+    _stop_while_main_loads_the_snapshot(first, monkeypatch, signal.SIGTERM)
+    second = tmp_path / "second"
+    second.mkdir()
+    server = _server(second)
+    scene = scene_for(server)
+    answers = []
+
+    def scenario():
+        client = scene.connect()
+        client.settimeout(5)
+        client.sendall(_resp(b"PING"))
+        try:
+            answers.append(client.recv(64))
+        except OSError as exc:
+            # a loop that never ran has nothing to answer with, and a server that has already stopped resets the connection
+            answers.append(repr(exc))
+
+    scene.run(scenario)
+    assert answers == [b"+PONG\r\n"], answers
+
+
+@pytest.mark.parametrize(
+    "way_out", ["a clean return", "a usage error", "a refused snapshot", "a run that raises"])
+def test_main_gives_the_stop_handlers_back_on_every_way_out(
+        tmp_path, monkeypatch, servers_main_builds, stop_handlers, way_out):
+    # main() is also called in-process, and a recording handler left bound after it returned would
+    # swallow every later SIGTERM and Ctrl-C in that process. each way out is reached from a point
+    # where the handlers are known to be in place, and the control is that they were not the test's own
+    # there, so that a main() that never installed any cannot pass this by leaving the originals alone
+    during = []
+    argv = ["--port", "0", "--snapshot-path", str(tmp_path / "dump.mrdb")]
+    outcome = None
+    if way_out == "a clean return":
+        monkeypatch.setattr(Server, "run", lambda self: during.append(stop_handlers.held()))
+    elif way_out == "a run that raises":
+        def exploding_run(self):
+            during.append(stop_handlers.held())
+            raise RuntimeError("run exploded")
+
+        monkeypatch.setattr(Server, "run", exploding_run)
+        outcome = RuntimeError
+    elif way_out == "a refused snapshot":
+        def refusing_load(path):
+            during.append(stop_handlers.held())
+            raise persistence.SnapshotError("injected: the snapshot is refused")
+
+        monkeypatch.setattr(persistence, "load", refusing_load)
+        outcome = SystemExit
+    else:
+        real_parser = server_module.build_arg_parser
+
+        def recording_parser():
+            during.append(stop_handlers.held())
+            return real_parser()
+
+        monkeypatch.setattr(server_module, "build_arg_parser", recording_parser)
+        argv = ["--port", "not-a-port"]
+        outcome = SystemExit
+    monkeypatch.setattr(logging, "basicConfig", lambda **kwargs: None)
+
+    if outcome is None:
+        server_module.main(argv)
+    else:
+        with pytest.raises(outcome):
+            server_module.main(argv)
+
+    assert len(during) == 1, "main() never reached the point this way out is taken from"
+    assert all(during[0][signum] != stop_handlers.ours[signum] for signum in stop_handlers.ours), (
+        "main() had not replaced the test's handler for both stop signals there, so a restored handler below proves nothing")
+    assert stop_handlers.held() == stop_handlers.ours, "main() left its own handlers bound"
+
+
+def test_main_starts_without_a_stop_request_an_earlier_main_left_behind(
+        tmp_path, monkeypatch, servers_main_builds, stop_handlers):
+    # a stop recorded by a main() that then failed before run() -- a refused snapshot is the ordinary
+    # way -- is never consumed, and the next main() in the process must not begin by honouring it.
+    # only the record itself can say so here: a stale one is read by run() exactly as a fresh one is
+    monkeypatch.setattr(server_module, "_stop_requested_during_startup", True)
+    seen = []
+    monkeypatch.setattr(Server, "run", lambda self: seen.append(server_module._consume_stop_requested_during_startup()))
+    monkeypatch.setattr(logging, "basicConfig", lambda **kwargs: None)
+    server_module.main(["--port", "0", "--snapshot-path", str(tmp_path / "dump.mrdb")])
+    assert seen == [False]
 
 
 def test_a_negative_drain_timeout_is_refused_without_recommending_zero(capsys):

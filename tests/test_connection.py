@@ -3,7 +3,7 @@ import socket
 import pytest
 
 import resp
-from connection import Connection, Role
+from connection import Connection, Role, unread_in_kernel
 from tests.int_ceiling import NO_CEILING_REASON, NO_CONVERSION_CEILING, OVERSIZED_DIGIT_RUN
 
 
@@ -117,6 +117,65 @@ def test_unread_in_kernel_answers_zero_for_a_closed_connection(pair):
     peer.sendall(b"PING\r\n")
     conn.close()
     assert conn.unread_in_kernel() == 0
+
+
+def test_unread_in_kernel_answers_zero_for_a_socket_closed_behind_the_connections_back(pair):
+    # the connection's closed flag is its own and says nothing about its socket: a socket object that
+    # has given up its descriptor leaves closed False and answers -1 from fileno(), and what ioctl
+    # raises for that is a ValueError and not the OSError a refused question raises. the drain asks
+    # this of every connection it left open, from inside the finally clause that writes its one line,
+    # so a raise here is the line not being written
+    conn, peer = pair
+    peer.sendall(b"PING\r\n")
+    conn._sock.close()
+    assert conn.closed is False, "the case under test needs a connection that does not know its socket is gone"
+    assert conn.unread_in_kernel() == 0
+
+
+def test_the_module_level_unread_in_kernel_answers_zero_for_a_closed_socket_object():
+    # the function the server asks of a socket no Connection owns, the accept backlog's, and the one
+    # the method above delegates to. the same ValueError as above, reached without a connection in
+    # the way: a closed socket object answers -1 from fileno()
+    a, b = socket.socketpair()
+    try:
+        b.sendall(b"PING\r\n")
+        a.close()
+        assert unread_in_kernel(a) == 0
+    finally:
+        a.close()
+        b.close()
+
+
+def test_the_module_level_unread_in_kernel_answers_zero_when_the_kernel_refuses_the_question():
+    # the other family, which is an OSError and not the ValueError above: a descriptor number the
+    # process holds nothing under is refused by the kernel with EBADF. a number this far up is never
+    # open in a test process, so the refusal does not depend on what the rest of the suite left open
+    class Unheld:
+        def fileno(self):
+            return 1 << 20
+
+    assert unread_in_kernel(Unheld()) == 0
+
+
+def test_unread_in_kernel_answers_a_queue_longer_than_a_sixteen_bit_count_holds(pair):
+    # the answer is written into a buffer the call is handed, and CPython copies a mutable buffer
+    # that small through its own and copies back only as many bytes as the buffer was long, so one
+    # sized for a short is not refused: it truncates, to the low sixteen bits and signed. 140,000
+    # reads back as 8,928, and a stop that had thrown away 40,000 bytes published a negative figure.
+    # the two tests above send at most a few bytes and could not see any of it
+    conn, peer = pair
+    # a socketpair holds 8 KiB by default in either direction, so the queue could not get this long
+    # without both ends being raised, which end's limit governs depending on the platform
+    for sock in (conn._sock, peer):
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 1 << 21)
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 1 << 21)
+    queued = 140_000
+    # a timeout so that a kernel that takes less than this is a failure and not a send that never returns
+    peer.settimeout(5)
+    peer.sendall(b"x" * queued)
+    assert conn.unread_in_kernel() == queued
+    assert conn.unread_in_kernel() == queued, "the question consumed what it counted"
+    assert unread_in_kernel(conn._sock) == queued
 
 
 def test_take_commands_drains_a_pipelined_buffer(pair):
@@ -488,3 +547,73 @@ def test_incomplete_since_is_none_on_a_new_connection_and_is_never_written_by_co
     assert conn.incomplete_since is None
     conn.close()
     assert conn.incomplete_since is None
+
+
+def test_a_multibulk_awaiting_elements_reports_the_bytes_it_has_consumed_with_an_empty_buffer(pair):
+    # take_commands deletes the bytes it parses, so the read buffer alone says a half-received
+    # command holds nothing at exactly the points where has_incomplete_command needs _argv as well.
+    # the shutdown drain reports the bytes it throws away, and these are among them: the count is
+    # kept because nothing afterwards can recover it from the buffer
+    conn, peer = pair
+    stages = [
+        (b"*3\r\n", 4),                 # the header alone
+        (b"$3\r\nSET\r\n", 13),         # and the first element
+        (b"$1\r\nk\r\n", 20),           # and the second, the buffer ending exactly there each time
+    ]
+    for chunk, held in stages:
+        peer.sendall(chunk)
+        conn.receive()
+        assert conn.take_commands() == []
+        assert conn.read_buffer == bytearray(), "the case under test needs an empty buffer"
+        assert conn.consumed_for_incomplete_command == held
+    peer.sendall(b"$1\r\nv\r\n")
+    conn.receive()
+    assert conn.take_commands() == [[b"SET", b"k", b"v"]]
+    assert conn.consumed_for_incomplete_command == 0, "a completed command holds nothing"
+
+
+def test_what_a_connection_holds_for_an_incomplete_command_is_accounted_at_every_byte(pair):
+    # the count and the buffer together are every byte of the command that has not completed, and
+    # that is asserted after each byte of a stream rather than at chosen points: the stream mixes a
+    # multibulk, an inline line, an empty line, an empty multibulk and a second multibulk, so every
+    # branch of take_commands that touches the count is crossed, and a figure that drifts at any
+    # byte is reported at that byte. the sum is what the drain publishes, and it is only right if
+    # a byte is in one of the two and never in both or neither
+    conn, peer = pair
+    pieces = [
+        b"*3\r\n$3\r\nSET\r\n$1\r\nk\r\n$1\r\nv\r\n",
+        b"PING\r\n",
+        b"\r\n",
+        b"*0\r\n",
+        b"*2\r\n$4\r\nECHO\r\n$2\r\nhi\r\n",
+    ]
+    stream = b"".join(pieces)
+    # the offsets at which a step has finished and nothing is held
+    boundaries = {0}
+    total = 0
+    for piece in pieces:
+        total += len(piece)
+        boundaries.add(total)
+    for fed in range(1, len(stream) + 1):
+        peer.sendall(stream[fed - 1:fed])
+        conn.receive()
+        conn.take_commands()
+        held = fed - max(boundary for boundary in boundaries if boundary <= fed)
+        accounted = conn.consumed_for_incomplete_command + len(conn.read_buffer)
+        assert accounted == held, (fed, accounted, held)
+    assert conn.consumed_for_incomplete_command == 0 and conn.read_buffer == bytearray()
+
+
+@pytest.mark.parametrize("step", [b"PING\r\n", b"\r\n", b"*0\r\n"], ids=["inline command", "empty line", "empty multibulk"])
+def test_a_step_that_leaves_no_command_outstanding_leaves_the_count_at_zero(pair, step):
+    # the three ways a step ends with nothing owed: an inline command, an empty line, and a header that
+    # declares no elements. none can be reached with anything held, so the count is put there by hand,
+    # which is the only way to see that each of them resets it rather than relying on the reset that
+    # completing a multibulk makes: a count that drifted up would put bytes in the drain's figure that
+    # were never on the wire
+    conn, peer = pair
+    conn.consumed_for_incomplete_command = 99
+    peer.sendall(step)
+    conn.receive()
+    conn.take_commands()
+    assert conn.consumed_for_incomplete_command == 0
