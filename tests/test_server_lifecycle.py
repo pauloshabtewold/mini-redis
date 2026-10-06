@@ -540,11 +540,14 @@ def test_a_failed_bind_leaves_the_server_usable():
         squatter.close()
 
 
-def test_main_exits_one_with_a_single_line_and_no_traceback_on_a_failed_bind():
+def test_main_exits_one_with_a_single_line_and_no_traceback_on_a_failed_bind(tmp_path):
     # every other startup refusal main() has -- a corrupt snapshot, an unwritable path --
     # already exits 1 with one line; before ListenFailed existed a bind failure alone
     # unwound as a full traceback out of main(), where this line is what tells the two
-    # apart from an operator's own mistake
+    # apart from an operator's own mistake. the snapshot path is a file under tmp_path with
+    # saving off, and not the default ./dump.mrdb: that is resolved against the directory
+    # pytest runs in, which is the repository, and main() constructs the server before it
+    # tries the bind, which creates and removes a temporary file beside the snapshot path
     squatter = socket.socket()
     squatter.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     squatter.bind(("127.0.0.1", 0))
@@ -554,7 +557,8 @@ def test_main_exits_one_with_a_single_line_and_no_traceback_on_a_failed_bind():
         err = io.StringIO()
         try:
             with contextlib.redirect_stderr(err):
-                main(["--port", str(port)])
+                main(["--port", str(port), "--snapshot-interval", "0",
+                      "--snapshot-path", str(tmp_path / "dump.mrdb")])
             pytest.fail("main() started on a port another socket already holds")
         except SystemExit as exc:
             assert exc.code == 1, ("a failed bind is not a usage error", exc.code)

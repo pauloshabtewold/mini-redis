@@ -955,20 +955,32 @@ def test_the_drain_logs_exactly_one_line_however_it_ends(tmp_path, scene_for):
     assert drained[0].levelno == logging.INFO and message.startswith("shutdown drain complete"), message
     # the counts are read by name and not off the end of the line: asserting the tail pins which figure is last rather than what any of them says, and a figure added to the line then moves the assertion without changing what it checks
     assert _drain_counts(drained[0]) == (0, 0), message
+    # the third figure is asserted on its own, because the two reply counts cannot say anything about it: a request thrown away undispatched is not a reply anybody is owed. a stop that handed every reply over and read nothing it had to throw away reports zero request bytes discarded, and a figure taken from the wrong buffer or never filled in leaves both reply counts green
+    assert _drain_discarded(drained[0]) == 0, message
     # a loss is a WARNING and a clean ending is not, so a configuration that shows warnings and above shows the line that says something was lost and not the one that says nothing was
     for ending, records in (("timed out", timed_out), ("skipped", skipped)):
         message = records[0].getMessage()
         assert records[0].levelno == logging.WARNING, (ending, message)
         assert message.startswith("shutdown drain incomplete"), (ending, message)
         assert _drain_counts(records[0])[1] == 1, (ending, message)
+        # every request the client sent was dispatched before the stop, and the loss here is of replies, so there is no request for the drain to have discarded
+        assert _drain_discarded(records[0]) == 0, (ending, message)
+
+
+def _drain_figure(record, label):
+    message = record.getMessage()
+    found = re.search(r"%s: (\d+)" % label, message)
+    assert found, (label, message)
+    return int(found.group(1))
 
 
 def _drain_counts(record):
-    message = record.getMessage()
-    closed = re.search(r"closed while owed bytes: (\d+)", message)
-    still = re.search(r"still owed bytes: (\d+)", message)
-    assert closed and still, message
-    return int(closed.group(1)), int(still.group(1))
+    return (_drain_figure(record, "closed while owed bytes"),
+            _drain_figure(record, "still owed bytes"))
+
+
+def _drain_discarded(record):
+    return _drain_figure(record, "request bytes discarded undispatched")
 
 
 def test_a_client_that_half_closes_during_the_drain_still_receives_every_reply(tmp_path, scene_for, monkeypatch):

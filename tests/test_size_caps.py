@@ -324,21 +324,39 @@ def test_each_new_numeric_flag_is_refused_when_negative_at_both_doors(capsys):
     # high-water mark reads any non-zero value as a mark that is set, so a negative one is
     # refused for sitting below the low-water mark instead -- a ValueError either way, and
     # the operator is told the marks are the wrong way round rather than that the number
-    # they typed is not allowed at all
+    # they typed is not allowed at all.
+    # each flag carries the ending its refusal has to finish on, spelled out here and not read
+    # from the module under test, which would pin nothing. the shared ending tells the operator
+    # that 0 disables the check, and for --write-buffer-low-water that is untrue: with the pause
+    # on its 0 means resume only when the queue is empty and switches nothing off, so it has an
+    # ending of its own at both doors. "cannot be negative" alone passes for either ending, and
+    # for a flag handed another's message, so the ending is asserted in full and the other
+    # flags' endings are asserted absent. there are two endings among the three, and the
+    # count is asserted so that a table collapsed to one leaves the absence check with
+    # something to compare against
     flags = (
-        ("--write-buffer-high-water", "write buffer high water", "write_buffer_high_water"),
-        ("--write-buffer-low-water", "write buffer low water", "write_buffer_low_water"),
-        ("--incomplete-command-timeout", "incomplete command timeout", "incomplete_command_timeout"),
+        ("--write-buffer-high-water", "write buffer high water", "write_buffer_high_water",
+         "0 disables the check, not -1"),
+        ("--write-buffer-low-water", "write buffer low water", "write_buffer_low_water",
+         "-1 does not turn anything off, and 0 means resume only when the queue is empty"),
+        ("--incomplete-command-timeout", "incomplete command timeout", "incomplete_command_timeout",
+         "0 disables the check, not -1"),
     )
-    for flag, label, name in flags:
+    endings = {ending for _flag, _label, _name, ending in flags}
+    assert len(endings) == 2, endings
+    for flag, label, name, ending in flags:
         with pytest.raises(SystemExit):
             build_arg_parser().parse_args([flag, "-1"])
         message = capsys.readouterr().err
         assert flag in message and label in message and "_" + name not in message, message
+        # through the end of the line, so the ending is exactly this flag's and nothing follows it
+        assert "cannot be negative; %s\n" % ending in message, message
         with pytest.raises(ValueError) as refusal:
             Server(0, **{name: -1})
         refused = str(refusal.value)
-        assert name in refused and "cannot be negative" in refused, refused
+        assert name in refused and refused.endswith("cannot be negative; %s" % ending), refused
+        for other in endings - {ending}:
+            assert other not in message and other not in refused, (flag, other)
 
         assert getattr(build_arg_parser().parse_args([flag, "0"]), name) == 0
         server = Server(0, **{name: 0})

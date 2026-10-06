@@ -37,9 +37,18 @@ RUN python -c 'import tomllib; print("\n".join(tomllib.load(open("pyproject.toml
 # Source layer. The server runs from /app; installing the package as well shows that
 # pyproject.toml builds from the files the build context carries. The build and egg-info
 # directories that leaves in /app are removed.
+# The last command asserts what the install carried, because nothing else fails a build
+# whose context lacks README.md or LICENSE: the dependency layer's COPY used to, and
+# setuptools builds the wheel without a long description or without the licence file and
+# says nothing, so a .dockerignore edit that dropped either would ship an image that
+# looks right. It is here and not back on that COPY because a COPY that names those files
+# rebuilds the dependency layer on every edit to the front page, and because the installed
+# metadata is what the wheel holds, which the presence of the files in the context does
+# not show.
 COPY . .
 RUN pip install --no-compile . \
-    && rm -rf build ./*.egg-info
+    && rm -rf build ./*.egg-info \
+    && python -c 'import importlib.metadata as m; d = m.metadata("mini-redis"); assert d.get_payload(), "README.md did not reach the image: the installed package has no long description"; assert d.get_all("License-File"), "LICENSE did not reach the image: the installed package carries no licence file"'
 
 VOLUME /data
 USER mini-redis

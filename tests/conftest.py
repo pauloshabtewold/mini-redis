@@ -129,7 +129,11 @@ def launch_server(snapshot_path, extra_args=(), attempts=5):
     and a crash test has to end its server with `SIGKILL`; and `test_logging.py`, whose
     `_Running` helper drains the child's stderr on a thread. A list of them is a list that
     goes stale the next time a module starts its own, so it is the count that is stated
-    first: four, and `grep -l Popen tests/*.py` is what checks it.
+    first: four, and `grep -l 'Popen(' tests/*.py | grep -v /conftest.py` is what checks
+    it. The call's opening parenthesis is in the pattern because a bare `Popen` also
+    matches the comment in `test_redis_cli_smoke.py` that says it uses `launch_server`
+    rather than one of its own, and `conftest.py` is filtered out because it is the
+    launcher the four stand apart from: without the filter the same search prints five.
 
     Everything here is bounded: five attempts, each with its own five-second deadline that
     holds on every path through the read, so a server that says nothing, says half a line,

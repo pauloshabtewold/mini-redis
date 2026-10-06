@@ -1,8 +1,11 @@
 """The Connection class: owns the socket, the read and write buffers, the role, and the only outbound API."""
 
+import array
 import enum
+import fcntl
 import itertools
 import socket
+import termios
 
 import resp
 
@@ -103,6 +106,26 @@ class Connection:
 
     def fileno(self) -> int:
         return self._sock.fileno()
+
+    def unread_in_kernel(self) -> int:
+        # how many bytes the peer has sent that this process has not read, asked of the kernel
+        # rather than read out of it, so it costs one syscall and takes nothing out of the receive
+        # queue. the one caller counts these at a stop, where they are bytes about to be thrown
+        # away: a close over a non-empty receive queue is a reset, and nothing dispatches what is
+        # sitting in it. a read is not the alternative -- reading them is what the drain already
+        # does for as long as it runs, and this is the question asked about whatever it did not
+        # reach
+        # 0 rather than a raise for a closed socket, or a kernel that refuses the question on some
+        # descriptor this never sees, because the only caller is assembling a figure for one log
+        # line and a report that raises on the way out is worse than one that is short
+        if self.closed:
+            return 0
+        held = array.array("i", [0])
+        try:
+            fcntl.ioctl(self._sock.fileno(), termios.FIONREAD, held, True)
+        except OSError:
+            return 0
+        return held[0]
 
     @property
     def has_incomplete_command(self) -> bool:

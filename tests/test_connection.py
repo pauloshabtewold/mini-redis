@@ -95,6 +95,30 @@ def test_fileno_is_the_underlying_descriptor(pair):
     assert conn.fileno() == conn._sock.fileno()
 
 
+def test_unread_in_kernel_answers_what_the_peer_sent_and_nothing_was_read(pair):
+    # asked rather than read, so the answer must not consume what it counts: the server asks this
+    # of a connection it is about to close during a stop, and a question that took the bytes would
+    # be a read the drain decided not to do
+    conn, peer = pair
+    assert conn.unread_in_kernel() == 0, "nothing has been sent yet"
+    peer.sendall(b"*1\r\n$4\r\nPING\r\n")
+    assert conn.unread_in_kernel() == 14
+    assert conn.unread_in_kernel() == 14, "the question consumed what it counted"
+    conn.receive()
+    assert conn.unread_in_kernel() == 0, "the receive queue is empty once it has been read"
+    assert bytes(conn.read_buffer) == b"*1\r\n$4\r\nPING\r\n"
+
+
+def test_unread_in_kernel_answers_zero_for_a_closed_connection(pair):
+    # the one caller is assembling a figure for a log line written from a finally clause, and it
+    # asks every connection the drain disposed of, some of which are already closed. a descriptor
+    # of -1 raises from the ioctl, and a report that raises on the way out is worse than a short one
+    conn, peer = pair
+    peer.sendall(b"PING\r\n")
+    conn.close()
+    assert conn.unread_in_kernel() == 0
+
+
 def test_take_commands_drains_a_pipelined_buffer(pair):
     conn, peer = pair
     peer.sendall(b"*1\r\n$4\r\nPING\r\n" + b"PING\r\n")

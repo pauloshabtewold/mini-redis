@@ -642,6 +642,137 @@ def test_the_drain_line_reports_the_bytes_it_discarded(make_connection, caplog):
     assert "request bytes discarded undispatched: %d" % discarded in lines[0], lines[0]
 
 
+def test_what_the_drain_never_read_is_counted_for_a_connection_it_closes(make_connection, caplog):
+    # the shape that makes the figure worth having. a connection owing nothing is closed by the
+    # setup pass with no read pass at all, so a count of what the drain read reports 0 for it
+    # however much its peer sent -- and the close over a non-empty receive queue is a reset, which
+    # is what makes those requests a loss rather than something a later pass would have reached
+    server, conn = make_connection([BlockingIOError])
+    sent = _PING * 5
+    conn._sock.peer.sendall(sent)
+    server._draining = True
+
+    with caplog.at_level(logging.INFO, logger="server"):
+        server._drain_for(0)
+
+    assert conn.closed, "a connection owing nothing is closed by the setup pass"
+    assert server._discarded_request_bytes == len(sent), server._discarded_request_bytes
+    # the level decision, pinned where the figure is not zero, which is the only place it says
+    # anything: no reply was owed to anyone, so the line is INFO and says complete although a
+    # whole pipeline was thrown away. that is the documented choice and not an oversight, and
+    # without this assertion promoting the level on a non-zero count would turn no test red
+    line = [r for r in caplog.records if "shutdown drain" in r.getMessage()]
+    assert len(line) == 1, [r.getMessage() for r in line]
+    assert line[0].levelno == logging.INFO, line[0].getMessage()
+    assert line[0].getMessage().startswith("shutdown drain complete"), line[0].getMessage()
+
+
+def test_what_the_drain_never_read_is_counted_for_a_connection_still_owing_at_the_deadline(make_connection):
+    # the same loss on the other arm: this connection owes a reply, so the setup pass keeps it, and
+    # at a 0 timeout the loop runs no pass at all -- deadline = now + 0, and the clock does not go
+    # backwards -- so every request its peer sent is still sitting in the receive queue when the
+    # drain gives up. the figure has to carry those too, and nothing before it did
+    server, conn = make_connection([BlockingIOError])
+    sent = _PING * 7
+    conn._sock.peer.sendall(sent)
+    conn.queue(b"x" * 10)
+    server._draining = True
+
+    server._drain_for(0)
+
+    assert not conn.closed and conn.write_buffer, "the case under test needs a connection still owed bytes"
+    assert server._discarded_request_bytes == len(sent), server._discarded_request_bytes
+
+
+def test_a_buffer_and_a_receive_queue_are_both_counted_and_not_one_instead_of_the_other(make_connection):
+    # the setup pass's site and the close's site add. either one written as an assignment rather
+    # than an addition reports one of the two and looks right doing it
+    server, conn = make_connection([BlockingIOError])
+    conn.read_buffer.extend(_PING * 3)
+    buffered = len(conn.read_buffer)
+    in_the_kernel = _PING * 9
+    conn._sock.peer.sendall(in_the_kernel)
+    conn.queue(b"x" * 10)
+    server._draining = True
+
+    server._drain_for(0)
+
+    assert server._discarded_request_bytes == buffered + len(in_the_kernel), (
+        server._discarded_request_bytes, buffered, len(in_the_kernel))
+
+
+def test_a_buffer_and_what_a_drain_pass_reads_are_both_counted(make_connection):
+    # the third pairing, and the one only a drain that actually runs a pass reaches: a 0 timeout
+    # runs none -- deadline is now plus nothing and the clock does not go backwards -- so a test
+    # that passes 0 cannot tell the read path's addition from an assignment. the connection is
+    # left owing ten bytes the script blocks on once, so the first pass reads and the second send
+    # empties the buffer and ends the loop rather than spinning it to a deadline
+    server, conn = make_connection([BlockingIOError, 10])
+    conn.queue(b"x" * 10)
+    server._flush(conn)                             # the blocked send, which registers write interest
+    conn.read_buffer.extend(_PING * 2)
+    buffered = len(conn.read_buffer)
+    arrives_later = _PING * 6
+    conn._sock.peer.sendall(arrives_later)
+    server._draining = True
+
+    server._drain_for(1)
+
+    assert not conn.write_buffer, "the drain was meant to end on an emptied buffer, not on its deadline"
+    assert server._discarded_request_bytes == buffered + len(arrives_later), (
+        server._discarded_request_bytes, buffered, len(arrives_later))
+
+
+def test_the_setup_pass_sums_the_buffers_of_every_connection_and_not_the_last_one(make_connection):
+    # one connection cannot tell an addition from an assignment, and a real stop has a population.
+    # the buffers are deliberately different lengths so that the sum is not any one of them
+    server, first = make_connection([BlockingIOError])
+    _, second = make_connection([BlockingIOError])
+    first.read_buffer.extend(_PING * 2)
+    second.read_buffer.extend(_PING * 5)
+    total = len(_PING) * 7
+    for conn in (first, second):
+        conn.queue(b"x" * 10)
+    server._draining = True
+
+    server._drain_for(0)
+
+    assert server._discarded_request_bytes == total, server._discarded_request_bytes
+
+
+def test_a_connection_that_owes_nothing_has_its_buffer_counted_before_it_is_abandoned(make_connection):
+    # counted for every connection, owing or not, and this is the one the arm order could drop: a
+    # client caught half way through a command has bytes in its read buffer and nothing queued for
+    # it, so the setup pass abandons it. that is the case the figure's own level decision is argued
+    # from, which makes it the one that has to be counted
+    server, conn = make_connection([BlockingIOError])
+    conn.read_buffer.extend(b"*1\r\n$4\r\nPI")       # a command that has begun and not ended
+    buffered = len(conn.read_buffer)
+    server._draining = True
+
+    server._drain_for(0)
+
+    assert conn.closed and not conn.write_buffer, "the case under test needs a connection owing nothing"
+    assert server._discarded_request_bytes == buffered, server._discarded_request_bytes
+
+
+def test_the_closes_after_the_drain_add_nothing_to_the_figure_it_already_reported(make_connection):
+    # _shutdown closes every connection the drain left open, after the line has been written. those
+    # closes go through _close like any other, so without the flag that scopes the accounting they
+    # would count a receive queue the finally clause has already counted, and the attribute would
+    # not match the figure anyone was shown
+    server, conn = make_connection([BlockingIOError])
+    conn._sock.peer.sendall(_PING * 4)
+    conn.queue(b"x" * 10)
+    server._draining = True
+
+    server._drain_for(0)
+    reported = server._discarded_request_bytes
+    server._abandon(conn)                           # what _shutdown does to each connection
+
+    assert server._discarded_request_bytes == reported, (server._discarded_request_bytes, reported)
+
+
 @pytest.mark.parametrize("flag, value", [
     ("--port", "abc"), ("--port", ""), ("--port", "1.5"),
     ("--write-buffer-limit", "abc"), ("--write-buffer-limit", "1e6"),
