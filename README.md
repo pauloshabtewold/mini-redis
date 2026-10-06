@@ -129,16 +129,26 @@ fails at a known offset. Truncation does: it is refused at every offset. A flipp
 mostly does not. I ran 3,000 single-bit-flip trials, one random bit each, against the
 shipping encoder: a 2,036-byte snapshot of 41 keys holding a list and a TTL, 16,288 bit
 positions. Decoded with the trailer recomputed over the corrupted bytes, which is what a
-length-prefixed format with no checksum amounts to, **81.0% of the flips were silently
-accepted as a snapshot holding different data** and only 19.0% were caught at all -- 475
-of those by a length prefix running off the end, 48 by a type byte that named no kind,
+length-prefixed format with no checksum amounts to, **about 81% of the flips were silently
+accepted as a snapshot holding different data** and only about 19% were caught at all --
+475 of those by a length prefix running off the end, 48 by a type byte that named no kind,
 and 5 by a key arriving twice. With the CRC32 trailer in place, all 3,000 were refused,
-100%. The reason is that most bytes in a snapshot are payload and not structure, so a
-flip inside a key, a value or an expiry passes every bounds check there is.
-`HELLOWORLD` came back as `HELLOWOVLD`; a key named `beta` came back as `beua`, so
+100%. The two shares are estimates from 3,000 random trials and are written as estimates
+for that reason: the exhaustive figure for a fixture of this shape is 80.9% accepted and
+18.9% caught, which is the ceiling, since only a flip in a key, a value or an expiry can
+be accepted as different data and the rest of the bytes are structure. That is also the
+reason for the result: most bytes in a snapshot are payload and not structure, so a
+flip inside a key, a value or an expiry passes every bounds check there is. On a smaller
+three-key fixture, flipped exhaustively, the same decode accepts 50.0% as different data —
+the share is a function of how much of the blob is payload, so it is the shape of the
+finding and not either number that carries. These corruptions are from that three-key
+fixture: `HELLOWORLD` came back as `HELLOWOVLD`; a key named `beta` came back as `beua`, so
 `GET beta` answered nil and a
 key nobody wrote existed; an expiry of 1700000000000 came back as 1699995805696.
-`tests/test_persistence_properties.py` pins both sides, and `docs/DESIGN.md` has the
+`tests/test_persistence_properties.py` pins the refusal side exactly — every flip a
+`SnapshotError`, and for the right reason — and asserts of the other side only that it
+accepts something, on the smaller fixture. The shares above are not pinned by any test.
+`docs/DESIGN.md` has the
 other half of the picture, the count and version fields, where the length prefixes do
 catch every flip.
 
@@ -154,8 +164,8 @@ and sends it on the next writable event; `docs/DESIGN.md` has the counts and how
 were taken.
 
 **`redis-benchmark` drops an unrecognised `-t` name and still exits 0.** Measured on
-7.2.7, the version the numbers above were taken with: `-t nosuchtest` printed nothing at
-all, wrote nothing to standard error and exited 0; `-t set,nosuchtest` ran `SET` and
+7.2.7, the version the numbers above were taken with: `-t nosuchtest` printed one byte, a
+newline, wrote nothing to standard error and exited 0; `-t set,nosuchtest` ran `SET` and
 dropped the rest without a word, exit 0; and the pinned list with `lrange_100` misspelt
 as `lrange100` ran nine tests, printed a table that looks complete, and exited 0 with the
 `LRANGE_100` line simply absent. A missing test is invisible in a table of results,
@@ -168,8 +178,10 @@ it appears whether or not the `LPUSH` test ran. Then require each of the ten nam
 begin one of the remaining lines, followed by `:` or ` (`, because the two `LRANGE`
 labels carry a parenthetical.
 
-On 7.2.7, at the pinned request count, the real run reports nothing missing, with 8
-lines carrying the seeding label. With `lpush` dropped from the list, so nine names, the
+On 7.2.7, at the pinned request count, the real run reports nothing missing, with four to
+six lines carrying the seeding label across seven runs. How many there are is not fixed —
+the next paragraph says why — so take the range and not a figure from it.
+With `lpush` dropped from the list, so nine names, the
 tool still exits 0 and the rule reports `LPUSH` missing, while a plain search for
 `LPUSH` anywhere in the output and a rule that discards exactly one seeding line both
 report nothing missing. The number of seeding lines is not fixed, because the tool
@@ -288,9 +300,10 @@ of some tens of thousands of small commands. It packs the whole batch and writes
 before it reads any reply, which is the client the pause described under the water marks
 below leaves hanging, so a batch of hundreds of thousands can hang it at the shipped
 defaults; `--write-buffer-high-water 0` is what lets it complete. `redis-benchmark`'s
-default run completes `PING`, `SET`, `GET`, `INCR`, `LPUSH`, `RPUSH`, `LPOP` and `RPOP`,
-and exits at `SADD`, the first command in its sequence this server does not implement at
-all.
+default run completes nine tests — `PING_INLINE` and `PING_MBULK` both, then `SET`,
+`GET`, `INCR`, `LPUSH`, `RPUSH`, `LPOP` and `RPOP` — and exits at `SADD`, the first
+command in its sequence this server does not implement at all. Two of the nine are `PING`,
+because the tool sends it unframed and framed and this server answers both.
 
 A `redis-py` client that asks for RESP3 by default, as the one this suite runs against
 does, sends `HELLO 3` as it connects, and this server answers `NOPROTO unsupported
@@ -333,7 +346,9 @@ once the kernel has taken what it will; it defaults to 32 MiB, and 0 turns it of
 paragraphs after this one say what that default is and costs. `KEYS *` has the same
 shape: it materialises its whole reply as one array holding every key in the keyspace,
 with no cap of its own, so the reply is bounded only by however large the keyspace has
-already grown — real Redis has the same property and documents it. `INFO`'s
+already grown — real Redis has the same property, and documents the command as
+`O(N)` and dangerous on a large keyspace rather than documenting the reply's size.
+`INFO`'s
 `used_memory` is peak resident memory rather than current on any platform without
 `/proc`: it reads `/proc/self/statm` where that exists and falls back to
 `resource.getrusage(...).ru_maxrss`, a high-water mark, so the two figures agree right
@@ -350,9 +365,14 @@ mark is 0. A high-water mark of 0 switches the pause off, so reading goes on how
 much is queued and the low-water mark is never reached; with the pause on, a low-water
 mark of 0 means resume only when the queue is empty. `--write-buffer-limit` is the
 ceiling behind them. With the pause in force it is not what slows a client down: a
-client that stops reading is paused long before it reaches 32 MiB, and what the limit
-catches is a reply larger than it is, or the replies to one read's worth of pipelined
-requests, which the pause cannot unqueue once they are parsed. The 32 MiB default is a
+client that stops reading is paused rather than throttled, and what the limit catches is
+a reply larger than it is, or the replies to one read's worth of pipelined requests,
+which the pause cannot unqueue once they are parsed. What the pause does not do is hold
+such a client anywhere near the high-water mark. The batch that crossed the mark is
+still dispatched whole, so a paused connection holds the mark plus that batch — measured
+at the shipped defaults, up to 30.4 MiB against the 32 MiB limit, thirty times the mark
+and 95% of the ceiling. The pause keeps a client that stops reading from being closed by
+the limit; it does not keep it far away from the limit. The 32 MiB default is a
 choice, and a departure from the reference, which leaves an ordinary client's output
 buffer unlimited. This server does not: nothing else here bounds what a few kilobytes
 of pipelined requests can queue, and a bounded queue is worth being different over.
@@ -372,24 +392,44 @@ limit, so a list of elements that are all far under the cap can be stored and no
 back at any finite limit, and a `KEYS` reply is judged the same way. Only 0 reads every
 one of them back.
 
-**A client that stops reading is paused, not closed.** The pause is what keeps it from
-ever approaching `--write-buffer-limit`, so that limit never fires for it;
+**A client that stops reading is paused, not closed.** The pause is what keeps
+`--write-buffer-limit` from firing for it, not what keeps it away from the limit;
 `--incomplete-command-timeout` is suspended for every paused connection, whatever it has
 or has not sent, so that flag does not bound it either; and it holds what is already
 queued for it, at least the high-water mark's worth plus whatever the one batch that
 crossed the mark queued, until it disconnects. That is bounded: per connection by the
 mark plus that batch, which the limit in turn caps at the limit plus one reply while the
-limit is on, and over all connections by `--max-connections`. It is also a divergence
+limit is on, and over all connections by `--max-connections`. Read that bound as the
+product it is. Measured at the shipped defaults, one paused connection holds up to
+30.4 MiB, so the default `--max-connections 1024` puts the aggregate near 30 GiB — far
+past the memory of any machine this is likely to run on, and the cap is what bounds the
+count of connections, not what makes the total small. Ninety-six paused connections drove
+2.9 GB into swap on an 8 GiB machine, with every one still open and a fresh client still
+answered in six milliseconds. It is also a divergence
 from the reference, which keeps reading such a client and closes it at the hard limit
 configured for ordinary clients, if there is one. It is accepted and not fixed: bounding
 how long a connection may stay paused would be a control of its own, and
 `--incomplete-command-timeout` is not it, since it is suspended for a paused connection
-whether or not that connection holds a half-sent command. The pause has one more cost,
-for a different client: one that writes every request before it reads any reply, as
+whether or not that connection holds a half-sent command.
+
+The pause has two more costs, for two different clients. One that writes every request
+before it reads any reply, as
 `redis-py`'s `pipeline()` does with the batch it holds, hangs once the requests it has
 still to send no longer fit in what the two kernels will hold, and nothing closes it.
 Where that point falls moves from run to run, and with `--write-buffer-high-water 0` the
-pause is off and the same client is answered in full. `docs/DESIGN.md` has the
+pause is off and the same client is answered in full. And a client that stops reading
+loses writes when the server is stopped. Its requests wait unread for as long as it stays
+paused, which is until it disconnects; a stop reads and discards every one of them, so a
+pipeline whose `send()` has already returned is lost in full. It takes the pause to have
+fired, which takes more queued replies than the two kernels will hold — below that the
+connection is still being read and nothing is lost. Measured over three runs where it did
+fire: of 50,000 pipelined `SET`s whose bytes the kernels had accepted, 1,433 to 1,919 were
+executed and 48,081 to 48,567 were discarded, with the client given a clean end of input
+and the server exiting 0 — and 50,000 of 50,000 executed in all three runs with
+`--write-buffer-high-water 0`. The drain's own line counts the bytes it discarded
+undispatched, about 1.64 MB in those runs and 0 with the pause off, and that figure is the
+only place the loss is reported; nothing bounds it, and only turning the pause off removes
+it. `docs/DESIGN.md` has the
 measurements and the reasoning.
 
 **Four more flags cover persistence and the active sweep.** Persistence is on by
@@ -509,11 +549,18 @@ connection the high-water mark had stopped reading is read again from the moment
 drain begins, for the same reason: whatever it had not read would still be in its
 receive queue at the close. The deadline is checked between passes of the loop, so the
 real bound is SECONDS plus one `select()` timeout, and the drain ends in one log line
-however it ends, even when a pass raises. The line carries two counts, connections
-closed while they still owed bytes and connections still owing bytes when the drain
-ended, and it is a warning if either is non-zero and informational if both are zero.
-Both are shown at the default `--log-level`, which is INFO, so a clean stop ends with a
-line saying it was clean; `--log-level WARNING` leaves only the warning.
+however it ends, even when a pass raises. The line carries two counts of replies,
+connections closed while they still owed bytes and connections still owing bytes when the
+drain ended, and it is a warning if either is non-zero and informational if both are
+zero. Both are shown at the default `--log-level`, which is INFO, so a clean stop ends
+with a line saying it was clean; `--log-level WARNING` leaves only the warning. It carries
+one figure for requests as well: the bytes it read and discarded without dispatching them,
+which is the only report there is of the writes a stop throws away, and which matters most
+for a connection the pause had stopped reading, since that connection's whole pipeline is
+sitting unread. That figure does not move the level. A command that was only half sent
+leaves its bytes in a read buffer too, and those are indistinguishable here from a whole
+request nobody will answer, so promoting the level on any non-zero count would make an
+ordinary stop of a client caught mid-command a warning.
 
 `--shutdown-drain-timeout 0` reads the opposite way from the limits it sits beside. For
 `--write-buffer-limit`, `--max-value-size`, `--max-multibulk`, `--max-connections` and

@@ -121,10 +121,15 @@ def launch_server(snapshot_path, extra_args=(), attempts=5):
     it is also read.
 
     A module that starts its own asks the kernel for port 0 and reads the bind line
-    itself, so there is no port to race over: `test_graceful_shutdown.py`, because its
-    tests assert how long a stop takes and what status the process exits with and
-    `stop_server()` ignores the status, and `test_connection_cap.py`, for its one test
-    of the flag through `main()`.
+    itself, so there is no port to race over, and there are four of them:
+    `test_graceful_shutdown.py`, because its tests assert how long a stop takes and what
+    status the process exits with and `stop_server()` ignores the status;
+    `test_connection_cap.py`, for its one test of the flag through `main()`;
+    `test_crash_consistency.py`, because the shared teardown's `SIGTERM` writes a snapshot
+    and a crash test has to end its server with `SIGKILL`; and `test_logging.py`, whose
+    `_Running` helper drains the child's stderr on a thread. A list of them is a list that
+    goes stale the next time a module starts its own, so it is the count that is stated
+    first: four, and `grep -l Popen tests/*.py` is what checks it.
 
     Everything here is bounded: five attempts, each with its own five-second deadline that
     holds on every path through the read, so a server that says nothing, says half a line,
