@@ -1,3 +1,4 @@
+import errno
 import logging
 import selectors
 import socket
@@ -914,20 +915,41 @@ class ScriptedListener:
         self.pending = []
         self.socks = []
         self.events = []
+        # set, accept() raises OSError where an empty queue would raise BlockingIOError: a listener the kernel refuses or whose descriptor has gone, which the sweep reaches only after it has taken whatever was pending
+        self.broken = False
+        self.refused = 0
 
-    def join(self, payload):
+    def join(self, payload, close_fails=False):
         accepted, client = socket.socketpair()
         self.socks.extend((accepted, client))
         client.sendall(payload)
-        self.pending.append(accepted)
+        self.pending.append(_CloseRefused(accepted) if close_fails else accepted)
         return accepted
 
     def accept(self):
         if not self.pending:
-            # what a non-blocking listener raises for an empty queue, and what ends one sweep
             self.events.append("sweep")
+            if self.broken:
+                self.refused += 1
+                # bounded, so that a sweep which went back to a listener that had just failed fails the test and does not park it
+                assert self.refused <= 10, "the sweep went on asking a listener that had failed"
+                raise OSError(errno.EMFILE, "Too many open files")
+            # what a non-blocking listener raises for an empty queue, and what ends one sweep
             raise BlockingIOError()
         return self.pending.pop(0), ("stub", 0)
+
+
+# a swept socket whose close() reports an error. the descriptor is released first and the error raised after, which is what close(2) does when it reports one: the sweep is being asked about an error and not about a leak, and the test can still see that the socket was let go
+class _CloseRefused:
+    def __init__(self, sock):
+        self._sock = sock
+
+    def fileno(self):
+        return self._sock.fileno()
+
+    def close(self):
+        self._sock.close()
+        raise OSError(errno.EIO, "Input/output error")
 
 
 @pytest.fixture
@@ -1006,6 +1028,90 @@ def test_the_backlog_is_swept_before_the_first_drain_pass_and_again_after_the_la
     assert events[0] == "sweep", events
     assert events[-1] == "sweep", events
     assert events.count("sweep") == 2, events
+
+
+def test_a_listener_that_cannot_be_accepted_from_costs_the_drain_neither_its_line_nor_what_it_had_counted(scripted_listener, caplog):
+    # the sweep's one way out that is not the ordinary one. the line the drain writes is the only account
+    # a stop gives of itself, and the sweep runs inside the clause that writes it, so an OSError the sweep
+    # let through would put a traceback where the figure should be. two clients are pending and the
+    # listener fails once they are gone: that the figure still holds both is what separates a sweep that
+    # stops where it failed from one that gives up what it had already counted, and the one error per
+    # sweep, with no second ask, is what separates a stop from a retry
+    server = Server(0)
+    try:
+        sent = [_PING * 50, _PING * 120]
+        swept = [scripted_listener.join(payload) for payload in sent]
+        scripted_listener.broken = True
+        server._draining = True
+
+        with caplog.at_level(logging.INFO, logger="server"):
+            server._drain_for(0, scripted_listener)
+
+        lines = [r.getMessage() for r in caplog.records if "shutdown drain" in r.getMessage()]
+        assert len(lines) == 1, lines
+        discarded = sum(len(payload) for payload in sent)
+        assert "request bytes discarded undispatched: %d" % discarded in lines[0], lines[0]
+        assert [sock.fileno() for sock in swept] == [-1, -1], "a swept connection was left open"
+        # one failed accept for each of the two sweeps, and the sweep ended on it
+        assert scripted_listener.events == ["sweep", "sweep"], scripted_listener.events
+        failures = [r for r in caplog.records if r.getMessage() == "could not sweep the accept backlog"]
+        assert len(failures) == 2, [r.getMessage() for r in caplog.records]
+        # a traceback and not a bare message, at a level a configuration that hides INFO still shows
+        for record in failures:
+            assert record.levelno == logging.ERROR, record.levelname
+            assert isinstance(record.exc_info[1], OSError), record.exc_info
+    finally:
+        server._loop.close()
+
+
+def test_a_swept_socket_that_will_not_close_is_still_counted_and_does_not_end_the_sweep(scripted_listener, caplog):
+    # the count is taken before the close and the close is in a finally clause, so a close that raises
+    # is the one place the sweep could lose what it had just learned. the refusing socket comes first
+    # and a healthy one behind it, so that the figure is a sum that includes the one that refused and
+    # the second socket's closure shows the sweep went on past it. one sweep and not the drain, because
+    # the drain looks twice and a sweep that stopped at the refusal would have the second look find
+    # what the first had left, which is exactly the loss this is here to see
+    server = Server(0)
+    try:
+        refusing_sent = _PING * 70
+        closing_sent = _PING * 130
+        refusing = scripted_listener.join(refusing_sent, close_fails=True)
+        closing = scripted_listener.join(closing_sent)
+
+        with caplog.at_level(logging.INFO, logger="server"):
+            total = server._count_unaccepted_backlog(scripted_listener)
+
+        assert total == len(refusing_sent) + len(closing_sent), total
+        assert closing.fileno() == -1, "the sweep stopped at the socket that would not close"
+        assert refusing.fileno() == -1, "the socket that reported the error was never closed"
+        failures = [r for r in caplog.records if r.getMessage() == "could not close a swept backlog socket"]
+        assert len(failures) == 1, [r.getMessage() for r in caplog.records]
+        # a traceback and not a bare message, at a level a configuration that hides INFO still shows
+        assert failures[0].levelno == logging.ERROR, failures[0].levelname
+        assert isinstance(failures[0].exc_info[1], OSError), failures[0].exc_info
+    finally:
+        server._loop.close()
+
+
+def test_a_swept_socket_that_will_not_close_costs_the_drain_neither_its_line_nor_the_figure(scripted_listener, caplog):
+    # the same refusal seen from the drain, whose one line is written from a finally clause: an error
+    # the sweep let out of its own finally would replace the line with a traceback, and the bytes the
+    # refusing socket held are in the figure only if the count was kept when the close failed
+    server = Server(0)
+    try:
+        sent = _PING * 90
+        refusing = scripted_listener.join(sent, close_fails=True)
+        server._draining = True
+
+        with caplog.at_level(logging.INFO, logger="server"):
+            server._drain_for(0, scripted_listener)
+
+        lines = [r.getMessage() for r in caplog.records if "shutdown drain" in r.getMessage()]
+        assert len(lines) == 1, lines
+        assert "request bytes discarded undispatched: %d" % len(sent) in lines[0], lines[0]
+        assert refusing.fileno() == -1, "the socket that reported the error was never closed"
+    finally:
+        server._loop.close()
 
 
 @pytest.mark.parametrize("flag, value", [

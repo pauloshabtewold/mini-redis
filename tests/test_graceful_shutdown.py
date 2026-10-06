@@ -19,6 +19,8 @@ Everything the first two kinds start keeps its snapshot inside the test's own
 `tmp_path`, because every SIGTERM now saves one.
 """
 
+import array
+import fcntl
 import logging
 import os
 import pathlib
@@ -30,6 +32,7 @@ import socket
 import struct
 import subprocess
 import sys
+import termios
 import threading
 import time
 
@@ -1190,6 +1193,48 @@ def test_the_drain_waits_for_every_connection_that_owes_bytes(tmp_path, scene_fo
     assert outcome["second"] == outcome["expected"], "the drain ended with the second connection still owed bytes"
 
 
+# Darwin's SO_NWRITE, which this Python's socket module does not expose: sys/socket.h gives it as 0x1024
+_SO_NWRITE = 0x1024
+
+
+def _unacknowledged_bytes(client):
+    # what this socket has taken from sendall() that the far end's kernel has not yet acknowledged. a
+    # TCP receiver acknowledges bytes it has already put in the receive queue and never ones it has not,
+    # so zero here is the sender saying that every byte it wrote is now sitting in the other kernel's
+    # queue -- which is the one fact a test needs about a connection that nobody has accepted and so has
+    # nothing on the server's side to ask. Darwin spells the question SO_NWRITE and Linux spells it
+    # TIOCOUTQ, and both count the unsent bytes with the unacknowledged ones
+    if sys.platform == "darwin":
+        return client.getsockopt(socket.SOL_SOCKET, _SO_NWRITE)
+    held = array.array("i", [0])
+    fcntl.ioctl(client.fileno(), termios.TIOCOUTQ, held, True)
+    return held[0]
+
+
+def test_the_unacknowledged_byte_probe_reports_bytes_a_peer_has_not_read():
+    # the control for the wait in the test below, which is only as good as its probe: one that answered
+    # zero whatever it was asked would pass that wait at once and leave the race where it was. a sender
+    # that writes until the kernel takes no more, to a peer that reads nothing, is the one state in
+    # which the answer cannot be zero
+    listener = socket.socket()
+    listener.bind(("127.0.0.1", 0))
+    listener.listen(1)
+    client = socket.create_connection(listener.getsockname())
+    accepted, _ = listener.accept()
+    try:
+        client.setblocking(False)
+        try:
+            # bounded, so a kernel that never refuses a write ends in the assertion and not in a hang
+            for _ in range(1024):
+                client.send(b"x" * 65536)
+        except BlockingIOError:
+            pass
+        assert _unacknowledged_bytes(client) > 0, "the probe saw no bytes in a send queue the peer was not draining"
+    finally:
+        for sock in (client, accepted, listener):
+            sock.close()
+
+
 def test_clients_that_connect_after_the_stop_and_are_never_accepted_are_counted_in_the_drains_line(tmp_path, scene_for):
     # the listener leaves the select set when the loop stops and stays open until the teardown, so the
     # kernel goes on completing handshakes into its backlog for the whole of the save and the drain.
@@ -1227,13 +1272,21 @@ def test_clients_that_connect_after_the_stop_and_are_never_accepted_are_counted_
             client, expected = scene.stall()
             server._request_stop(None, None)
             scene.wait_for(lambda: len(passes) >= 2, "the drain to be running")
+            late = []
             for size in sizes:
-                scene.connect().sendall(b"x" * size)
-            # a pause and not a wait on anything: the connection is in nobody's hands, so there is
-            # nothing on this side to ask when loopback has delivered a client's last byte to it, and a
-            # count taken at once is short on a few runs in a hundred. the drain is held open by a
-            # client that has read nothing, so the pause costs the test nothing
-            time.sleep(0.2)
+                late.append(scene.connect())
+                late[-1].sendall(b"x" * size)
+            # sendall() returns once the bytes are in the client's own send queue, and loopback moves
+            # them to the other kernel a few hundred microseconds later. the connection is in nobody's
+            # hands on the server's side, so there is nothing there to ask, and a sweep that runs in that
+            # gap finds less than was sent -- measured over a real listener, 13 of 3,000 sweeps taken
+            # straight after the three sends were short and 0 of 3,000 once every client's send queue
+            # had emptied. the drain's final sweep is taken the moment the server's own buffer empties,
+            # which a fast reader makes soon after the sends, so the test goes on only when no late
+            # client has a byte the server's kernel has not acknowledged. the drain is held open by a
+            # client that has read nothing until then, so the wait costs it nothing
+            scene.wait_for(lambda: not any(_unacknowledged_bytes(c) for c in late),
+                           "the late clients' bytes to reach the server's kernel")
             assert len(_read_total(client, expected)) == expected
 
         scene.run(scenario)
