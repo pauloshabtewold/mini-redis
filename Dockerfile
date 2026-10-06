@@ -45,10 +45,17 @@ RUN python -c 'import tomllib; print("\n".join(tomllib.load(open("pyproject.toml
 # rebuilds the dependency layer on every edit to the front page, and because the installed
 # metadata is what the wheel holds, which the presence of the files in the context does
 # not show.
+# The distribution name is read from pyproject.toml rather than written out here, because a
+# hardcoded one turns a rename into a build that fails with PackageNotFoundError and names
+# neither file, when both had in fact reached the image. And the long description is read as
+# `get("Description") or get_payload()`: METADATA 2.4 may carry it in the message body or folded
+# into a Description header, importlib.metadata synthesizes the header from the body when it is
+# absent, and asserting on the body alone would fail a correct build under a setuptools that
+# writes the other shape -- which `requires` does not pin an upper bound against.
 COPY . .
 RUN pip install --no-compile . \
     && rm -rf build ./*.egg-info \
-    && python -c 'import importlib.metadata as m; d = m.metadata("mini-redis"); assert d.get_payload(), "README.md did not reach the image: the installed package has no long description"; assert d.get_all("License-File"), "LICENSE did not reach the image: the installed package carries no licence file"'
+    && python -c 'import tomllib, importlib.metadata as m; name = tomllib.load(open("pyproject.toml", "rb"))["project"]["name"]; d = m.metadata(name); assert d.get("Description") or d.get_payload(), "README.md did not reach the image: the installed package has no long description"; assert d.get_all("License-File"), "LICENSE did not reach the image: the installed package carries no licence file"'
 
 VOLUME /data
 USER mini-redis
