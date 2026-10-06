@@ -1,3 +1,4 @@
+import logging
 import selectors
 import socket
 import threading
@@ -572,6 +573,73 @@ def test_the_drain_reads_and_discards_what_a_paused_connection_had_not_read():
         assert not reader.is_alive()
         assert ended == ["end of input"], ended
         assert len(received) == owed, (len(received), owed)
+
+
+_PING = b"*1\r\n$4\r\nPING\r\n"
+
+
+def test_the_drains_setup_pass_counts_and_clears_what_was_buffered_when_it_began(make_connection):
+    # bytes that arrived before the stop are never dispatched, because the drain dispatches
+    # nothing, so they are a loss and they are counted as one. clearing them here is what
+    # keeps the count in the read path additive: from this point a buffer holds only what
+    # arrived after this pass, so no byte is counted twice
+    server, conn = make_connection([BlockingIOError])
+    conn.read_buffer.extend(_PING * 3)
+    buffered = len(conn.read_buffer)
+    conn.queue(b"x" * 10)        # it owes bytes, so the drain keeps it rather than abandoning it
+    server._draining = True
+
+    server._drain_for(0)
+
+    assert server._discarded_request_bytes == buffered, server._discarded_request_bytes
+    assert not conn.read_buffer, "the setup pass clears every buffer it counts"
+
+
+def test_a_read_during_the_drain_adds_what_it_threw_away_to_the_count(make_connection):
+    # the site that catches the loss the pause creates: a connection the high-water mark
+    # stopped reading has its requests waiting in the kernel's receive queue, the drain
+    # switches reading back on and discards every one of them, and before this count
+    # nothing anywhere reported that it had
+    server, conn = make_connection([BlockingIOError])
+    server._draining = True
+    sent = _PING * 5
+    conn._sock.peer.sendall(sent)
+
+    server._read_and_dispatch(conn)
+
+    assert server._discarded_request_bytes == len(sent), server._discarded_request_bytes
+    assert not conn.read_buffer, "the buffer is emptied so it cannot grow across passes"
+    assert not conn.write_buffer, "nothing is dispatched during the drain, so nothing is queued"
+
+
+def test_a_stop_that_discards_nothing_reports_zero(make_connection):
+    # the figure is a loss report, so the clean case has to read as clean rather than as a
+    # number an operator has to interpret
+    server, conn = make_connection([BlockingIOError])
+    conn.queue(b"x" * 10)
+    server._draining = True
+
+    server._drain_for(0)
+
+    assert server._discarded_request_bytes == 0, server._discarded_request_bytes
+
+
+def test_the_drain_line_reports_the_bytes_it_discarded(make_connection, caplog):
+    # the count exists to be read, and the drain's one line is the only place a stop says
+    # anything at all. the two reply counts beside it cannot carry this, because a request
+    # discarded undispatched is not a reply anybody is owed
+    server, conn = make_connection([BlockingIOError])
+    conn.read_buffer.extend(_PING * 4)
+    discarded = len(conn.read_buffer)
+    conn.queue(b"x" * 10)
+    server._draining = True
+
+    with caplog.at_level(logging.INFO, logger="server"):
+        server._drain_for(0)
+
+    lines = [r.getMessage() for r in caplog.records if "shutdown drain" in r.getMessage()]
+    assert len(lines) == 1, lines
+    assert "request bytes discarded undispatched: %d" % discarded in lines[0], lines[0]
 
 
 @pytest.mark.parametrize("flag, value", [

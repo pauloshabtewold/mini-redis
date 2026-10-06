@@ -59,7 +59,12 @@ _ACCEPTED = re.compile(_at("INFO") + r"accepted connection (\d+) from " + _PEER 
 _CLOSED = re.compile(_at("INFO") + r"closed connection (\d+) from " + _PEER + r"; (\d+) connected")
 _DRAIN = re.compile(
     _at("INFO") + r"shutdown drain complete; connections closed while owed bytes: 0; "
-    r"connections still owed bytes: 0")
+    r"connections still owed bytes: 0; request bytes discarded undispatched: (\d+)")
+# the two reply counts are pinned at 0 because a clean stop is what these scenarios make, and
+# the request figure is captured rather than pinned: this module asserts which lines are written
+# and at which level, and the drain's own arithmetic is pinned where the drain is tested. Left
+# out of the pattern altogether the whole line would read as a stray, which is how a figure
+# added to it turns every "nothing else was written" assertion here red at once
 _COMMAND = re.compile(_at("DEBUG") + r"connection (\d+): b'([^']*)' with (\d+) arguments")
 _REFUSAL = re.compile(r"(\w+):[^:]+:refusing " + _PEER + r": .*--max-connections.*")
 _IGNORED = re.compile(

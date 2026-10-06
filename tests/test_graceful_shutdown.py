@@ -953,13 +953,14 @@ def test_the_drain_logs_exactly_one_line_however_it_ends(tmp_path, scene_for):
 
     message = drained[0].getMessage()
     assert drained[0].levelno == logging.INFO and message.startswith("shutdown drain complete"), message
-    assert message.endswith(": 0"), message
+    # the counts are read by name and not off the end of the line: asserting the tail pins which figure is last rather than what any of them says, and a figure added to the line then moves the assertion without changing what it checks
+    assert _drain_counts(drained[0]) == (0, 0), message
     # a loss is a WARNING and a clean ending is not, so a configuration that shows warnings and above shows the line that says something was lost and not the one that says nothing was
     for ending, records in (("timed out", timed_out), ("skipped", skipped)):
         message = records[0].getMessage()
         assert records[0].levelno == logging.WARNING, (ending, message)
         assert message.startswith("shutdown drain incomplete"), (ending, message)
-        assert message.endswith(": 1"), (ending, message)
+        assert _drain_counts(records[0])[1] == 1, (ending, message)
 
 
 def _drain_counts(record):

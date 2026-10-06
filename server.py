@@ -22,10 +22,10 @@ DEFAULT_PORT = 6379
 LISTEN_HOST = "127.0.0.1"
 # bounds how long a stop signal waits to be noticed, and on an idle loop floors both --expiry-sweep-interval and --snapshot-interval: either deadline is checked only when run_once() returns -- see Server._tick -- so with no traffic a deadline can be noticed up to one timeout late, and the default sweep interval is equal to it. under traffic run_once() returns as soon as a socket is ready, so a shorter interval is honoured.
 SELECT_TIMEOUT_SECONDS = 0.1
-# the most one connection may have queued once the kernel has taken what it will, past which it is closed. with the water marks below in force this is not what slows a client down: one that stops reading is paused long before it gets here, so what this bounds is a reply larger than it, or the replies to one read's batch of pipelined requests, which the pause cannot unqueue once they are parsed. 0 turns the check off. see Server._flush for why exceeding it closes the connection instead of slowing it down
+# the most one connection may have queued once the kernel has taken what it will, past which it is closed. with the water marks below in force this is not what slows a client down: one that stops reading is paused rather than throttled here, so what this bounds is a reply larger than it, or the replies to one read's batch of pipelined requests, which the pause cannot unqueue once they are parsed. what the pause does not do is hold such a client near the mark -- the batch that crossed the mark is still dispatched whole, and measured a paused connection holds up to 30.43 MiB against this 32 MiB default, so the pause keeps it from being closed here rather than keeping it far away. 0 turns the check off. see Server._flush for why exceeding it closes the connection instead of slowing it down
 # a local choice and not the reference's, which leaves an ordinary client unlimited. it is below DEFAULT_MAX_VALUE_SIZE, so a value that was stored can be too large to read back: the reply to a GET of it exceeds this and the connection is closed. that is what a hard limit does, and neither default is moved to hide it
 DEFAULT_WRITE_BUFFER_LIMIT = 32 * 1024 * 1024
-# a connection with more than this queued for it stops being read, and is read again once the queue falls to the low-water mark below. the gap between the two is the reason there are two: equal marks would pause and resume the connection on every event. 0 disables the pause. the pause is what keeps a client that pipelines faster than it reads from ever approaching the limit above
+# a connection with more than this queued for it stops being read, and is read again once the queue falls to the low-water mark below. the gap between the two is the reason there are two: equal marks would pause and resume the connection on every event. 0 disables the pause. the pause is what keeps a client that pipelines faster than it reads from being closed by the limit above, and not what keeps it away from it: a paused connection holds this mark plus the one batch that crossed it, which the limit in turn caps at the limit plus one reply, so at the two shipped defaults it holds up to 30.43 MiB against a 32 MiB ceiling rather than anything near 1 MiB
 DEFAULT_WRITE_BUFFER_HIGH_WATER = 1024 * 1024
 DEFAULT_WRITE_BUFFER_LOW_WATER = 256 * 1024
 # how long a connection may sit on a command it has only partly sent. the size caps bound one element, one command's element count and one connection's queued replies, and none bounds how long a connection may hold part of one, so a hundred connections can each sit on almost all of a large element for as long as they like; this closes a connection that has held one for longer than this. it bounds the time and not the sum: inside the limit those read buffers still add up. 0 turns the check off
@@ -600,6 +600,8 @@ class Server:
         # refusals in the current episode, counting the one already reported, and when the last one came. _log_refusal keeps both: a refusal that follows the one before it by more than REFUSAL_EPISODE_GAP_SECONDS starts the count again
         self._cap_refusals = 0
         self._last_refusal_at: float | None = None
+        # inbound bytes a stop threw away without dispatching them: what was sitting in a read buffer when the drain began, plus everything the drain read and discarded. _drain_for zeroes it on the way in and reports it on its one line. it exists because the pause makes this quantity large and nothing else reports it: a connection the high-water mark stopped reading has its requests waiting in the kernel's receive queue for as long as it stays paused, which is until it disconnects, and the drain reads and discards every one of them -- measured, 48,080 of 50,000 pipelined SETs whose send() had already returned. the two reply counts beside it on that line cannot show this, because a discarded request is not a reply anybody is owed
+        self._discarded_request_bytes = 0
 
     @property
     def connected_clients(self) -> int:
@@ -812,6 +814,8 @@ class Server:
             return
         if self._draining:
             # read and thrown away: a command dispatched now would queue a reply for a write the snapshot already missed, and a request left unread makes the close that follows a reset and not a FIN. measured, a reset does not take back what the peer has already received -- a client reads every byte and meets the error only on the read after the last -- but it discards what the closing socket itself has queued and the kernel has not yet put on the wire, and that is the tail of what the drain was waiting to deliver. the buffer is emptied so it cannot grow across passes, and nothing is parsed because this connection is only waiting to be closed
+            # counted before the clear, and only here plus the drain's setup pass, which clears every buffer it counts: that is what keeps one byte from being counted twice as the drain reads more into a buffer it already accounted for
+            self._discarded_request_bytes += len(conn.read_buffer)
             conn.read_buffer.clear()
             return
         try:
@@ -1049,9 +1053,14 @@ class Server:
         # what keeps the remaining work a fixed number of bytes is that nothing is dispatched, not that nothing is read, and a connection has to be drained of inbound bytes before it is closed: closing a socket that still holds unread ones sends a reset instead of a FIN, and a reset discards the closing socket's own send queue -- what this process handed the kernel and the kernel has not yet put on the wire -- so the last replies of a slow reader would go with it. what the peer had already received is not taken back
         # every connection that owes bytes when the drain begins, kept because a close empties the set it was found in and the report in the finally clause has to count what the drain lost as well as what it is still waiting on. the set only shrinks from here on, because the listener is no longer registered, so nothing can arrive that this list does not hold
         owing = []
+        # zeroed here rather than in __init__ alone, so the figure on the line below belongs to this stop and not to the life of the process
+        self._discarded_request_bytes = 0
         try:
             # a copy, because _abandon discards from the set being walked
             for conn in list(self._connections):
+                # counted and cleared for every connection, owing or not, before either arm below: these are bytes that arrived before the stop and will never be dispatched, since the drain dispatches nothing. clearing is what makes the count in _read_and_dispatch additive rather than overlapping -- from here on a buffer holds only what arrived after this pass
+                self._discarded_request_bytes += len(conn.read_buffer)
+                conn.read_buffer.clear()
                 if not conn.write_buffer:
                     # _abandon rather than _close: this walk runs after the loop has exited, where _guard no longer applies, so one close that raises would strand every connection behind it in iteration order
                     self._abandon(conn)
@@ -1069,10 +1078,12 @@ class Server:
             still_owing = sum(1 for conn in owing if not conn.closed and conn.write_buffer)
             incomplete = bool(closed_owing or still_owing)
             # in a finally so that it is the only line this writes however it ends, including a pass that raises. it is a WARNING whenever any connection was owed bytes it did not get -- closed while owed them (a peer that went away, the write-buffer limit, an unhandled error) or still owed them at the deadline -- and INFO when none was, so the level says whether anything was lost
+            # the third figure does not move the level, deliberately. a request that was only half sent leaves its bytes in a read buffer, and those are indistinguishable here from a whole request the pause left unread, so promoting the level on any non-zero count would make an ordinary stop of a client caught mid-command a warning. what the figure is for is that the loss is visible at all: before it, a stop that discarded a paused client's entire pipeline reported nothing but the replies it still owed
             logger.log(
                 logging.WARNING if incomplete else logging.INFO,
-                "shutdown drain %s; connections closed while owed bytes: %d; connections still owed bytes: %d",
-                "incomplete" if incomplete else "complete", closed_owing, still_owing)
+                "shutdown drain %s; connections closed while owed bytes: %d; connections still owed bytes: %d; request bytes discarded undispatched: %d",
+                "incomplete" if incomplete else "complete", closed_owing, still_owing,
+                self._discarded_request_bytes)
 
     def _shutdown(self, listener: socket.socket) -> None:
         try:
