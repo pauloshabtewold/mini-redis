@@ -298,6 +298,11 @@ def test_a_header_arriving_in_pieces_is_scanned_once_not_once_per_read(opening):
     "first, second, expected",
     [
         (b"*1\r", b"\n$4\r\nPING\r\n", [[b"PING"]]),
+        # the width of the count is what makes the header's own reset observable: at one
+        # digit the position left behind lands on the next element's terminator anyway,
+        # and only from two digits up does it point past that terminator, into the middle
+        # of a header that starts at byte zero -- a bogus protocol error on a valid command
+        (b"*10\r", b"\n" + b"$1\r\na\r\n" * 10, [[b"a"] * 10]),
         (b"*1\r\n$4\r", b"\nPING\r\n", [[b"PING"]]),
         (b"*2\r\n$4\r\nECHO\r\n$1\r", b"\nx\r\n", [[b"ECHO", b"x"]]),
         # the inline path resumes at the end rather than one byte short, because its
@@ -306,7 +311,8 @@ def test_a_header_arriving_in_pieces_is_scanned_once_not_once_per_read(opening):
         (b"PING\r", b"\n", [[b"PING"]]),
         (b"ECHO hi\r", b"\nPING\r\n", [[b"ECHO", b"hi"], [b"PING"]]),
     ],
-    ids=["multibulk-count", "bulk-length", "second-element", "inline", "inline-then-more"],
+    ids=["multibulk-count", "multibulk-count-two-digits", "bulk-length", "second-element",
+         "inline", "inline-then-more"],
 )
 def test_a_header_crlf_split_across_two_reads_is_still_found(pair, first, second, expected):
     # the resume position has to stop one byte short of the end: a \r already buffered

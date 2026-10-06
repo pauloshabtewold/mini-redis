@@ -288,6 +288,45 @@ def test_run_once_dispatches_read_and_write_for_one_connection_in_one_pass(h):
     assert h.writable == [conn]
 
 
+@pytest.mark.parametrize(
+    "ready, first",
+    [
+        ([READ | WRITE], "read"),
+        ([WRITE, READ], "write"),
+        ([READ, WRITE], "read"),
+    ],
+    ids=["one-entry-both-bits", "write-entry-first", "read-entry-first"],
+)
+def test_run_once_dispatches_no_second_arm_to_a_connection_the_first_one_closed(h, ready, first):
+    # one select() return carries both read and write readiness for the same descriptor --
+    # the test above is the live witness that it does -- and the arm that runs first is free
+    # to close the connection, which the dispatch loop has to notice before it runs the
+    # other: a closed socket's descriptor is -1, and a handler handed one has nothing to
+    # work with. how that readiness is reported is the backends' own business, one entry
+    # carrying both bits or one entry per filter in either order, so every shape is driven
+    # here rather than only the one this machine happens to produce -- the arm whose turn
+    # comes second is a different arm under each of them, and a guard on one alone would
+    # pass for the shapes that never reach it
+    conn = h.make()
+    h.loop.register(conn)
+    h.loop.set_write_interest(conn, True)
+    key = h.loop._selector.get_key(conn)
+
+    def closing(arm):
+        def dispatch(ready_conn):
+            h.order.append((arm, ready_conn))
+            ready_conn.close()
+        return dispatch
+
+    h.loop._on_readable = closing("read")
+    h.loop._on_writable = closing("write")
+    entries = [(key, mask) for mask in ready]
+    with mock.patch.object(h.loop._selector, "select", return_value=entries):
+        h.loop.run_once()
+    assert h.order == [(first, conn)], (
+        "a dispatch reached the connection after it was closed: %r" % (h.order,))
+
+
 def test_the_selector_itself_refuses_an_empty_mask(h):
     # shaped as a disjunction because the backends disagree: kqueue raises and drops the registration, epoll accepts the empty mask. it exists so the applier's never-ask-for-zero test cannot pass vacuously on a backend that tolerates it.
     sel = h.loop._selector

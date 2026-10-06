@@ -294,6 +294,23 @@ def test_a_zero_high_water_mark_disables_the_pause_and_is_not_refused(monkeypatc
         client.close()
 
 
+def test_the_high_water_mark_and_the_command_timeout_default_to_the_documented_values():
+    # the pause's own threshold and the half-sent-command deadline are both published
+    # figures, and the tests that exercise them read each default out of the parser and
+    # size their queues and their clocks relative to whatever comes back, so they hold for
+    # any value it takes. that leaves the figures themselves pinned nowhere: a published
+    # number has to be asserted against its own literal somewhere, or the documentation is
+    # the only record of it and nothing fails when the two part company
+    args = build_arg_parser().parse_args([])
+    assert args.write_buffer_high_water == 1048576, args.write_buffer_high_water
+    assert args.incomplete_command_timeout == 30, args.incomplete_command_timeout
+    server = Server(0)
+    try:
+        assert (server.write_buffer_high_water, server.incomplete_command_timeout) == (1048576, 30)
+    finally:
+        server._loop.close()
+
+
 def test_each_new_numeric_flag_is_refused_when_negative_at_both_doors(capsys):
     # the parser is one door and Server is the other, and a flag refused at only one is
     # refused only for the people who use it. 0 is accepted at both, as the value that
@@ -301,7 +318,13 @@ def test_each_new_numeric_flag_is_refused_when_negative_at_both_doors(capsys):
     # MAX_SCHEDULABLE_INTERVAL, the ceiling every duration flag shares. this flag would not
     # fail without it: the stalled-command sweep only compares an elapsed time against the
     # value, and comparing an int with a float cannot overflow however large the int is. the
-    # ceiling is there so that one rule covers every duration at both doors
+    # ceiling is there so that one rule covers every duration at both doors.
+    # the refusal's own wording is asserted at both doors and not only at the CLI, because
+    # the type alone does not say which rule fired: the pair rule standing behind the
+    # high-water mark reads any non-zero value as a mark that is set, so a negative one is
+    # refused for sitting below the low-water mark instead -- a ValueError either way, and
+    # the operator is told the marks are the wrong way round rather than that the number
+    # they typed is not allowed at all
     flags = (
         ("--write-buffer-high-water", "write buffer high water", "write_buffer_high_water"),
         ("--write-buffer-low-water", "write buffer low water", "write_buffer_low_water"),
@@ -312,8 +335,10 @@ def test_each_new_numeric_flag_is_refused_when_negative_at_both_doors(capsys):
             build_arg_parser().parse_args([flag, "-1"])
         message = capsys.readouterr().err
         assert flag in message and label in message and "_" + name not in message, message
-        with pytest.raises(ValueError):
+        with pytest.raises(ValueError) as refusal:
             Server(0, **{name: -1})
+        refused = str(refusal.value)
+        assert name in refused and "cannot be negative" in refused, refused
 
         assert getattr(build_arg_parser().parse_args([flag, "0"]), name) == 0
         server = Server(0, **{name: 0})
