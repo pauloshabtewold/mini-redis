@@ -223,7 +223,13 @@ class Connection:
                         # the header's own bytes are the first thing held for this command
                         self.consumed_for_incomplete_command += consumed
                     else:
-                        # nothing is outstanding: the header was the whole of it
+                        # nothing is outstanding: the header was the whole of it. the reset is
+                        # defensive and a no-op on every path the wire can produce: this branch is
+                        # reached only while _argv is None, the counter is zeroed wherever _argv
+                        # becomes None, so it is already 0 here -- the same equivalence the
+                        # header's += above has to a plain =, and written as an assignment for the
+                        # same reason, that the invariant belongs to the surrounding code and not
+                        # to this line
                         self.consumed_for_incomplete_command = 0
                 else:
                     argv, consumed, needed = resp.parse_command(
@@ -241,7 +247,11 @@ class Connection:
                     # progress is driven by `consumed`, not by `argv`
                     del self.read_buffer[:consumed]
                     # an inline step leaves nothing outstanding: it either completed a command or
-                    # consumed an empty line, and a multibulk cannot be in progress on this branch
+                    # consumed an empty line, and a multibulk cannot be in progress on this branch.
+                    # the reset is defensive and a no-op on every path the wire can produce: this
+                    # branch is reached only while _argv is None, the counter is zeroed wherever
+                    # _argv becomes None, so it is already 0 here -- written as an assignment
+                    # because that invariant belongs to the surrounding code and not to this line
                     self.consumed_for_incomplete_command = 0
                     if argv is not None:
                         commands.append(argv)

@@ -75,8 +75,8 @@ def dbsize(store, conn, argv: list[bytes]) -> Reply:
 # a class -- this grammar takes '^', fnmatch takes '!', and each treats the other as an
 # ordinary member of the class -- so a client asking for the complement of a set would get
 # back exactly the set it meant to exclude, with no error to notice it by. fnmatch also has
-# no backslash escape at all, and it operates on str, which the bytes invariant on this
-# path forbids, and memoises translated patterns in a cache keyed by whatever a client sends
+# no backslash escape at all, and memoises translated patterns in a cache keyed by whatever
+# a client sends
 _STAR = ord("*")
 _QUESTION = ord("?")
 _LBRACKET = ord("[")
