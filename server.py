@@ -479,7 +479,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
         type=_shutdown_drain_timeout,
         default=DEFAULT_SHUTDOWN_DRAIN_TIMEOUT_SECONDS,
         metavar="SECONDS",
-        help="on SIGTERM or SIGINT, save a snapshot and then keep sending the replies "
+        help="on SIGTERM, and on SIGINT unless this process inherited it ignored, save a snapshot and then keep sending the replies "
              "already queued for clients, for no longer than SECONDS plus one "
              f"{SELECT_TIMEOUT_SECONDS} second select() timeout, before exiting whether "
              "or not the kernel took all of them. 0 is not unlimited here, it is the "
