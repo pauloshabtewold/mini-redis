@@ -1,7 +1,13 @@
 import errno
 import logging
+import os
+import pathlib
+import re
+import select
 import selectors
 import socket
+import subprocess
+import sys
 import threading
 import time
 import types
@@ -11,7 +17,10 @@ import pytest
 import server as server_module
 from connection import RECV_SIZE, Connection
 from server import Server, build_arg_parser
+from tests.test_graceful_shutdown import _unacknowledged_bytes, _wait_until
 from tests.test_server_lifecycle import listening, pump
+
+REPO_ROOT = pathlib.Path(__file__).resolve().parent.parent
 
 
 # a real send() only short-writes when the kernel's autotuned buffers happen to be full, which is machine-dependent and silently stops testing elsewhere; scripting send() makes the short write mandatory and deterministic here
@@ -918,6 +927,7 @@ class ScriptedListener:
         # set, accept() raises OSError where an empty queue would raise BlockingIOError: a listener the kernel refuses or whose descriptor has gone, which the sweep reaches only after it has taken whatever was pending
         self.broken = False
         self.refused = 0
+        self.empty_asks = 0
 
     def join(self, payload, close_fails=False):
         accepted, client = socket.socketpair()
@@ -934,7 +944,9 @@ class ScriptedListener:
                 # bounded, so that a sweep which went back to a listener that had just failed fails the test and does not park it
                 assert self.refused <= 10, "the sweep went on asking a listener that had failed"
                 raise OSError(errno.EMFILE, "Too many open files")
-            # what a non-blocking listener raises for an empty queue, and what ends one sweep
+            # what a non-blocking listener raises for an empty queue, and what ends one sweep. bounded the way the broken path above is: a sweep that went back to a listener that had just said nothing was pending -- a break that became a continue -- would append to events for ever, and a timeout's own exception lands in _drain_for's finally clause, which sweeps again and re-enters the loop, so the runaway would be a hang and not a failure. a drain sweeps twice, and no test here sweeps more than a few times
+            self.empty_asks += 1
+            assert self.empty_asks <= 20, "the sweep went on asking a listener that had nothing pending"
             raise BlockingIOError()
         return self.pending.pop(0), ("stub", 0)
 
@@ -961,9 +973,9 @@ def scripted_listener():
 
 
 def test_the_accept_backlog_is_counted_and_closed_at_the_stop(scripted_listener):
-    # clients that connected and sent before the stop and that nothing accepted: they are in no
-    # connection set, so nothing else will ever ask what they sent, and the listener's own close resets
-    # them. three of different lengths, so that the figure is a sum and not one of them
+    # clients that connected and sent before the stop and that nothing served: they are in no
+    # connection set, so nothing else will ever ask what they sent, and the listener's own close would
+    # have reset them. three of different lengths, so that the figure is a sum and not one of them
     server = Server(0)
     try:
         sent = [_PING * 50, _PING * 120, _PING * 300]
@@ -1054,12 +1066,16 @@ def test_a_listener_that_cannot_be_accepted_from_costs_the_drain_neither_its_lin
         assert [sock.fileno() for sock in swept] == [-1, -1], "a swept connection was left open"
         # one failed accept for each of the two sweeps, and the sweep ended on it
         assert scripted_listener.events == ["sweep", "sweep"], scripted_listener.events
-        failures = [r for r in caplog.records if r.getMessage() == "could not sweep the accept backlog"]
+        failures = [r for r in caplog.records if r.getMessage().startswith("could not sweep the accept backlog")]
         assert len(failures) == 2, [r.getMessage() for r in caplog.records]
-        # a traceback and not a bare message, at a level a configuration that hides INFO still shows
+        # the error is in the message and there is no traceback, at a level a configuration that hides INFO
+        # still shows. a traceback is rendered by opening source files, and descriptor exhaustion is the
+        # likeliest reason to be here, where that open fails too and only "--- Logging error ---" is left
         for record in failures:
             assert record.levelno == logging.ERROR, record.levelname
-            assert isinstance(record.exc_info[1], OSError), record.exc_info
+            assert record.exc_info is None, record.exc_info
+            assert "Too many open files" in record.getMessage(), record.getMessage()
+            assert "does not count what it still held" in record.getMessage(), record.getMessage()
     finally:
         server._loop.close()
 
@@ -1112,6 +1128,222 @@ def test_a_swept_socket_that_will_not_close_costs_the_drain_neither_its_line_nor
         assert refusing.fileno() == -1, "the socket that reported the error was never closed"
     finally:
         server._loop.close()
+
+
+def test_a_swept_socket_is_closed_when_asking_what_it_holds_raises_something_unexpected(scripted_listener, monkeypatch):
+    # the close is in a finally clause so that it does not depend on the question being answered: the
+    # question catches OSError and ValueError inside itself, and anything else it raised would otherwise
+    # leave the swept socket open for as long as the exception took to be handled. nothing the kernel
+    # does makes it raise a RuntimeError, so the question is replaced
+    server = Server(0)
+    try:
+        swept = scripted_listener.join(_PING * 20)
+
+        def exploding(sock):
+            raise RuntimeError("injected: neither an OSError nor a ValueError")
+
+        monkeypatch.setattr(server_module, "unread_in_kernel", exploding)
+        with pytest.raises(RuntimeError):
+            server._count_unaccepted_backlog(scripted_listener)
+        assert swept.fileno() == -1, "the swept socket was left open when the question about it raised"
+    finally:
+        server._loop.close()
+
+
+class _BoundedAccepts:
+    # a real listener whose empty answers are counted, for the reason ScriptedListener counts its own: a sweep that went back to a listener that had just said nothing was pending would otherwise spin on a real one for ever, and a timeout's exception lands in the drain's finally clause, which sweeps again
+    def __init__(self, listener):
+        self._listener = listener
+        self.empty_asks = 0
+
+    def accept(self):
+        try:
+            return self._listener.accept()
+        except BlockingIOError:
+            self.empty_asks += 1
+            assert self.empty_asks <= 20, "the sweep went on asking a listener that had nothing pending"
+            raise
+
+
+def _how_a_waiting_client_sees_its_connection(client, seconds):
+    # "open" is the answer to a connection nothing has touched: it is not readable, so the wait for it
+    # runs to its end, and that is the only answer that costs the whole of `seconds`
+    ready, _, _ = select.select([client], [], [], seconds)
+    if not ready:
+        return "open"
+    try:
+        data = client.recv(1)
+    except ConnectionResetError:
+        return "reset"
+    return "EOF" if data == b"" else "data"
+
+
+@pytest.mark.parametrize("sent, ends_as", [
+    (b"", "EOF"), (_PING, "reset"), (_PING[:11], "reset"),
+], ids=["idle", "sent a command", "half-sent command"])
+def test_a_client_waiting_in_the_backlog_at_the_stop_is_closed_when_the_drain_starts_and_not_when_it_ends(
+        make_connection, sent, ends_as):
+    # the entry sweep's one effect, and the only reason it is there: the sweep in the finally clause counts
+    # everything this one does, so the figure is the same without it. what differs is when a client that was
+    # already waiting when the stop landed finds out -- at the start of the drain, or when the drain is over,
+    # which at the shipped timeout is up to five seconds of a connected client whose requests nothing will
+    # read. the client is observed from inside the drain's first pass, which comes after the entry sweep and
+    # before the sweep in the finally clause, and a client left to the later sweep is still open there. one
+    # client per case, and the wait for the listener to be readable is what says its handshake has completed
+    # and it is pending: with several, readable would say only that one of them is. a swept client that had
+    # sent bytes sees the reset the listener's close was going to give it anyway, and an idle one sees an
+    # orderly close
+    server, conn = make_connection([BlockingIOError, 10])
+    conn.queue(b"x" * 10)
+    server._flush(conn)                             # the blocked send, which holds the drain open for a pass
+    listener = socket.socket()
+    client = None
+    try:
+        listener.bind(("127.0.0.1", 0))
+        listener.listen(8)
+        listener.setblocking(False)
+        client = socket.create_connection(listener.getsockname())
+        ready, _, _ = select.select([listener], [], [], 10)
+        assert ready, "the client's handshake never completed into the backlog"
+        if sent:
+            client.sendall(sent)
+            _wait_until(lambda: not _unacknowledged_bytes(client), 10, "the server's kernel to take the bytes")
+        seen = []
+        real_run_once = server._loop.run_once
+
+        def observing_run_once():
+            if not seen:
+                seen.append(_how_a_waiting_client_sees_its_connection(client, 2))
+            real_run_once()
+
+        server._loop.run_once = observing_run_once
+        server._draining = True
+
+        server._drain_for(10, _BoundedAccepts(listener))
+
+        assert seen, "no pass of the drain ran, so nothing was observed"
+        assert seen == [ends_as], "the client was %s in the drain's first pass, where %s was expected" % (seen[0], ends_as)
+    finally:
+        if client is not None:
+            client.close()
+        listener.close()
+
+
+def test_the_sweep_gives_back_its_spare_descriptor_before_the_first_accept(scripted_listener):
+    server = Server(0)
+    try:
+        scripted_listener.join(_PING * 20)
+        server._hold_spare_descriptor()
+        spare = server._spare_fd
+        assert spare is not None
+        os.fstat(spare)                             # the control: it is an open descriptor until the sweep gives it back
+        real_accept = scripted_listener.accept
+        held_at_accept = []
+
+        def watching_accept():
+            held_at_accept.append(server._spare_fd)
+            return real_accept()
+
+        scripted_listener.accept = watching_accept
+
+        server._count_unaccepted_backlog(scripted_listener)
+
+        assert held_at_accept and held_at_accept[0] is None, held_at_accept
+        with pytest.raises(OSError) as raised:
+            os.fstat(spare)
+        assert raised.value.errno == errno.EBADF, raised.value
+    finally:
+        server._loop.close()
+
+
+def test_a_reserve_that_cannot_be_opened_is_reported_without_a_traceback_and_does_not_stop_the_server(caplog, monkeypatch):
+    server = Server(0)
+    try:
+        def refusing(path, flags):
+            raise OSError(errno.EMFILE, "Too many open files")
+
+        with monkeypatch.context() as patched, caplog.at_level(logging.WARNING, logger="server"):
+            patched.setattr(server_module.os, "open", refusing)
+            server._hold_spare_descriptor()
+
+        assert server._spare_fd is None
+        warnings = [r for r in caplog.records if "could not reserve a descriptor" in r.getMessage()]
+        assert len(warnings) == 1, [r.getMessage() for r in caplog.records]
+        assert warnings[0].levelno == logging.WARNING and warnings[0].exc_info is None, warnings[0]
+        assert "Too many open files" in warnings[0].getMessage(), warnings[0].getMessage()
+    finally:
+        server._loop.close()
+
+
+# a real descriptor table that is really full, because the failure is the kernel's and nothing scripted
+# stands in for it faithfully: accept() raises EMFILE only when there is no descriptor to give. the child
+# builds its own Server and listener, says which port, and waits to be told that the client has sent; it then
+# lowers its own limit, fills what is left, and sweeps. the limit is lowered in the child and not here, where
+# it would take the rest of the suite's descriptors with it
+_FULL_TABLE_DRIVER = """
+import errno, logging, os, resource, sys
+sys.path.insert(0, %r)
+from server import Server
+
+logging.basicConfig(level=logging.INFO)
+server = Server(0, shutdown_drain_timeout=0)
+listener = server._open_listener()
+if sys.argv[1] == "reserve":
+    server._hold_spare_descriptor()
+print(listener.getsockname()[1], flush=True)
+sys.stdin.readline()
+soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
+resource.setrlimit(resource.RLIMIT_NOFILE, (64, hard))
+held = []
+while True:
+    try:
+        held.append(os.open(os.devnull, os.O_RDONLY))
+    except OSError as exc:
+        assert exc.errno == errno.EMFILE, exc
+        break
+server._draining = True
+server._drain_for(0, listener)
+"""
+
+_SENT_TO_THE_BACKLOG = 180
+
+
+@pytest.mark.parametrize("mode", ["reserve", "no reserve"])
+def test_the_backlog_sweep_counts_a_waiting_client_when_the_descriptor_table_is_full(tmp_path, mode):
+    # measured under `ulimit -n 30`: accept() raised EMFILE, the figure read 0 where 180 bytes had been
+    # sent, and the line that was meant to say so could not be printed. with a descriptor held in reserve
+    # the sweep counts them. the second case is the control that this instrument sees the failure at all,
+    # and the one that pins what the operator is left with when there is no reserve: a figure of 0 that
+    # says, in so many words and without a traceback, that it is short
+    proc = subprocess.Popen(
+        [sys.executable, "-c", _FULL_TABLE_DRIVER % str(REPO_ROOT), mode],
+        stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, cwd=tmp_path)
+    client = None
+    try:
+        ready, _, _ = select.select([proc.stdout], [], [], 10)
+        port_line = proc.stdout.readline().decode() if ready else ""
+        assert port_line.strip().isdigit(), ("the driver never said which port it listened on", port_line)
+        client = socket.create_connection(("127.0.0.1", int(port_line)))
+        client.sendall(b"x" * _SENT_TO_THE_BACKLOG)
+        _wait_until(lambda: not _unacknowledged_bytes(client), 10, "the server's kernel to take every byte sent")
+        _, stderr = proc.communicate(b"go\n", timeout=60)
+    finally:
+        if client is not None:
+            client.close()
+        if proc.returncode is None:
+            proc.kill()
+            proc.communicate(timeout=10)
+    stderr = stderr.decode()
+    assert proc.returncode == 0, (proc.returncode, stderr)
+    assert "Logging error" not in stderr, stderr
+    found = re.findall(r"request bytes discarded undispatched: (\d+)", stderr)
+    assert len(found) == 1, stderr
+    if mode == "reserve":
+        assert int(found[0]) == _SENT_TO_THE_BACKLOG, stderr
+        assert "could not sweep" not in stderr, stderr
+    else:
+        assert int(found[0]) == 0, stderr
+        assert "could not sweep the accept backlog: OSError(24, 'Too many open files')" in stderr, stderr
 
 
 @pytest.mark.parametrize("flag, value", [

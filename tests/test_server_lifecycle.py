@@ -716,9 +716,13 @@ def test_a_close_that_raises_still_leaves_the_set_clean():
             raise OSError(9, "Bad file descriptor")
 
         conn.close = explode
-        with pytest.raises(OSError):
-            server._close(conn)
-        assert conn not in server._connections
+        try:
+            with pytest.raises(OSError):
+                server._close(conn)
+            assert conn not in server._connections
+        finally:
+            # explode() stands in for Connection.close() and never reaches the socket, so the socket the accept took is closed here
+            conn._sock.close()
         client.close()
 
 

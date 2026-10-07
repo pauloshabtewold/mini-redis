@@ -20,6 +20,7 @@ Everything the first two kinds start keeps its snapshot inside the test's own
 """
 
 import array
+import errno
 import fcntl
 import logging
 import os
@@ -222,10 +223,8 @@ def test_a_cooperative_client_receives_its_whole_reply_before_exit(start, tmp_pa
     try:
         time.sleep(0.3)
         proc.send_signal(signal.SIGTERM)
-        # the snapshot appearing is the sign the loop has stopped and the drain is next. the process must still be there, because the client has read nothing and a server already gone took what it owed with it
+        # the snapshot appearing is the sign the loop has stopped and the drain is next, so every byte the client reads below comes from the drain and none from the main loop. there is deliberately no sleep followed by a poll() for a live process after it: the server stays up 0.6 to 1.7 s after the snapshot appears even at --shutdown-drain-timeout 0, so a poll() 0.2 s later cannot fire for the defect its message would name, a drain that was skipped, and under a skip-drain mutant this test fails at the byte comparison below with or without one. what observes the drain is that comparison
         _wait_until((tmp_path / "dump.mrdb").exists, 10, "the shutdown save")
-        time.sleep(0.2)
-        assert proc.poll() is None, "the server exited while the client had not read a byte"
         received = _read_total(client, replies * len(_bulk(b"x" * _VALUE_BYTES)))
         returned, rc = _returns_within(proc, 5)
     finally:
@@ -266,10 +265,8 @@ def test_a_request_arriving_during_the_drain_does_not_cost_the_client_its_replie
     try:
         time.sleep(0.3)
         proc.send_signal(signal.SIGTERM)
-        # the snapshot is written after the loop stops and before the drain starts, so a request sent once it exists and a margin has passed arrives after the drain has already taken its decision about reading
+        # the snapshot is written after the loop stops and before the drain starts, so a request sent once it exists arrives during the save or the drain, never to the main loop. there is deliberately no margin sleep and no poll() for a live process after the wait: whether the PING reaches the drain's setup pass or one of its later passes the outcome is the same, since both read and discard it, and the process being alive 0.2 s on says nothing the replies read below do not
         _wait_until((tmp_path / "dump.mrdb").exists, 10, "the shutdown save")
-        time.sleep(0.2)
-        assert proc.poll() is None, "the server exited while the client had not read a byte"
         client.sendall(_resp(b"PING"))
         # slowly, so the server's last byte is handed to the kernel while most of what it owes is still in flight: a reader that kept up would have an empty queue at the close and never see a reset
         client.settimeout(20)
@@ -349,6 +346,108 @@ def test_a_sigterm_during_a_slow_snapshot_load_is_honoured_and_not_discarded(tmp
     assert len(lines) == 1 and "shutdown drain complete" in lines[0], stderr
     assert os.path.getmtime(snapshot) >= signalled - 1.0, "the snapshot on disk is the one from before the signal"
     assert set(persistence.load(str(snapshot)).live_keys()) == {b"before"}
+
+
+# SIGINT is bound explicitly in the child, so that what main() is asked to leave alone is a handler that raises. a process started from a non-interactive background shell inherits SIGINT ignored, Python then leaves it ignored, and the test would be asking about a signal nothing ever delivers
+_CTRL_C_RAISES = "import signal\nsignal.signal(signal.SIGINT, signal.default_int_handler)\n"
+
+
+def test_a_sigint_during_a_slow_snapshot_load_still_aborts_it(tmp_path):
+    # the other half of the test above, and the reason SIGINT is not in the startup record: Ctrl-C
+    # during a load that is taking too long has to end the process, as it did before the record
+    # existed, and not wait for the load to finish and then exit 0. measured on a 79.5 MB snapshot,
+    # a process that recorded SIGINT exited 0 at 5.52 s and one that did not died of the signal at
+    # 0.22 s. the load here sleeps for _LOAD_SECONDS, so a process that outlived the signal by that
+    # long finished it
+    snapshot = tmp_path / "dump.mrdb"
+    older = Store()
+    older.write(b"before", b"1", keep_ttl=False)
+    persistence.save(older, str(snapshot))
+
+    proc = subprocess.Popen(
+        [sys.executable, "-c", _CTRL_C_RAISES + _SLOW_LOAD_THEN_MAIN % (str(REPO_ROOT), _LOAD_SECONDS),
+         "--port", "0", "--snapshot-path", str(snapshot)],
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE, cwd=tmp_path)
+    try:
+        ready, _, _ = select.select([proc.stdout], [], [], 10)
+        line = proc.stdout.readline() if ready else b""
+        assert line == b"loading\n", ("the load never began", line)
+        proc.send_signal(signal.SIGINT)
+        returned, rc = _returns_within(proc, _LOAD_SECONDS + SELECT_TIMEOUT_SECONDS + _MARGIN_SECONDS)
+        stderr = proc.stderr.read().decode() if returned else ""
+    finally:
+        _reap(proc)
+        proc.stderr.close()
+    assert returned, "the server was still running after the load and a margin: Ctrl-C did not abort it"
+    assert rc != 0, ("the process exited cleanly, which is what a recorded SIGINT does", stderr)
+    assert "KeyboardInterrupt" in stderr, stderr
+    assert "shutdown drain" not in stderr, ("the load was allowed to finish and the stop ran", stderr)
+
+
+# every byte in this is sent and none is dispatched: the command is cut inside its last element, so
+# the server holds a multibulk it can never complete. a number that is neither a round figure nor the
+# size of any other thing in this module, so that a figure taken from the wrong place cannot equal it
+_UNFINISHED_COMMAND = _resp(b"SET", b"never-completed", b"v" * 41)[:-17]
+
+
+@pytest.mark.parametrize("drain_timeout", ["0", "5"], ids=["no drain", "the shipped drain"])
+@pytest.mark.parametrize("read_first", [False, True], ids=["unread at the stop", "read and parsed at the stop"])
+def test_a_real_servers_drain_line_reports_the_request_bytes_the_stop_discarded(
+        tmp_path, drain_timeout, read_first):
+    # the figure is asserted where it is read, on the line a real process writes to stderr, and by
+    # value. everything else that checks the figure runs Server.run() on the test's own thread or
+    # drives the drain directly, and a figure that is correct there and absent from the process --
+    # the line formatted from the wrong attribute, the counting switched off by something main()
+    # does -- would pass all of them. a half-sent command is the shape this can build exactly: it
+    # is never dispatched, and the sites that hold its bytes are disjoint, so what the line reports is
+    # their sum and the sum is what the client sent. which sites hold them is the parameter. unread,
+    # the stop is sent as soon as the server's kernel has the bytes, which finds them still in a
+    # receive queue or in the accept backlog and has them counted there. read and parsed, a round trip
+    # on a second connection comes first: its request is sent after the first client's bytes are in
+    # the server's kernel, so the pass that answers it has those bytes among its ready events and has
+    # read them before it ends, and the stop then finds a multibulk's finished elements in the
+    # connection's own count and the rest in its read buffer. the waits are on conditions and not on a
+    # clock: the client's own count of bytes the server's kernel has not acknowledged has to reach
+    # zero, since a byte still in the client's send queue is the one thing no count on the server's
+    # side can see
+    proc = subprocess.Popen(
+        [sys.executable, str(REPO_ROOT / "server.py"), "--port", "0",
+         "--snapshot-path", str(tmp_path / "dump.mrdb"), "--snapshot-interval", "3600",
+         "--shutdown-drain-timeout", drain_timeout],
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE, cwd=tmp_path)
+    clients = []
+    try:
+        ready, _, _ = select.select([proc.stdout], [], [], 10)
+        line = proc.stdout.readline().decode() if ready else ""
+        assert line.startswith("listening on "), ("the server never said where it listened", line)
+        port = int(line.strip().rsplit(":", 1)[1])
+        client = socket.create_connection(("127.0.0.1", port))
+        clients.append(client)
+        client.sendall(_UNFINISHED_COMMAND)
+        _wait_until(lambda: not _unacknowledged_bytes(client), 10, "the server's kernel to take every byte sent")
+        if read_first:
+            other = socket.create_connection(("127.0.0.1", port))
+            clients.append(other)
+            other.settimeout(10)
+            other.sendall(_resp(b"PING"))
+            assert other.recv(64) == b"+PONG\r\n"
+        proc.send_signal(signal.SIGTERM)
+        returned, rc = _returns_within(proc, int(drain_timeout) + SELECT_TIMEOUT_SECONDS + _MARGIN_SECONDS)
+        stderr = proc.stderr.read().decode() if returned else ""
+    finally:
+        for opened in clients:
+            opened.close()
+        _reap(proc)
+        proc.stderr.close()
+    assert (returned, rc) == (True, 0), (returned, rc)
+    lines = [entry for entry in stderr.splitlines() if "shutdown drain" in entry]
+    assert len(lines) == 1, stderr
+    found = re.search(r"request bytes discarded undispatched: (\d+)$", lines[0])
+    assert found, lines[0]
+    assert int(found.group(1)) == len(_UNFINISHED_COMMAND), (found.group(1), len(_UNFINISHED_COMMAND), lines[0])
+    # the level is the documented one and is not the figure's to move: nothing was owed a reply, so the
+    # line says complete over a figure that is not zero, and it is the figure that says what was thrown away
+    assert "shutdown drain complete" in lines[0], lines[0]
 
 
 # --- the tests below run Server.run() on this thread, with a second thread as the clients
@@ -524,6 +623,64 @@ def test_the_listener_is_unregistered_before_the_save(tmp_path, scene_for):
     # the control first: the loop did hold the listener, so a False below is a change and not an instrument that cannot see it
     assert serving == [True]
     assert saves == [False], "the listener was still in the select set when the save ran"
+
+
+def test_run_holds_a_spare_descriptor_for_the_backlog_sweeps_and_the_first_sweep_gives_it_back(tmp_path, scene_for):
+    # the reserve is what lets the sweeps accept when the process has no descriptor left, and it is only
+    # there if run() opens it once it has its listener and only free again if the first sweep gives it
+    # back before accepting. the drain is spied at both ends: its entry, where the reserve has to still
+    # be held, since an earlier release would leave the sweep nothing to give back, and its exit, where
+    # the entry sweep has released it
+    server = _server(tmp_path)
+    scene = scene_for(server)
+    seen = {}
+    real_drain = server._drain_for
+
+    def spying_drain(seconds, listener=None):
+        seen["at the drain's entry"] = server._spare_fd
+        real_drain(seconds, listener)
+        seen["after the drain"] = server._spare_fd
+
+    server._drain_for = spying_drain
+    held_while_serving = []
+
+    def scenario():
+        scene.wait_for(lambda: server._spare_fd is not None, "run() to hold its spare descriptor")
+        held_while_serving.append(server._spare_fd)
+
+    scene.run(scenario)
+    assert held_while_serving, "run() never held a spare descriptor while it served"
+    assert seen["at the drain's entry"] == held_while_serving[0], seen
+    assert seen["after the drain"] is None, "the entry sweep did not give the spare descriptor back"
+    assert server._spare_fd is None
+
+
+def test_a_run_that_raises_before_the_backlog_sweep_still_gives_its_spare_descriptor_back(tmp_path, monkeypatch):
+    # the reserve is released by the first sweep on the way out of a stop, and a run() that ends some other
+    # way -- here, a raise out of the loop -- never reaches a sweep, so what returns it is run()'s own exit
+    server = _server(tmp_path)
+    held = []
+    real_hold = server._hold_spare_descriptor
+
+    def recording_hold():
+        real_hold()
+        held.append(server._spare_fd)
+
+    def exploding_tick():
+        raise RuntimeError("injected: the loop failed")
+
+    monkeypatch.setattr(server, "_hold_spare_descriptor", recording_hold)
+    monkeypatch.setattr(server, "_tick", exploding_tick)
+    try:
+        with pytest.raises(RuntimeError, match="injected"):
+            server.run()
+    finally:
+        server._loop.close()
+    assert held and held[0] is not None, "run() never held a spare descriptor"
+    assert server._spare_fd is None
+    with pytest.raises(OSError) as raised:
+        os.fstat(held[0])
+    assert raised.value.errno == errno.EBADF, "the spare descriptor was left open when run() raised"
 
 
 def test_a_connection_attempted_during_the_drain_is_not_accepted(tmp_path, scene_for):
@@ -1235,11 +1392,13 @@ def test_the_unacknowledged_byte_probe_reports_bytes_a_peer_has_not_read():
             sock.close()
 
 
-def test_clients_that_connect_after_the_stop_and_are_never_accepted_are_counted_in_the_drains_line(tmp_path, scene_for):
+def test_clients_that_connect_after_the_stop_and_are_never_served_are_counted_in_the_drains_line(tmp_path, scene_for):
     # the listener leaves the select set when the loop stops and stays open until the teardown, so the
     # kernel goes on completing handshakes into its backlog for the whole of the save and the drain.
-    # those clients are never accepted, never read and never answered, and the listener's close resets
-    # them. measured, three of them sent 201,000 bytes of complete requests that the line reported as 0.
+    # those clients are never served: nothing reads or answers them, and one that had sent bytes is
+    # reset when the sweep closes it, as the listener's close would have reset it, while an idle one
+    # sees an orderly close. measured, three of them sent 201,000 bytes of complete requests that the
+    # line reported as 0.
     # they connect once the drain has made two passes, so the sweep at its entry has come and gone, and
     # this runs through run() and a real listener, which is the one place the listener's hand-over to
     # the drain is seen
@@ -1367,12 +1526,12 @@ def _stop_while_main_loads_the_snapshot(home, monkeypatch, signum):
     return snapshot, signalled, log.records
 
 
-@pytest.mark.parametrize("signum", [signal.SIGTERM, signal.SIGINT], ids=["SIGTERM", "SIGINT"])
 def test_a_stop_that_arrives_while_main_loads_the_snapshot_is_honoured_by_run(
-        tmp_path, monkeypatch, servers_main_builds, stop_handlers, signum):
-    # main() returning at all is the clean exit: a stop that was lost leaves run() in its loop, which
-    # the tick above turns into a failure rather than a hang
-    snapshot, signalled, records = _stop_while_main_loads_the_snapshot(tmp_path, monkeypatch, signum)
+        tmp_path, monkeypatch, servers_main_builds, stop_handlers):
+    # SIGTERM alone: main() records that signal and leaves SIGINT as it found it, for the reason the
+    # two tests that follow this one give. main() returning at all is the clean exit: a stop that was
+    # lost leaves run() in its loop, which the tick above turns into a failure rather than a hang
+    snapshot, signalled, records = _stop_while_main_loads_the_snapshot(tmp_path, monkeypatch, signal.SIGTERM)
     assert len(servers_main_builds) == 1
     lines = [r for r in records if "shutdown drain" in r.getMessage()]
     assert len(lines) == 1, [r.getMessage() for r in records]
@@ -1382,6 +1541,24 @@ def test_a_stop_that_arrives_while_main_loads_the_snapshot_is_honoured_by_run(
     assert os.path.getmtime(snapshot) >= signalled - 1.0, "the snapshot on disk is the one from before the stop"
     assert set(persistence.load(str(snapshot)).live_keys()) == {b"before"}
     assert stop_handlers.reached == [], "the signal reached the handler main() found, so main() had installed none"
+
+
+def test_a_sigint_while_main_loads_the_snapshot_is_not_recorded_and_still_aborts_the_load(
+        tmp_path, monkeypatch, servers_main_builds, stop_handlers):
+    # SIGINT is left out of the startup record on purpose, and this is the test that says so. the
+    # defect the record closes is `docker stop`, which sends SIGTERM. recording SIGINT as well swallowed Ctrl-C during a slow load:
+    # the load ran to its end and the process then exited 0 -- measured on a 79.5 MB snapshot, 5.52 s
+    # after the signal where it had died of it in 0.22 s, and three Ctrl-Cs did not abort it -- which
+    # took from an operator at a terminal the one way they had to give up on a load that was taking too
+    # long. what the process held for SIGINT is Python's own handler, as it does in any interpreter
+    # not started with SIGINT ignored, and a SIGINT inside the load raises KeyboardInterrupt out of it
+    signal.signal(signal.SIGINT, signal.default_int_handler)
+    with pytest.raises(KeyboardInterrupt):
+        _stop_while_main_loads_the_snapshot(tmp_path, monkeypatch, signal.SIGINT)
+    assert servers_main_builds == [], "a Server was built over a load that Ctrl-C was meant to abandon"
+    assert signal.getsignal(signal.SIGINT) is signal.default_int_handler, "main() left SIGINT bound to something else"
+    # and nothing is left recorded for a Server built directly afterwards
+    assert server_module._consume_stop_requested_during_startup() is False
 
 
 def test_the_stop_recorded_during_startup_is_consumed_so_the_next_run_in_the_process_still_serves(
@@ -1418,9 +1595,12 @@ def test_the_stop_recorded_during_startup_is_consumed_so_the_next_run_in_the_pro
 def test_main_gives_the_stop_handlers_back_on_every_way_out(
         tmp_path, monkeypatch, servers_main_builds, stop_handlers, way_out):
     # main() is also called in-process, and a recording handler left bound after it returned would
-    # swallow every later SIGTERM and Ctrl-C in that process. each way out is reached from a point
-    # where the handlers are known to be in place, and the control is that they were not the test's own
-    # there, so that a main() that never installed any cannot pass this by leaving the originals alone
+    # swallow every later SIGTERM in that process. each way out is reached from a point where the
+    # handler is known to be in place, and the control is that it was not the test's own there, so
+    # that a main() that never installed one cannot pass this by leaving the original alone. SIGINT is
+    # the other half of the control and was changed deliberately: it is not replaced during main(),
+    # because recording it as well swallowed Ctrl-C during startup, and a main() that replaced it
+    # again would fail the assertion below that names it
     during = []
     argv = ["--port", "0", "--snapshot-path", str(tmp_path / "dump.mrdb")]
     outcome = None
@@ -1459,8 +1639,10 @@ def test_main_gives_the_stop_handlers_back_on_every_way_out(
             server_module.main(argv)
 
     assert len(during) == 1, "main() never reached the point this way out is taken from"
-    assert all(during[0][signum] != stop_handlers.ours[signum] for signum in stop_handlers.ours), (
-        "main() had not replaced the test's handler for both stop signals there, so a restored handler below proves nothing")
+    assert during[0][signal.SIGTERM] != stop_handlers.ours[signal.SIGTERM], (
+        "main() had not replaced the test's handler for SIGTERM there, so a restored handler below proves nothing")
+    assert during[0][signal.SIGINT] == stop_handlers.ours[signal.SIGINT], (
+        "main() replaced the handler for SIGINT, which would swallow Ctrl-C while the snapshot loads")
     assert stop_handlers.held() == stop_handlers.ours, "main() left its own handlers bound"
 
 
@@ -1475,6 +1657,111 @@ def test_main_starts_without_a_stop_request_an_earlier_main_left_behind(
     monkeypatch.setattr(logging, "basicConfig", lambda **kwargs: None)
     server_module.main(["--port", "0", "--snapshot-path", str(tmp_path / "dump.mrdb")])
     assert seen == [False]
+
+
+def test_a_stop_that_lands_while_run_installs_its_handlers_is_still_honoured(
+        tmp_path, monkeypatch, stop_handlers):
+    # the order inside run() is the whole of the startup fix. the record is consumed after both of run()'s
+    # handlers are armed, so a stop recorded while they are being armed is read by that consume and one
+    # arriving later reaches _request_stop. consumed before them, a stop that lands in between sets the
+    # record again after it was read, nothing ever reads it, and the server serves on: the whole suite
+    # passed with the two moved, which is how this test came to be written. the stop is landed from inside
+    # the install of run()'s first handler, the latest point at which the record can be written and the
+    # handlers still not all be in place, and the watchdog is what turns a loop that never ends into a
+    # failure that does
+    server = _server(tmp_path)
+    real_signal = signal.signal
+    landed = []
+    ticks = []
+    watchdog_fired = []
+
+    def installing(signum, handler):
+        previous = real_signal(signum, handler)
+        if handler == server._request_stop and not landed:
+            landed.append(signum)
+            server_module._note_stop_requested_during_startup(signum, None)
+        return previous
+
+    def watchdog():
+        watchdog_fired.append(True)
+        server._request_stop(None, None)
+
+    monkeypatch.setattr(signal, "signal", installing)
+    monkeypatch.setattr(server, "_tick", lambda: ticks.append(1))
+    timer = threading.Timer(5, watchdog)
+    timer.daemon = True
+    timer.start()
+    started = time.monotonic()
+    try:
+        server.run()
+    finally:
+        timer.cancel()
+        server._loop.close()
+    elapsed = time.monotonic() - started
+    assert landed, "run() never installed a handler for the stop to land in"
+    assert not watchdog_fired, "run() was still looping after five seconds: the stop that landed was never read"
+    assert ticks == [], "the loop ran: the stop that landed while the handlers were armed was not honoured"
+    assert server._running is False
+    assert elapsed < 5, elapsed
+
+
+@pytest.mark.parametrize(
+    "way_out", ["a usage error", "a refused snapshot", "an OSError out of construction"])
+def test_a_stop_recorded_by_a_main_that_died_before_run_does_not_end_a_server_built_directly_afterwards(
+        tmp_path, monkeypatch, servers_main_builds, stop_handlers, scene_for, way_out):
+    # main() cleared the record on the way in and nowhere else, so a main() that recorded a stop and died
+    # before run() left it set, and a Server built directly afterwards honoured a request that was made of
+    # another one: it printed `listening on`, ran no iteration of its loop and returned. each way out is
+    # one main() really has between the handler going in and run() being reached, and the signal is a real
+    # one, delivered from inside it
+    first = tmp_path / "first"
+    first.mkdir()
+    argv = ["--port", "0", "--snapshot-path", str(first / "dump.mrdb")]
+    outcome = SystemExit
+    # a context, so that the load and the parser are the real ones again for the server built below
+    with monkeypatch.context() as patched:
+        patched.setattr(logging, "basicConfig", lambda **kwargs: None)
+        if way_out == "a usage error":
+            real_parser = server_module.build_arg_parser
+
+            def stopped_parser():
+                os.kill(os.getpid(), signal.SIGTERM)
+                return real_parser()
+
+            patched.setattr(server_module, "build_arg_parser", stopped_parser)
+            argv = ["--port", "not-a-port"]
+        else:
+            def stopped_load(path):
+                os.kill(os.getpid(), signal.SIGTERM)
+                if way_out == "a refused snapshot":
+                    raise persistence.SnapshotError("injected: the snapshot is refused")
+                raise OSError(5, "injected: an unexpected OSError out of construction")
+
+            patched.setattr(persistence, "load", stopped_load)
+            if way_out == "an OSError out of construction":
+                outcome = OSError
+        with pytest.raises(outcome):
+            server_module.main(argv)
+    assert stop_handlers.reached == [], "the signal reached the handler main() found, so main() had installed none"
+
+    second = tmp_path / "second"
+    second.mkdir()
+    server = _server(second)
+    scene = scene_for(server)
+    answers = []
+
+    def scenario():
+        client = scene.connect()
+        client.settimeout(5)
+        try:
+            client.sendall(_resp(b"PING"))
+            answers.append(client.recv(64))
+        except OSError as exc:
+            # a loop that never ran has nothing to answer with, and a server that has already stopped resets the connection
+            answers.append(repr(exc))
+
+    scene.run(scenario)
+    assert answers == [b"+PONG\r\n"], answers
 
 
 def test_a_negative_drain_timeout_is_refused_without_recommending_zero(capsys):
