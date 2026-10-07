@@ -65,12 +65,15 @@ EXPOSE 6379
 # rather than being discarded -- but only once main() has installed it, and the
 # interpreter's own startup and this module's imports run before that. A stop inside that
 # window is still discarded: the container serves on to the end of the stop timeout and
-# dies on SIGKILL with no save, and a write already answered `OK` in that window is gone
-# after a restart. Measured on a 400k-key volume, a `SET` acked and then lost, with
-# `docker stop` taking 10.21 s and exit 137. The window is interpreter startup plus
-# imports and does not grow with the keyspace: 169 to 429 ms from spawn to the handlers
-# being armed over 12 fresh starts in the container, median about 235, and 147 to 234 ms
-# by the daemon's own clock, none of them a ceiling, all taken at load average 4.6 to 7.2.
+# dies on SIGKILL with no save, and a write it answers `OK` before then is gone after a
+# restart. Measured on a 400k-key volume, a `SET` acked and then lost, with `docker stop`
+# taking 10.28 s and exit 137. The window ends when main()'s one handler is armed, which
+# is interpreter startup plus imports and does not grow with the keyspace: from the
+# daemon's StartedAt to that handler it was 209.0 to 607.4 ms over 14 fresh starts on an
+# empty volume, median 237.2, at load average 6.1 to 7.4, and the median on a 400k-key
+# volume was 262.2 ms. The largest of 14 is not a ceiling. run()'s two handlers are armed
+# later, after the snapshot load, and that point does grow: median 242.7 ms on the empty
+# volume, 1,257.8 ms on the 400k-key one. A stop between the two is recorded and honoured.
 # Waiting for `listening on` before the first command avoids it. Under a shell form PID 1
 # is /bin/sh, which does not forward the signal, and the server is killed after the stop
 # timeout without its shutdown save having run.
