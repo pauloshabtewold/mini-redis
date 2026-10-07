@@ -178,23 +178,24 @@ begin one of the remaining lines, followed by `:` or ` (`, because the two `LRAN
 labels carry a parenthetical.
 
 At the pinned request count, with `redis-benchmark` 7.2.7 driving each of the two
-servers in turn, the run reports nothing missing: five or six lines carry the seeding
-label against a real `redis-server 7.2.7` and seven or eight against this server, nine
-runs each, alternated pair by pair at loads from 4.3 to 6.5. How many there are is not
-fixed — the reason is two sentences on — and load moves each count by about one line,
-but the two-line gap between the servers does not move at any load, so the spread is
-mostly which server is answering and not how busy the machine is. Eleven lines, which an
-earlier range reached for, did not reproduce in eighteen runs. Take the per-server range
-and not a figure from it. With `lpush` dropped from the
-list, so nine names, the tool still exits 0 and the rule reports `LPUSH` missing, while
-a plain search for `LPUSH` anywhere in the output and a rule that discards exactly one
-seeding line both report nothing missing. The number of seeding lines is not fixed,
-because the tool repaints that line while it seeds, so how many there are depends on how
-long seeding takes; at a small request count there can be just one, and the singular
-rule and the plural one agree. I verified the rule at the pinned count for that reason.
-Deleting the `\r` characters instead of splitting on them failed a correct run at small
-request counts on 6.2.14 and did not on 7.2.7 at 1,000, 2,000 or 100,000, so the split
-is kept as the reading that is right on both.
+servers in turn, the run reports nothing missing: over nine alternated pairs of runs, a
+real `redis-server 7.2.7` carried 4 lines with the seeding label in four of the five
+runs at load 6.5 or below and 5 to 11 at higher load, eleven having reproduced once, at
+load 8.05, and this server carried 7 or 8 below that load and 8 or 9 above it. How many
+there are is not fixed — the reason is the repainting described below — and the gap
+between the servers is not constant either: 3 or 4 lines at load 6.5 or below and from
+-2 to +4 above it, this server's count minus the real server's. Read the per-server
+counts as load-dependent and take neither the gap nor any single count as fixed. With
+`lpush` dropped from the list, so nine names, the tool still exits 0 and the rule
+reports `LPUSH` missing, while a plain search for `LPUSH` anywhere in the output and a
+rule that
+discards exactly one seeding line both report nothing missing. The tool repaints that
+line while it seeds, so how many there are depends on how long seeding takes; at a small
+request count there can be just one, and the singular rule and the plural one agree. I
+verified the rule at the pinned count for that reason. Deleting the `\r` characters
+instead of splitting on them failed a correct run at small request counts on 6.2.14 and
+did not on 7.2.7 at 1,000, 2,000 or 100,000, so the split is kept as the reading that is
+right on both.
 
 ## Designed and not built
 
@@ -411,18 +412,19 @@ one of them back.
 or has not sent, so that flag does not bound it either; and it holds what is already
 queued for it, at least the high-water mark's worth plus whatever the one batch that
 crossed the mark queued, until it disconnects. That is bounded: per connection by the
-mark plus that batch, which the limit in turn caps at the limit plus one reply while the
-limit is on, and over all connections by `--max-connections`. Read that bound as the
-product it is: the 32 MiB above, times the default `--max-connections 1024`, puts the
-aggregate at 32 GiB — far past the memory of any machine this is likely to run on, and
-the cap is what bounds the count of connections, not what makes the total small.
-Ninety-six paused connections drove 2.9 GB into swap on an 8 GiB machine, with every one
-still open and a fresh client still answered in six milliseconds. That a client is held
-and never closed is also a divergence from the reference, which keeps reading such a
-client and closes it at the hard limit configured for ordinary clients, if there is one.
-It is accepted and not fixed: bounding how long a connection may stay paused would be a
-control of its own, and `--incomplete-command-timeout` is not it, since it is suspended
-for a paused connection whether or not that connection holds a half-sent command.
+mark plus that batch, which the limit itself caps while the limit is on — the limit
+plus one reply is the transient peak before a close, not the hold — and over all
+connections by `--max-connections`. Read that bound as the product it is: the 32 MiB
+above, times the default `--max-connections 1024`, puts the aggregate at 32 GiB — far
+past the memory of any machine this is likely to run on, and the cap is what bounds the
+count of connections, not what makes the total small. Ninety-six paused connections
+drove 2.9 GB into swap on an 8 GiB machine, with every one still open and a fresh client
+still answered in six milliseconds. That a client is held and never closed is also a
+divergence from the reference, which keeps reading such a client and closes it at the
+hard limit configured for ordinary clients, if there is one. It is accepted and not
+fixed: bounding how long a connection may stay paused would be a control of its own, and
+`--incomplete-command-timeout` is not it, since it is suspended for a paused connection
+whether or not that connection holds a half-sent command.
 
 The pause has two more costs, for two different clients. One that writes every request
 before it reads any reply, as `redis-py`'s `pipeline()` does with the batch it holds,
@@ -433,31 +435,46 @@ And a client that stops reading loses writes when the server is stopped. Its req
 wait unread for as long as it stays paused, which is until it disconnects; a stop
 dispatches none of them, so a pipeline whose `send()` has already returned is lost in
 full. It takes the pause to have fired, which takes more queued replies than the two
-kernels will hold — below that the connection is still being read, and what is then lost is
-whatever the loop had not read when the stop landed rather than the whole pipeline: measured
-with the pause unable to fire at all, a prompt stop discarded 604,051 to 1,567,618 bytes of a
-1,977,780-byte pipeline across ten runs, and a server given three seconds to catch up
-discarded none. The pause is what makes the loss the whole pipeline and makes it certain.
-Measured at the shipped defaults over twenty-three runs where it did fire, each preceded by
-twelve 1 MiB replies so that it fires every time: of 50,000 pipelined `SET`s whose bytes
-the kernels had accepted, all 50,000 were discarded and none executed, with the server
-exiting 0 — and 50,000 of 50,000 executed in five runs with `--write-buffer-high-water
-0`. How many are executed is not fixed: earlier probes of the same shape executed up to
+kernels will hold — below that the connection is still being read, and what is then
+lost is whatever the loop had not read when the stop landed rather than the whole
+pipeline: measured with the pause unable to fire at all, a prompt stop discarded at
+least 623,532 and up to 1,863,264 bytes of a 1,977,780-byte pipeline across ten runs,
+94.2% of it at the top, and a server given three seconds to catch up discarded none. The
+pause is what makes the loss the whole pipeline and makes it certain. Measured at the
+shipped defaults over twenty-three runs where it did fire, each preceded by twelve 1 MiB
+replies so that it fires every time: of 50,000 pipelined `SET`s whose bytes the kernels
+had accepted, all 50,000 were discarded and none executed, with the server exiting 0.
+How many are executed is not fixed: earlier probes of the same shape executed up to
 about two thousand, so read the loss as the whole pipeline rather than as a figure near
-it. The client's end of input is clean when the drain managed to empty the receive queue
-and a reset when it did not, which depends on how long the drain lasted and not on what
-the client did wrong. The drain's own line counts the inbound bytes the stop threw away in
-all five shapes they come in, which for that pipeline is the whole 1,588,890 bytes the
-client sent — exactly what it sent, in 23 of 23 runs — and 0 with the pause off in 5 of
-5. What it cannot count is what the client's own kernel still holds unsent, which is not
-a question this server can ask anyone. At the shipped `--shutdown-drain-timeout 5` that
-costs nothing: 0 bytes uncounted in 23 of 23, even in the run where 360,246 bytes were
-still in the client's kernel at the instant of `SIGTERM`, because the drain reads for
-those five seconds and the peer's kernel delivers inside them. At
-`--shutdown-drain-timeout 0` the uncounted amount is exactly what the peer still held —
-median 0, at most 360,246 bytes, 22.7% of the pipeline, non-zero in 5 of 15. That figure
-is the only place the loss is reported, and nothing bounds the loss itself. `docs/DESIGN.md`
-has the measurements and the reasoning.
+it. With `--write-buffer-high-water 0` and three seconds for the server to catch up,
+50,000 of 50,000 executed in five runs. The client's end of input is clean when the
+drain managed to empty the receive queue and a reset when it did not, which depends on
+how long the drain lasted and not on what the client did wrong. The drain's own line
+counts the inbound bytes the stop threw away in all five shapes they come in, which for
+that pipeline and a client that never reads is the whole 1,588,890 bytes it sent —
+exactly what it sent, in each of those twenty-three runs. With the pause off the figure
+was 0 in 5 of 5 once the server had three seconds to catch up; with a prompt stop it was
+1,523,567, 737,152, 1,523,567, 1,195,680 and 1,195,680 bytes, with 2,143 to 26,964 of
+the 50,000 executed. Turning the pause off removes the loss's certainty, not the loss.
+What the line cannot count is what the peer's own kernel still holds unsent, which is
+not a question this server can ask anyone, and how much that is depends on the client
+and not on the timeout. A client that never reads holds the drain open for its whole
+timeout, and the peer's kernel delivers inside it: 0 bytes uncounted in 12 of 12 at the
+shipped `--shutdown-drain-timeout 5`, the drain lasting 5.09 to 5.20 s. A client that
+reads its replies ends the drain as soon as no reply is owed — measured at 0.01 to
+0.02 s, not five seconds — and whatever its kernel still held is uncounted: non-zero
+in 6 of 9 runs, median 478,646 bytes and maximum 1,180,846, and in a second harness
+non-zero in 8 of 17, 156,780 to 322,080 bytes. Every one of those was reported under an
+INFO line reading `complete`. At `--shutdown-drain-timeout 0` there is no read pass, and
+the uncounted amount is exactly what the peer still held. Measured with a client that
+never reads, over 12 runs of a 1,588,890-byte pipeline: non-zero in 12 of 12, median
+550,534 bytes and maximum observed 1,196,714, which is 75.3% of the pipeline; a second
+harness over 8 runs reached 450,092. In the two runs where the client's `sendall` had
+returned, the figures were 543,902 and 549,754, each within 7 KB of what `SO_NWRITE`
+reported the client's kernel still held unsent. Nothing bounds the uncounted amount:
+these are the largest values seen, not a ceiling. The drain's line is the only place the
+loss is reported, and nothing bounds the loss itself. `docs/DESIGN.md` has the
+measurements and the reasoning.
 
 **Four more flags cover persistence and the active sweep.** Persistence is on by
 default. `--snapshot-path` names the file a snapshot is written to and read back from
@@ -550,71 +567,93 @@ them without repeating them.
 (default `5`) bounds the drain, which is the part of the way out that waits on clients,
 and not the whole of it: the wait for the loop to notice the signal, up to one
 `select()` timeout, comes first, and so does the snapshot save, which costs what the
-keyspace costs and which this flag does not limit. On `SIGINT` or `SIGTERM` the loop
-stops, and then, before anything is torn down: the listening socket leaves the select
-set, so nothing further is accepted, though the socket itself stays open until the
-teardown and a replacement server cannot bind the port while this process is still
-running; a snapshot is saved; and the server spends up to SECONDS sending the replies
-already queued for clients, then exits whether or not the kernel took all of them. The
-save comes before the drain on purpose. A client that never reads holds the drain to its
-whole timeout, and an operator who gives up and sends `SIGKILL` should not find that the
-snapshot was the thing waiting behind it. It runs whether or not `--snapshot-interval`
-is `0`: that interval schedules periodic saves, and a save on the way out is a different
-thing, which is also why `CONFIG GET save` can answer an empty string from a server that
-will still write a snapshot when it is stopped. The one pairing of flags that skips it
-is the one described with the persistence flags above, where the file is being left
-alone on purpose. During the drain the server keeps reading its clients and dispatches
-nothing. Stopping reading looks like the way to keep the drain finite, and it is the
-wrong one: a request left unread in a socket's receive queue turns the close that
-follows into a reset, and a reset discards the closing socket's own send queue, which is
-the replies this process handed to its kernel and the kernel had not yet put on the
-wire. Replies the peer had already received are not taken back; the tail that never left
-is what goes. What keeps the drain finite is that no command runs and so no new reply is
-queued, while inbound bytes are read and thrown away: the receive queue is empty at the
-close, so the close is orderly and the kernel goes on sending what it holds. A
-connection the high-water mark had stopped reading is read again from the moment the
-drain begins, for the same reason: whatever it had not read would still be in its
-receive queue at the close. The deadline is checked between passes of the loop, so the
-real bound is SECONDS plus one `select()` timeout, and the drain ends in one log line
-however it ends, even when a pass raises. The line carries two counts of replies,
-connections closed while they still owed bytes and connections still owing bytes when
-the drain ended, and it is a warning if either is non-zero and informational if both are
-zero. Both are shown at the default `--log-level`, which is INFO, so a clean stop ends
-with a line that says `complete`; `--log-level WARNING` leaves only the
-warning. That word is about replies alone: it means every connection that was owed bytes
-got them, not that nothing inbound was thrown away. It carries one figure for
-requests as well: the inbound bytes it threw away without dispatching them, which is the
-only report there is of the writes a stop throws away, and which matters most for a
-connection the pause had stopped reading, since that connection's whole pipeline is
-sitting unread. It counts all five shapes that loss arrives in — what was in a read
-buffer when the drain began, what a half-received command had already had parsed off
-that buffer, what the drain read and discarded while it ran, what was still unread in a
-connection's receive queue when that connection was closed or the drain ran out of time,
-and what sat on a connection the kernel completed into the accept backlog after the stop,
-which nothing ever accepts. The receive queue is the shape that dominates, and the one a
-count of the drain's own reads would miss entirely: the drain ends as soon as no connection is owed a
-reply, and at `--shutdown-drain-timeout 0` it ends before a single read. That figure
-does not move the level, and the reason is not that the two kinds of byte cannot be told
-apart -- they can, since `has_incomplete_command` is exactly that question and the read
-path asks it already. It is that no threshold separates them by size. A command only half
-sent leaves its bytes in a read buffer too, and one client caught mid-upload of a large
-value holds more of them than a whole discarded pipeline does: measured, 4,194,314 bytes
-for one `SET` of a declared 8 MiB value against 1,588,890 for fifty thousand pipelined
-ones, with a ceiling of `--max-value-size` per connection. A threshold set above the
-pipeline misses the pipeline and a threshold below it warns on an ordinary upload, so the
-level says what it can say exactly -- whether a reply was lost -- and the figure is read
-for the rest.
+keyspace costs. Two sweeps of the accept backlog, described below, sit inside the drain
+at its entry and in its `finally`, with no deadline of their own. This flag limits none
+of these. On `SIGINT` or `SIGTERM` the loop stops, and then, before anything is torn
+down: the listening socket leaves the select set, so no connection that arrives from
+here on is served, though the socket itself stays open until the teardown and a
+replacement server cannot bind the port while this process is still running; a snapshot
+is saved; and the server spends up to SECONDS sending the replies already queued for
+clients, then exits whether or not the kernel took all of them. The save comes before
+the drain on purpose. A client that never reads holds the drain to its whole timeout,
+and an operator who gives up and sends `SIGKILL` should not find that the snapshot was
+the thing waiting behind it. It runs whether or not `--snapshot-interval` is `0`: that
+interval schedules periodic saves, and a save on the way out is a different thing, which
+is also why `CONFIG GET save` can answer an empty string from a server that will still
+write a snapshot when it is stopped. The one pairing of flags that skips it is the one
+described with the persistence flags above, where the file is being left alone on
+purpose. During the drain the server keeps reading its clients and dispatches nothing.
+Stopping reading looks like the way to keep the drain finite, and it is the wrong one: a
+request left unread in a socket's receive queue turns the close that follows into a
+reset, and a reset discards the closing socket's own send queue, which is the replies
+this process handed to its kernel and the kernel had not yet put on the wire. Replies
+the peer had already received are not taken back; the tail that never left is what goes.
+What keeps the drain finite is that no command runs and so no new reply is queued, while
+inbound bytes are read and thrown away: the receive queue is empty at the close, so the
+close is orderly and the kernel goes on sending what it holds. A connection the
+high-water mark had stopped reading is read again from the moment the drain begins, for
+the same reason: whatever it had not read would still be in its receive queue at the
+close. The deadline is checked between passes of the loop, so SECONDS plus one
+`select()` timeout bounds the part that waits on connections. The two sweeps that accept
+what the kernel completed into the listener's backlog after the stop, only to count what
+each holds and close it, sit outside it: they run at the drain's entry and in its
+`finally`, with no deadline of their own, and are bounded by the kernel's accept backlog
+rather than by the deadline. Measured on a live server they took 0.2 ms to 28 ms, which
+matters at `--shutdown-drain-timeout 0`, where the sweeps are one of two steps between
+the loop stopping and exit that no deadline covers; the snapshot save is the other. A
+real client cannot extend them on this host: the sweep accepts at a median 61,054
+connections per second against one connector at a median 1,179, and floods of 4, 7 and
+32 processes did not extend exit past 0.07 s.
+The drain ends in one log line however it ends, even when a pass raises. The line
+carries two counts of replies, connections closed while they still owed bytes and
+connections still owing bytes when the drain ended, and it is a warning if either is
+non-zero and informational if both are zero. Both are shown at the default
+`--log-level`, which is INFO, so a clean stop ends with a line that says `complete`;
+`--log-level WARNING` leaves only the warning. That word is about replies alone: it
+means every connection that was owed bytes got them, not that nothing inbound was thrown
+away. It carries one figure for requests as well: the inbound bytes it threw away
+without dispatching them, which is the only report there is of the writes a stop throws
+away, and which matters most for a connection the pause had stopped reading, since that
+connection's whole pipeline is sitting unread. It counts all five shapes that loss
+arrives in — what was in a read buffer when the drain began, what a half-received
+command had already had parsed off that buffer, what the drain read and discarded while
+it ran, what was still unread in a connection's receive queue when that connection was
+closed or the drain ran out of time, and what sat on a connection the kernel completed
+into the accept backlog after the stop, which is never served. The receive queue is the
+shape that dominates, and the one a count of the drain's own reads would miss entirely:
+the drain ends as soon as no connection is owed a reply, and at
+`--shutdown-drain-timeout 0` it ends before a single read. That figure does not move the
+level. The bytes of a command only half sent are discarded by a stop like those of a
+request nobody will answer, and `has_incomplete_command` tells them apart only where
+they have been read: it answers for bytes in a read buffer and for a multibulk held with
+the buffer empty, which are the first two shapes, and it cannot answer for the shape
+that dominates, because the bytes in a kernel receive queue were never parsed. So the
+two kinds are distinguishable where they have been read and not where most of them are.
+Even where they can be told apart, no threshold separates them by size, which is the
+argument that carries: one client caught mid-upload of a large value holds more bytes
+than a whole discarded pipeline does. Measured, 4,194,334 bytes, 3 of 3, for one client
+that had sent a 4 MiB body of a declared 8 MiB `SET` value, against 1,588,890 for fifty
+thousand pipelined `SET`s. What one connection can hold for one unfinished command is
+bounded by `--max-multibulk` times `--max-value-size` and not by `--max-value-size`,
+because the count includes a multibulk's finished elements as well as the one still
+arriving: `--max-value-size` bounds each element and nothing bounds their sum but
+`--max-multibulk`. Measured at `--max-value-size 100` with an `MSET`-shaped command of
+five finished 100-byte elements and 50 bytes of a sixth, 610 bytes were held and
+reportable, six times the per-element cap. A threshold set above the pipeline misses the
+pipeline and a threshold below it warns on an ordinary upload, so the level says what it
+can say exactly -- whether a reply was lost -- and the figure is read for the rest.
 
 `--shutdown-drain-timeout 0` reads the opposite way from the limits it sits beside. For
 `--write-buffer-limit`, `--max-value-size`, `--max-multibulk`, `--max-connections` and
 `--incomplete-command-timeout`, `0` removes the limit, so a check that closes or refuses
 something stops doing it and turning it off is permissive. This value is a time
-allowance and what it allows is the drain, so `0` is no time at all, and means no drain:
-turning it off is restrictive. (`--port 0` and the two intervals read in neither way:
-the kernel chooses a port, or a periodic task is switched off, and none of the three is
-a limit.) The two water marks read in neither way either, and each has a reading of its
-own: `--write-buffer-high-water 0` disables the pause, so reading goes on however much
-is queued, and `--write-buffer-low-water` is then unreachable, which is accepted and not
+allowance and what it allows is the drain, so `0` is no time at all, and means no drain
+pass — the setup pass and the two backlog sweeps still run, but nothing is read: turning
+it off is restrictive. (`--port 0` and the two intervals read in neither way: the kernel
+chooses a port, or a periodic task is switched off, and none of the three is a limit.)
+The two water marks read in neither way either, and each has a reading of its own:
+`--write-buffer-high-water 0` disables the pause, so reading goes on however much is
+queued, and `--write-buffer-low-water` is then unreachable, which is accepted and not
 refused; with the pause on, `--write-buffer-low-water 0` means resume only when the
 queue is empty, the most conservative resume and not a way of switching anything off.
 What is lost is the part of the replies the kernel will not take in the one best-effort
@@ -654,13 +693,14 @@ end of input. The first is a question put to the kernel that this server does no
 and it ties the exit to the pace of the slowest reader, up to the deadline; the second
 needs the client's cooperation and has no bound of its own against one that never gives
 it. This server does neither. The second limit is the other direction, and it is the
-last of the pause's costs above: a request the stop never dispatches is a write the client
-was already told had left, whether the drain read and threw it away or the close reset it
-unread. That one is reported, in the drain line's third figure.
-`--write-buffer-high-water 0` removes the pause's share of it — the whole pipeline, lost
-with certainty — and not the loss itself: a stop still discards whatever the loop had not
-read, which with the pause off and no time to catch up measured 604,051 to 1,567,618
-bytes of a 1,977,780-byte pipeline. `docs/DESIGN.md` has the reasoning.
+last of the pause's costs above: a request the stop never dispatches is a write the
+client was already told had left, whether the drain read and threw it away or the close
+reset it unread. That one is reported, in the drain line's third figure.
+`--write-buffer-high-water 0` removes the pause's share of it — the whole pipeline,
+lost with certainty — and not the loss itself: a stop still discards whatever the loop
+had not read, which with the pause off and no time to catch up measured at least 623,532
+and up to 1,863,264 bytes of a 1,977,780-byte pipeline. `docs/DESIGN.md` has the
+reasoning.
 
 `--max-connections COUNT` (default `1024`) closes, without a reply, a connection that
 arrives while COUNT clients are already connected; `0` means no limit, and nothing is
@@ -694,30 +734,30 @@ The default is loopback, so a server is local-only unless asked otherwise: it ha
 authentication, and whatever can reach the port can read, overwrite or flush every key.
 An empty `HOST` is refused, since it would listen on every interface, and `0.0.0.0` asks
 for that by name. `--log-level` (default `INFO`; `DEBUG`, `INFO`, `WARNING` or `ERROR`,
-in any case) sets how much is logged, once, in `main()`: importing `server` configures
-nothing, so a program that embeds it keeps its own logging. INFO adds a line for each
-connection opened and each closed to what WARNING shows. Those two lines have no count
-bound of their own, unlike the refusal and task-failure lines above, and each is a
-blocking write to standard error on the one thread this server has: a client that
+in any case) sets how much is logged, once, in `_parse_and_run()`: importing `server`
+configures nothing, so a program that embeds it keeps its own logging. INFO adds a line
+for each connection opened and each closed to what WARNING shows. Those two lines have
+no count bound of their own, unlike the refusal and task-failure lines above, and each
+is a blocking write to standard error on the one thread this server has: a client that
 connects and disconnects in a loop can fill a stalled reader's buffer by itself and park
 the loop, which is the hazard those bounds exist for. `--log-level WARNING` removes
 those two lines, and with them the line a drain that lost no replies writes, which is
 also INFO -- and with it the only report there is of the request bytes a stop discarded,
-because a stop that loses requests but no replies writes that line and no other. It does
-not remove the hazard. Two WARNING lines are the same kind of writer: one
-per connection, with no count bound of their own. One is written when a connection is
-closed for holding a half-sent command past `--incomplete-command-timeout`, and a
-client reaches it by connecting, sending half a command and waiting out the timeout.
-The other is written when a connection is closed for queued replies still over
-`--write-buffer-limit`, and a client reaches it by asking for a reply bigger than the
-limit plus whatever the kernel takes. A client that does either in a loop still drives
-a blocking write per connection at WARNING. That is a residual this server accepts and
-does not bound: the refusal and task-failure lines above are counted, these two are
-not, and the write is the same blocking one on the same thread. DEBUG adds a line per
-dispatched command naming it and counting its arguments, never showing a key or a value,
-and that call sits behind a level check, so at INFO nothing is built for it. An unknown
-level is a usage error and exits 2. Neither flag takes a number, so neither has a `0`
-to misread.
+because a stop that loses requests but no replies writes that line and no other. Even
+so, `--log-level WARNING` does not remove the hazard: two WARNING lines are the same
+kind of writer, one per connection, with no count bound of their own. One is written
+when a connection is closed for holding a half-sent command past
+`--incomplete-command-timeout`, and a client reaches it by connecting, sending half a
+command and waiting out the timeout. The other is written when a connection is closed
+for queued replies still over `--write-buffer-limit`, and a client reaches it by asking
+for a reply bigger than the limit plus whatever the kernel takes. A client that does
+either in a loop still drives a blocking write per connection at WARNING. That is a
+residual this server accepts and does not bound: the refusal and task-failure lines
+above are counted, these two are not, and the write is the same blocking one on the same
+thread. DEBUG adds a line per dispatched command naming it and counting its arguments,
+never showing a key or a value, and that call sits behind a level check, so at INFO
+nothing is built for it. An unknown level is a usage error and exits 2. Neither flag
+takes a number, so neither has a `0` to misread.
 
 ## Quickstart
 
@@ -761,14 +801,16 @@ docker stop mini-redis
 ```
 
 The `until` line is not decoration. `docker run -d` returns as soon as the container is
-created, and a `PING` sent before the server has bound answers `Error: Server closed the
-connection` -- 3 of 3 without it. The server prints `listening on` once it is bound and its
-stop handlers are armed, which is the one line worth waiting for and the same line the test
-suite's own launcher reads. The image exposes port 6379, which the `-p` above publishes on
-loopback as 7000. It runs
-the server as a non-root user whose uid is fixed so that a volume written by one build
-is writable by the next, and keeps its snapshot at `/data/dump.mrdb`, inside a volume,
-so that stopping the container and starting another over the same volume keeps the
+created, and a `PING` sent before the server has bound answers
+`Error: Server closed the connection` -- 3 of 3 without it. The server prints
+`listening on` once the listener is bound and the stop handlers are armed, which is what
+makes it the right line to wait for before sending a command, and the same line the test
+suite's own launcher reads. A stop that arrives during startup prints it too and then
+exits, so the line says the port is open, not that the server will stay up. The image
+exposes port 6379, which the `-p` above publishes on loopback as 7000. It runs the
+server as a non-root user whose uid is fixed so that a volume written by one build is
+writable by the next, and keeps its snapshot at `/data/dump.mrdb`, inside a volume, so
+that stopping the container and starting another over the same volume keeps the
 keyspace. Inside the container the server listens on every interface, because a
 published port is unreachable otherwise, and it has no authentication: a bare
 `-p 6379:6379` offers every key to whatever can reach the host, so publish to loopback
@@ -781,6 +823,20 @@ took 10.23 s, the container exited 137 and no snapshot was written, against 0.23
 0 and a snapshot written with the exec form. `docker stop` waits ten seconds by default
 before it sends `SIGKILL`, so a keyspace whose save takes longer than that needs
 `docker stop -t`.
+
+The exec form is not a complete answer. The handler that `SIGTERM` needs exists only
+once `main()` has installed it, and the interpreter's own startup and `server.py`'s
+imports run before that. The kernel delivers no signal to PID 1 that has only its
+default disposition, so a `docker stop` that lands in that window is discarded: the
+container serves on to the end of the stop timeout and dies on `SIGKILL` with no save,
+and every write it answers `OK` in that time is gone after a restart. Measured on a
+400k-key volume, a `SET` was acknowledged and then lost, `docker stop` took 10.21 s and
+the container exited 137 with no drain line. The window does not grow with the keyspace;
+from container start to the handlers being armed it measured 169 to 429 ms over 12 fresh
+starts, median about 235, and 147 to 234 ms by the daemon's own clock. None of these is
+a ceiling, and all were taken at load average 4.6 to 7.2, so a quiet machine will be
+faster. Waiting for `listening on` before the first command or the first `docker stop`,
+as the `until` line above does, avoids it.
 
 ## What's interesting here
 
