@@ -17,7 +17,7 @@ import pytest
 import server as server_module
 from connection import RECV_SIZE, Connection
 from server import Server, build_arg_parser
-from tests.test_graceful_shutdown import _unacknowledged_bytes, _wait_until
+from tests.test_graceful_shutdown import _BoundedAccepts, _unacknowledged_bytes, _wait_until
 from tests.test_server_lifecycle import listening, pump
 
 REPO_ROOT = pathlib.Path(__file__).resolve().parent.parent
@@ -1148,21 +1148,6 @@ def test_a_swept_socket_is_closed_when_asking_what_it_holds_raises_something_une
         assert swept.fileno() == -1, "the swept socket was left open when the question about it raised"
     finally:
         server._loop.close()
-
-
-class _BoundedAccepts:
-    # a real listener whose empty answers are counted, for the reason ScriptedListener counts its own: a sweep that went back to a listener that had just said nothing was pending would otherwise spin on a real one for ever, and a timeout's exception lands in the drain's finally clause, which sweeps again
-    def __init__(self, listener):
-        self._listener = listener
-        self.empty_asks = 0
-
-    def accept(self):
-        try:
-            return self._listener.accept()
-        except BlockingIOError:
-            self.empty_asks += 1
-            assert self.empty_asks <= 20, "the sweep went on asking a listener that had nothing pending"
-            raise
 
 
 def _how_a_waiting_client_sees_its_connection(client, seconds):

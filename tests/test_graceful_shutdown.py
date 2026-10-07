@@ -484,6 +484,26 @@ class _server_log:
         self.log.setLevel(self.level)
 
 
+class _BoundedAccepts:
+    # a real listener whose empty answers are counted, for the reason ScriptedListener counts its own: a sweep that went back to a listener which had just said nothing was pending would spin on a real one for ever, and a pytest-timeout exception lands in the drain's finally clause, which sweeps again -- so a runaway is a hang and not a failure unless something here bounds it. everything but accept() is delegated, because the object this wraps is also registered with the selector, asked its address and closed
+    def __init__(self, listener):
+        self._listener = listener
+        self.empty_asks = 0
+
+    def accept(self):
+        try:
+            return self._listener.accept()
+        except BlockingIOError:
+            self.empty_asks += 1
+            assert self.empty_asks <= 20, "the sweep went on asking a listener that had nothing pending"
+            raise
+
+    def __getattr__(self, name):
+        # fileno, close, getsockname and the rest: the selector and the shutdown path all reach
+        # the real socket through here
+        return getattr(self._listener, name)
+
+
 class _Scene:
     def __init__(self, server):
         self.server = server
@@ -535,7 +555,9 @@ class _Scene:
         real_open = server._open_listener
 
         def open_listener():
-            self.listener = real_open()
+            # wrapped, so every scenario that drives a real listener through the drain is bounded
+            # against a sweep that stops breaking out of its accept loop
+            self.listener = _BoundedAccepts(real_open())
             self.port = self.listener.getsockname()[1]
             return self.listener
 
