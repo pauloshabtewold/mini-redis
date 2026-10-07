@@ -7,17 +7,24 @@ two tests that read `0` and the default: the boundary is the thing under test, a
 cap in the hundreds would measure descriptor limits rather than the comparison. Three
 tests use no listener. The two that refuse a negative cap, at the CLI parser and at
 the constructor, never serve a connection, and the one that starts a real `server.py`
-under its own `Popen` is there to show that `main()` passes the flag on.
+under its own `Popen` is there to show that `main()` passes the flag on. A fourth test
+starts a real `server.py` too, for the other reason a server refuses a connection, a
+descriptor table with no room, which only a child can have: lowering the limit in this
+process would take the rest of the suite's descriptors with it.
 """
 
 import contextlib
+import errno
 import gc
 import logging
 import pathlib
 import select
+import signal
 import socket
 import subprocess
 import sys
+import threading
+import time
 import types
 import warnings
 
@@ -366,3 +373,109 @@ def test_the_flag_reaches_a_server_started_through_main(tmp_path):
             proc.kill()
             proc.wait(timeout=10)
         proc.stdout.close()
+
+
+# this module's own copies of the three helpers test_graceful_shutdown.py waits on a child with, and not an import of them: the names are private there and a rename would break this module from a distance. the bound on every wait is a thread join or a deadline, never a wait() that a process which does not exit would hold for ever
+_MARGIN_SECONDS = 3.0
+
+
+def _wait_until(condition, seconds, what):
+    end = time.monotonic() + seconds
+    while not condition():
+        assert time.monotonic() < end, "timed out waiting for " + what
+        time.sleep(0.005)
+
+
+def _returns_within(proc, bound):
+    outcome = {}
+    waiter = threading.Thread(target=lambda: outcome.update(rc=proc.wait()), daemon=True)
+    waiter.start()
+    waiter.join(bound)
+    return (not waiter.is_alive()), outcome.get("rc")
+
+
+def _reap(proc):
+    if proc.poll() is None:
+        proc.kill()
+    proc.wait(timeout=10)
+    if proc.stdout is not None:
+        proc.stdout.close()
+
+
+# a real descriptor table that is really full: accept() fails with EMFILE only when there is no descriptor to give, and nothing scripted stands in for that faithfully. the limit is lowered by a thread inside the child, once it is told to, and not by the test, where it would take the rest of the suite's descriptors with it; the thread says when the table is full so that the clients are sent to a process that has none to give
+_FULL_TABLE_THEN_MAIN = """
+import errno, os, resource, sys, threading
+sys.path.insert(0, %r)
+import server
+
+
+def fill_when_told():
+    sys.stdin.readline()
+    soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
+    resource.setrlimit(resource.RLIMIT_NOFILE, (64, hard))
+    held = []
+    while True:
+        try:
+            held.append(os.open(os.devnull, os.O_RDONLY))
+        except OSError as exc:
+            assert exc.errno == errno.EMFILE, exc
+            break
+    print("full", flush=True)
+
+
+threading.Thread(target=fill_when_told, daemon=True).start()
+server.main(sys.argv[1:])
+"""
+
+
+def test_a_connection_refused_for_want_of_descriptors_is_reported_and_bounded(tmp_path):
+    # _on_accept used to read every OSError out of accept() as a peer that aborted between readiness and accept, which is normal and says nothing -- and EMFILE arrives there too. the failed accept() takes the pending connection with it on this platform, so the client saw a reset and the server logged nothing, where the connection cap, which refuses for the same reason, writes a line. a refusal by descriptors is now reported through the cap's own bounded path: a WARNING for the first that names the error, DEBUG for the rest, a count line every REFUSALS_PER_LINE, because what fills a descriptor table fills it as fast as a client can connect and logging writes to stderr with a blocking write on the only thread. the stream is read by a thread and not after the exit, so that a platform whose failed accept leaves the connection in the backlog, and so refuses again on the next pass, cannot fill the pipe and park the child inside a log write. the bound is asserted as arithmetic over every refusal that was logged, whatever it came to, and not as a count of three, for the same reason
+    snapshot = tmp_path / "dump.mrdb"
+    proc = subprocess.Popen(
+        [sys.executable, "-c", _FULL_TABLE_THEN_MAIN % str(REPO_ROOT),
+         "--port", "0", "--snapshot-path", str(snapshot), "--snapshot-interval", "0",
+         "--log-level", "DEBUG"],
+        stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, cwd=tmp_path)
+    stderr_lines = []
+    reader = threading.Thread(
+        target=lambda: stderr_lines.extend(iter(proc.stderr.readline, b"")), daemon=True)
+    reader.start()
+    clients = []
+
+    def refusals():
+        return [line.decode() for line in list(stderr_lines) if b"the descriptor table is full" in line]
+
+    try:
+        ready, _, _ = select.select([proc.stdout], [], [], 10)
+        line = proc.stdout.readline().decode() if ready else ""
+        assert line.startswith("listening on "), ("the server never said where it listened", line)
+        proc.stdin.write(b"fill\n")
+        proc.stdin.flush()
+        ready, _, _ = select.select([proc.stdout], [], [], 10)
+        filled = proc.stdout.readline() if ready else b""
+        assert filled == b"full\n", ("the child never filled its descriptor table", filled)
+        port = int(line.strip().rsplit(":", 1)[1])
+        for _ in range(3):
+            clients.append(socket.create_connection(("127.0.0.1", port)))
+        _wait_until(lambda: len(refusals()) >= 3, 10, "three refusals by descriptor to be logged")
+        proc.send_signal(signal.SIGTERM)
+        returned, rc = _returns_within(proc, server_mod.SELECT_TIMEOUT_SECONDS + _MARGIN_SECONDS)
+        reader.join(10)
+    finally:
+        for client in clients:
+            client.close()
+        _reap(proc)
+        reader.join(10)
+        proc.stderr.close()
+        proc.stdin.close()
+    stderr = b"".join(stderr_lines).decode()
+    assert returned and rc == 0, (returned, rc, stderr[-2000:])
+    assert "Logging error" not in stderr, stderr[-2000:]
+    table = refusals()
+    levels = [entry.split(":", 1)[0] for entry in table]
+    assert len(table) >= 3, ("a client the full table refused was not reported", table)
+    assert levels[0] == "WARNING", levels[:3]
+    assert "OSError(%d, " % errno.EMFILE in table[0] and "Too many open files" in table[0], table[0]
+    # one WARNING for the first refusal and one per REFUSALS_PER_LINE after it, however many there were: a WARNING for the second and the third as well is the line per attempt this path exists to prevent
+    assert levels.count("WARNING") == 1 + len(table) // server_mod.REFUSALS_PER_LINE, (
+        len(table), levels.count("WARNING"))

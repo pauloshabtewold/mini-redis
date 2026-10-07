@@ -1214,14 +1214,19 @@ def test_a_client_waiting_in_the_backlog_at_the_stop_is_closed_when_the_drain_st
         listener.close()
 
 
-def test_the_sweep_gives_back_its_spare_descriptor_before_the_first_accept(scripted_listener):
+def test_the_sweep_does_not_take_the_reserve_back_from_whoever_already_has_it(scripted_listener):
+    # the sweep used to release the reserve itself, one statement before its first accept. it no
+    # longer does: run() releases it before the shutdown save, the step whose failure costs the
+    # keyspace, and the save closes its temporary file before returning so the slot is free again
+    # here. a sweep that released it a second time would be closing a descriptor the kernel has
+    # since handed to something else
     server = Server(0)
     try:
         scripted_listener.join(_PING * 20)
         server._hold_spare_descriptor()
         spare = server._spare_fd
         assert spare is not None
-        os.fstat(spare)                             # the control: it is an open descriptor until the sweep gives it back
+        os.fstat(spare)                             # the control: it is an open descriptor
         real_accept = scripted_listener.accept
         held_at_accept = []
 
@@ -1233,7 +1238,10 @@ def test_the_sweep_gives_back_its_spare_descriptor_before_the_first_accept(scrip
 
         server._count_unaccepted_backlog(scripted_listener)
 
-        assert held_at_accept and held_at_accept[0] is None, held_at_accept
+        assert held_at_accept and held_at_accept[0] == spare, (
+            "the sweep released a reserve it is no longer responsible for", held_at_accept)
+        os.fstat(spare)                             # still open: the sweep closed nothing
+        server._release_spare_descriptor()
         with pytest.raises(OSError) as raised:
             os.fstat(spare)
         assert raised.value.errno == errno.EBADF, raised.value
@@ -1276,6 +1284,8 @@ listener = server._open_listener()
 if sys.argv[1] == "reserve":
     server._hold_spare_descriptor()
 print(listener.getsockname()[1], flush=True)
+# run() releases the reserve before the shutdown save and the save closes its temporary file,
+# so by the time the sweeps run the slot is free. driven directly here, this stands in for both
 sys.stdin.readline()
 soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
 resource.setrlimit(resource.RLIMIT_NOFILE, (64, hard))
@@ -1286,6 +1296,7 @@ while True:
     except OSError as exc:
         assert exc.errno == errno.EMFILE, exc
         break
+server._release_spare_descriptor()
 server._draining = True
 server._drain_for(0, listener)
 """

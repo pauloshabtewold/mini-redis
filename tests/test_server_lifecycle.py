@@ -570,6 +570,40 @@ def test_main_exits_one_with_a_single_line_and_no_traceback_on_a_failed_bind(tmp
         squatter.close()
 
 
+# a real descriptor table that is really full, because socket() itself fails with EMFILE and nothing scripted stands in for that faithfully. the limit is lowered in the child and not in the test, where it would take the rest of the suite's descriptors with it. exactly one descriptor is left free: Server's constructor takes it for the selector, which leaves none for the listener's socket() when run() reaches it, and nothing before that step needs one that stays open -- reading a snapshot that is not there and listing the directory beside it each take a descriptor and give it back
+_NO_DESCRIPTOR_FOR_THE_LISTENER = """
+import errno, os, resource, sys
+sys.path.insert(0, %r)
+import server
+
+soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
+resource.setrlimit(resource.RLIMIT_NOFILE, (64, hard))
+held = []
+while True:
+    try:
+        held.append(os.open(os.devnull, os.O_RDONLY))
+    except OSError as exc:
+        assert exc.errno == errno.EMFILE, exc
+        break
+os.close(held.pop())
+server.main(sys.argv[1:])
+"""
+
+
+def test_main_exits_one_with_a_single_line_when_the_listener_cannot_be_constructed(tmp_path):
+    # the bind was the one step of startup answered with a line rather than a traceback, and the socket's construction, which fails with EMFILE on a table with no room, sat ahead of the try that answers it and left main() as a raw traceback -- the outcome ListenFailed exists to prevent, reached through the one step it did not cover. exit status 1 is the same either way, which is why it is the line and the absence of a traceback that are asserted. a subprocess with a deadline, as the test of the stop signal above uses, because the descriptor limit can only be lowered in a process of its own, and the snapshot is kept under tmp_path with saving off for the reason the bind test above gives
+    probe = subprocess.run(
+        [sys.executable, "-c", _NO_DESCRIPTOR_FOR_THE_LISTENER % str(REPO_ROOT),
+         "--port", "0", "--snapshot-interval", "0", "--snapshot-path", str(tmp_path / "dump.mrdb")],
+        stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=30, cwd=tmp_path)
+    assert probe.returncode == 1, ("a refused start is exit 1", probe.returncode, probe.stderr)
+    refusals = [line for line in probe.stderr.splitlines() if line.startswith("error:")]
+    assert len(refusals) == 1, ("exactly one error line was expected", probe.stderr)
+    assert refusals[0].startswith("error: cannot listen on 127.0.0.1:0"), refusals[0]
+    assert "Too many open files" in refusals[0], refusals[0]
+    assert "Traceback" not in probe.stderr, probe.stderr
+
+
 def test_open_listener_raises_listen_failed_and_closes_the_socket_it_opened():
     # the socket _open_listener() creates is closed on its own failure path rather than
     # left for the caller: nothing else ever gets a reference to it, since the raise
