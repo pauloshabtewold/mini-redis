@@ -61,7 +61,20 @@ VOLUME /data
 USER mini-redis
 EXPOSE 6379
 
-# Exec form: the server is PID 1 and receives the SIGTERM `docker stop` sends. Under a
-# shell form PID 1 is /bin/sh, which does not forward it, and the server is killed after
-# the stop timeout without its shutdown save having run.
+# Exec form: the server is PID 1, so the SIGTERM `docker stop` sends reaches a handler
+# rather than being discarded -- but only once main() has installed it, and the
+# interpreter's own startup and this module's imports run before that. A stop inside that
+# window is still discarded: the container serves on to the end of the stop timeout and
+# dies on SIGKILL with no save, and a write it answers `OK` before then is gone after a
+# restart. Measured on a 400k-key volume, a `SET` acked and then lost, with `docker stop`
+# taking 10.28 s and exit 137. The window ends when main()'s one handler is armed, which
+# is interpreter startup plus imports and does not grow with the keyspace: from the
+# daemon's StartedAt to that handler it was 209.0 to 607.4 ms over 14 fresh starts on an
+# empty volume, median 237.2, at load average 6.1 to 7.4, and the median on a 400k-key
+# volume was 262.2 ms. The largest of 14 is not a ceiling. run()'s two handlers are armed
+# later, after the snapshot load, and that point does grow: median 242.7 ms on the empty
+# volume, 1,257.8 ms on the 400k-key one. A stop between the two is recorded and honoured.
+# Waiting for `listening on` before the first command avoids it. Under a shell form PID 1
+# is /bin/sh, which does not forward the signal, and the server is killed after the stop
+# timeout without its shutdown save having run.
 CMD ["python", "server.py", "--host", "0.0.0.0", "--snapshot-path", "/data/dump.mrdb"]

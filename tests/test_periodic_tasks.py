@@ -405,7 +405,7 @@ def test_the_interval_and_ignore_defaults_are_the_documented_values_at_both_door
 # error
 
 
-def test_an_arm_that_raises_is_logged_with_its_traceback_and_keeps_its_schedule():
+def test_an_arm_that_raises_is_reported_in_full_without_a_traceback_and_keeps_its_schedule():
     records = []
     handler = logging.Handler()
     handler.emit = records.append
@@ -452,15 +452,22 @@ def test_an_arm_that_raises_is_logged_with_its_traceback_and_keeps_its_schedule(
                 server._loop.close()
     finally:
         logging.getLogger("server").removeHandler(handler)
-    logged = [r for r in records if r.levelno >= logging.ERROR and r.exc_info]
+    assert not [r for r in records if r.exc_info], (
+        "no arm may ask for a traceback: rendering one opens source files, and a full "
+        "descriptor table is one of the ways every task guarded here fails",
+        [r.getMessage() for r in records if r.exc_info])
+    logged = [r for r in records if r.levelno >= logging.ERROR and " failed: " in r.getMessage()]
     assert len(logged) == 1, (
-        "the first failure must be logged with its traceback, and only the first: what "
-        "fails here fails once an interval for as long as the server runs, and four "
-        "copies of one traceback is the start of a stream that can fill a log sink and "
-        "park this thread inside the write", [r.getMessage() for r in logged])
+        "the first failure must be reported in full, and only the first: what fails here "
+        "fails once an interval for as long as the server runs, and four copies of one "
+        "report is the start of a stream that can fill a log sink and park this thread "
+        "inside the write", [r.getMessage() for r in logged])
     assert "expiry sweep" in logged[0].getMessage(), (
         "the log line must name which arm failed", logged[0].getMessage())
-    assert not [r for r in records if r.levelno >= logging.ERROR and not r.exc_info], (
+    assert "No space left on device" in logged[0].getMessage(), (
+        "and what it failed with, since the line carries no traceback",
+        logged[0].getMessage())
+    assert not [r for r in records if "times in a row" in r.getMessage()], (
         "four failures is under the repeat threshold, so nothing should have summarised "
         "them yet")
 
@@ -495,11 +502,12 @@ def test_a_task_failing_on_every_tick_reports_a_bounded_number_of_lines(tmp_path
         records = _guard_records(server, "snapshot save", [True] * 250)
     finally:
         server._loop.close()
-    tracebacks = [r for r in records if r.exc_info]
-    assert len(tracebacks) == 1, (
-        "250 identical failures printed more than one traceback",
-        [r.getMessage() for r in tracebacks])
-    summaries = [r for r in records if not r.exc_info]
+    assert not [r for r in records if r.exc_info], "no record may carry a traceback"
+    reports = [r for r in records if " failed: " in r.getMessage()]
+    assert len(reports) == 1, (
+        "250 identical failures printed more than one full report",
+        [r.getMessage() for r in reports])
+    summaries = [r for r in records if "times in a row" in r.getMessage()]
     assert len(summaries) == 250 // server_mod.FAILURE_REPEATS_PER_LINE, (
         "one line per FAILURE_REPEATS_PER_LINE suppressed failures, and no more",
         [r.getMessage() for r in summaries])
@@ -525,8 +533,8 @@ def test_the_first_failure_after_a_recovery_is_reported_in_full_again(tmp_path):
             server, "snapshot save", [True, True, True, False, True])
     finally:
         server._loop.close()
-    tracebacks = [r for r in records if r.exc_info]
-    assert len(tracebacks) == 2, (
+    reports = [r for r in records if " failed: " in r.getMessage()]
+    assert len(reports) == 2, (
         "the failure after the recovery was suppressed as though it were a repeat",
         [r.getMessage() for r in records])
 
@@ -540,8 +548,8 @@ def test_two_tasks_failing_at_once_are_counted_apart(tmp_path):
         sweeps = _guard_records(server, "expiry sweep", [True, True])
     finally:
         server._loop.close()
-    assert len([r for r in saves if r.exc_info]) == 1
-    assert len([r for r in sweeps if r.exc_info]) == 1, (
+    assert len([r for r in saves if " failed: " in r.getMessage()]) == 1
+    assert len([r for r in sweeps if " failed: " in r.getMessage()]) == 1, (
         "the sweep's first failure was suppressed by the save's count",
         [r.getMessage() for r in sweeps])
 

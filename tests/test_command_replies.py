@@ -71,7 +71,7 @@ def test_hello_answers_the_fourteen_element_array(store, conn, argv):
 def test_hello_reports_the_replication_role_not_the_connection_role():
     # the two vocabularies are disjoint: a follower link still answers master here
     store = Store()
-    a, _b = socket.socketpair()
+    a, b = socket.socketpair()
     follower = Connection(a, ("127.0.0.1", 0), role=Role.FOLLOWER)
     try:
         response, effects = commands.dispatch(store, follower, [b"HELLO"])
@@ -80,6 +80,7 @@ def test_hello_reports_the_replication_role_not_the_connection_role():
         assert follower.role is Role.FOLLOWER
     finally:
         a.close()
+        b.close()
 
 
 def test_hello_answers_with_no_connection_at_all():
@@ -95,8 +96,8 @@ def test_hello_answers_with_no_connection_at_all():
 
 def test_hello_reports_this_connection_s_own_id():
     store = Store()
-    a, _b = socket.socketpair()
-    c, _d = socket.socketpair()
+    a, b = socket.socketpair()
+    c, d = socket.socketpair()
     first, second = Connection(a, ("h", 0)), Connection(c, ("h", 0))
     try:
         first_reply, first_effects = commands.dispatch(store, first, [b"HELLO"])
@@ -108,8 +109,8 @@ def test_hello_reports_this_connection_s_own_id():
         assert b"$2\r\nid\r\n:%d\r\n" % first.id in third_reply
         assert third_effects == []
     finally:
-        a.close()
-        c.close()
+        for sock in (a, b, c, d):
+            sock.close()
 
 
 @pytest.mark.parametrize(
