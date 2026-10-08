@@ -205,6 +205,21 @@ _WINDOW_TAKES_NO_ZERO = "%d is not a window, and --rate-limit 0 is what disables
 _RATE_LIMITED = b"ERR rate limit exceeded"
 
 
+# every numeric setting is a whole number of bytes, seconds, milliseconds or things, and the
+# comparisons that enforce them are all orderings -- which is why a value that is not an int gets
+# past them rather than failing loudly. `nan < 0` is False, so nan reached every one of these
+# checks and was accepted; so were inf and, because bool subclasses int, True. A limiter at
+# rate_limit=nan never refuses, a window of 1e-9 never fires, and a shutdown_drain_timeout of True
+# is a one-second drain nobody asked for. The sixth review found this through the rate limiter and
+# it was never the rate limiter's: it is one line missing from the rule every flag shares
+def _check_whole_number(value, label: str) -> None:
+    # bool before int, because isinstance(True, int) is True and the message has to name what was
+    # actually passed rather than call it an integer
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise ValueError(
+            "%s must be a whole number, not %s" % (label, type(value).__name__))
+
+
 def _check_not_negative(value: int, label: str, ending: str = _ZERO_DISABLES) -> None:
     # the "0 disables, a negative number is refused" rule, stated once and used by every
     # CLI validator below and by Server.__init__. `limit and len(buf) >
@@ -214,6 +229,7 @@ def _check_not_negative(value: int, label: str, ending: str = _ZERO_DISABLES) ->
     # logs a healthy startup line. -1 is a conventional spelling of "unlimited"
     # elsewhere, which makes it the likeliest value to be typed here by someone
     # reaching for the opposite of what it does
+    _check_whole_number(value, label)
     if value < 0:
         raise ValueError(("%s cannot be negative; " + ending) % (label, value))
 
@@ -221,6 +237,7 @@ def _check_not_negative(value: int, label: str, ending: str = _ZERO_DISABLES) ->
 def _check_rate_limit_window(value: int, label: str) -> None:
     # not _check_not_negative with a different ending, because the rule itself differs:
     # every other numeric setting here admits 0 as "off", and this one admits no 0 at all
+    _check_whole_number(value, label)
     if value <= 0:
         raise ValueError(("%s must be positive; " + _WINDOW_TAKES_NO_ZERO) % (label, value))
 

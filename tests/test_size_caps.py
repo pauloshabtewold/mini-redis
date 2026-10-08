@@ -184,6 +184,48 @@ def test_every_flag_the_parser_defines_has_a_case_that_follows_it_to_the_server(
     assert "log_level" not in inspect.signature(Server.__init__).parameters
 
 
+# every numeric setting, named here rather than derived, so a flag added without a case shows up
+# in the coverage test below and not as a silent gap in this one
+_EVERY_NUMERIC_SETTING = [
+    "write_buffer_limit", "max_value_size", "max_multibulk", "snapshot_interval",
+    "expiry_sweep_interval", "shutdown_drain_timeout", "max_connections",
+    "write_buffer_high_water", "write_buffer_low_water", "incomplete_command_timeout",
+    "rate_limit", "rate_limit_window",
+]
+
+
+@pytest.mark.parametrize("setting", _EVERY_NUMERIC_SETTING)
+@pytest.mark.parametrize("value", [float("nan"), float("inf"), True, 2.5],
+                         ids=["nan", "inf", "bool", "float"])
+def test_a_value_that_is_not_a_whole_number_is_refused_at_the_constructor(setting, value):
+    # the sixth review's finding 39, found through the rate limiter and never the rate limiter's.
+    # every check these settings pass through is an ordering, and `nan < 0` is False, so nan got
+    # past all of them -- as did inf, and True, because bool subclasses int. the costs are silent
+    # and specific: rate_limit=nan never refuses a command, rate_limit_window=1e-9 never fires,
+    # shutdown_drain_timeout=True is a one-second drain nobody asked for, and max_connections=nan
+    # admits everyone. one line in the rule every flag shares, and twelve flags' worth of hole
+    with pytest.raises(ValueError) as refusal:
+        Server(0, **{setting: value})
+    assert "must be a whole number" in str(refusal.value), str(refusal.value)
+    assert setting in str(refusal.value), (
+        "the refusal does not name the setting that was wrong", str(refusal.value))
+
+
+def test_every_numeric_setting_is_covered_by_the_whole_number_case():
+    # the list above is written out, so this is what keeps it honest: a numeric parameter added to
+    # Server.__init__ and not to the list would otherwise never be tested for the hole above
+    import inspect
+    numeric = {
+        name for name, p in inspect.signature(Server.__init__).parameters.items()
+        if p.default is not inspect.Parameter.empty and isinstance(p.default, int)
+        and not isinstance(p.default, bool) and name != "port"
+    }
+    assert numeric == set(_EVERY_NUMERIC_SETTING), (
+        "numeric settings with no whole-number case: %s; cases for no setting: %s"
+        % (sorted(numeric - set(_EVERY_NUMERIC_SETTING)),
+           sorted(set(_EVERY_NUMERIC_SETTING) - numeric)))
+
+
 def test_an_empty_host_is_refused_at_both_doors(monkeypatch, tmp_path, capsys):
     # an empty host is what bind() reads as every interface, on a server with no authentication
     # at all, which is the exposure the loopback default exists to prevent, and it is what

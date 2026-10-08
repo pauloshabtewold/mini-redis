@@ -1062,6 +1062,13 @@ def test_the_survivor_walk_takes_the_bytes_it_counts_off_the_socket(make_connect
         conn.unread_in_kernel())
 
 
+# the one test here that fails as a HANG rather than an assertion when what it pins is removed:
+# its recv hook sends on every call, so a walk without a ceiling never finds an empty queue. the
+# suite's own timeout is 300 seconds, which is right for the parser off-by-one it was chosen for
+# and wrong for this -- a five-minute wait for a regression this test can detect in under one.
+# a marker rather than a lower global: the 300 is headroom over the slowest test in the suite and
+# narrowing it for one test's benefit would re-open what it was chosen to close
+@pytest.mark.timeout(20)
 def test_the_walk_reads_no_more_than_the_kernel_claimed_when_it_was_asked(make_connection):
     # the bound. Reading until the queue is empty would hand a peer that keeps sending a loop with no
     # end, at a point in the stop sequence that no deadline covers -- so the ioctl's answer is a
