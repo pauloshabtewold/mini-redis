@@ -53,9 +53,26 @@ and 76,161 against the 84,962 below, and the reference's `LRANGE_600` p99 at 4.2
 3.783 ms against 2.743 ms -- on a laptop carrying other work, which is what a laptop
 always is. What survived every repetition is the shape rather than the cell: the median
 share of native stayed within about a point of the figure quoted here, every test cleared
-the threshold with room to spare, and this server's p99 stayed two to three times the
+the threshold with room to spare, and this server's p99 stayed a low multiple of the
 reference's on the small commands. Read a row as the order of magnitude it establishes,
 not as a number to compare against your own hardware.
+
+The table is the measurement the shipped version was judged on, and the tree has moved
+twenty commits past the tag it was taken at -- one of them changed `take_commands()`,
+the read path all ten tests go through -- so it was taken again at the tip of this
+branch, against a private `redis-server 7.2.7` started for the run on a port of its own,
+at a load average of 4.2. What a re-measurement is for here is the figure this section
+says to read, the median share of native, and it held. At `-P 16` the eight small-reply
+commands ran at 19.6% to 27.2% of native, median 23.5%, against the 16.3% to 29.7% and
+22.1% below, and the two `LRANGE` tests at 49.9% and 60.9% against 46.9% and 59.7%; at
+`-P 1` the median share was 63.0% against 64.1%. No row's share moved by more than 6.4
+points, every test cleared the 8% threshold by the same wide margin, and the snapshot
+path was empty afterwards again. One sentence above did not hold: the reference's own
+p99 came back lower on the small commands than it had been, 0.375 to 0.951 ms against
+0.455 to 0.927, so the ratio this server stands at is 1.3 to 3.5 times rather than two
+to three. The rates in the table are left as they were taken, because each cell is one
+run and a newer run is no better evidence of a cell than an older one; what a
+re-measurement can settle is the share, and that is what is reported here.
 
 The list is pinned because the tool's default run stops at
 `SADD`, the first command in its sequence this server does not implement (see
