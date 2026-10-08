@@ -460,9 +460,14 @@ none executed, with the server exiting 0. How many are executed is not fixed: ea
 probes of the same shape executed up to about two thousand, so read the loss as the
 whole pipeline rather than as a figure near it. With `--write-buffer-high-water 0` and
 three seconds for the server to catch up, 50,000 of 50,000 executed in five runs. The
-client's end of input is clean when the drain managed to empty the receive queue and a
-reset when it did not, which depends on how long the drain lasted and not on what the
-client did wrong. The drain's own line counts the inbound bytes the stop threw away in
+client's end of input is clean, because the drain empties every receive queue it counts,
+including the ones no pass of it ever read. Measured at `--shutdown-drain-timeout 0`
+against a 700,000-byte pipeline the server never read, the client saw end of input in 10
+of 10 runs owing replies and 10 of 10 owing nothing, where before the queue was read
+rather than asked about it saw `ECONNRESET` in 10 of 10 of each, with the
+discarded-bytes figure unchanged in both arms. What is still a reset is a request that
+arrives after that last look, in the window between it and the close.
+The drain's own line counts the inbound bytes the stop threw away in
 all five shapes they come in, which for a client that never reads was exactly the bytes
 the kernels had accepted, in each of those twenty-three runs: the whole 1,588,890 bytes
 where the push had completed, which it had in 18 of the 23 at the 2 s the harness
