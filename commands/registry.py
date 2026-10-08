@@ -18,11 +18,15 @@ Handler = Callable[[Store, Any, list[bytes]], Reply]
 class Kind(enum.StrEnum):
     """What a command IS, not what it does to replication.
 
-    READ, WRITE and OTHER describe the command itself -- for the rate
-    limiter's exemption and for documentation. They never decide what
-    replicates: propagation is driven by the effect list, because a read
-    that finds an expired key must emit a DEL and the sweep emits DELs
-    with no command in sight.
+    READ, WRITE and OTHER describe the command itself, for documentation
+    and for whatever reads the tag -- which today is the test suite and
+    nothing else. The rate limiter was the reason this sentence once said
+    "for the rate limiter's exemption", and it is not: the limiter counts
+    every command and exempts by Connection.role, because what earns an
+    exemption is being this process's own replication link rather than
+    being a read. They never decide what replicates either: propagation is
+    driven by the effect list, because a read that finds an expired key
+    must emit a DEL and the sweep emits DELs with no command in sight.
 
     StrEnum so the value renders into introspection output and log lines
     with no conversion. An enum rather than a plain string so a typo is

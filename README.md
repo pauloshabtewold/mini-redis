@@ -17,11 +17,13 @@ expired ones, so nothing bounds when a particular key is reclaimed — which is 
 on lookup is still the load-bearing half: a key you ask for is never served stale,
 whatever the sweep has reached.
 
-Two parts of the design are not in it. Rate limiting and replication are specified in
-full and deliberately unbuilt, and [Designed and not built](#designed-and-not-built)
-says what that leaves behind in the code. [Benchmark](#benchmark) has what the server
-costs against real Redis, and [Limits](#limits) is the long list of what it does and
-does not do under pressure.
+One part of the design is not in it. Replication is specified in full and deliberately
+unbuilt, and [Designed and not built](#designed-and-not-built) says what that leaves
+behind in the code. Rate limiting was cut the same way and built afterwards: the `v1`
+tag does not contain it and the tree does, and it is off unless `--rate-limit` is given.
+[Benchmark](#benchmark) has what the server costs against real Redis, and
+[Limits](#limits) is the long list of what it does and does not do under pressure, the
+rate limiter included.
 
 ## Benchmark
 
@@ -58,7 +60,8 @@ reference's on the small commands. Read a row as the order of magnitude it estab
 not as a number to compare against your own hardware.
 
 The table is the measurement the shipped version was judged on, and the tree has moved
-twenty commits past the tag it was taken at -- one of them changed `take_commands()`,
+well past the tag it was taken at (`git rev-list v1..HEAD --count` says how far, and it
+keeps moving) -- one of those commits changed `take_commands()`,
 the read path all ten tests go through -- so it was taken again at the tip of this
 branch, against a private `redis-server 7.2.7` started for the run on a port of its own,
 at a load average of 4.2. What a re-measurement is for here is the figure this section
@@ -72,7 +75,10 @@ p99 came back lower on the small commands than it had been, 0.375 to 0.951 ms ag
 0.455 to 0.927, so the ratio this server stands at is 1.3 to 3.5 times rather than two
 to three. The rates in the table are left as they were taken, because each cell is one
 run and a newer run is no better evidence of a cell than an older one; what a
-re-measurement can settle is the share, and that is what is reported here.
+re-measurement can settle is the share, and that is what is reported here. The rate
+limiter was built after that re-measurement, so neither table was taken with its check
+in the path. With the limit off, which is the default, the check is one call per command
+that tests one attribute and returns.
 
 The list is pinned because the tool's default run stops at
 `SADD`, the first command in its sequence this server does not implement (see
@@ -129,11 +135,12 @@ Three facts make these numbers reportable, and each is stated because its absenc
 change them. The snapshot interval was `0` for every run of this server, so no periodic
 save fell inside a measurement: a save blocks the one thread that answers clients, and a
 run that crossed one would carry an unattributed stall inside its p99. The snapshot path
-was still empty after the runs, which is how I know none fired. The rate limiter is not
-built, so it was off by construction and not by configuration; a limiter that was on
-would have tripped under `-c 50` at once and the benchmark would have measured its
-rejection path. And the log level was `WARNING`, which leaves out the line this server
-writes at `INFO` for each connection it opens and closes.
+was still empty after the runs, which is how I know none fired. The rate limiter was
+off, by construction and not by configuration, because it did not exist when either
+measurement was taken. It is off by default now, and the reason is this benchmark: a
+limit that was on would have tripped under `-c 50` at once, and the numbers would have
+measured its rejection path. And the log level was `WARNING`, which leaves out the line
+this server writes at `INFO` for each connection it opens and closes.
 
 ## Three findings
 
@@ -217,38 +224,39 @@ right on both.
 
 ## Designed and not built
 
-Two parts of the design are specified in full and deliberately unbuilt: a per-connection
-sliding-window rate limiter, and leader-follower replication. `ratelimit.py` and
-`replication.py` each hold a docstring and nothing else, and that is a decision and not
-an omission. I cut both on purpose, at the point where stopping left nothing half-built
-in the tree, and I do not intend to build them; this is `v1` and there is no later
-version in which they are finished.
+One part of the design is specified in full and deliberately unbuilt: leader-follower
+replication. `replication.py` holds a docstring and nothing else, and that is a decision
+and not an omission. I cut it on purpose, at the point where stopping left nothing
+half-built in the tree, and I do not intend to build it.
 
-The limiter was to count requests per connection over a window, with a deque of
-timestamps popped from the left so that a check costs the same however busy the
-connection is, and to answer an over-limit request with an error while leaving the
-connection open. It would have been off by default, because a limit switched on trips
-under `redis-benchmark -c 50` immediately and the benchmark would then measure the
-rejection path. It limits a connection and not an address, so a client could reset its
-budget by reconnecting; I would have documented that rather than engineered it away.
+The per-connection rate limiter was cut in the same decision and built afterwards. The
+`v1` tag does not contain it: at the tag, `ratelimit.py` held a docstring and nothing
+else. [Limits](#limits) says what it does and where it stops.
+
 Replication was to be asynchronous: a follower connects, is sent the leader's keyspace
 in the snapshot format as one bulk string, and then receives a live stream of what each
 handler reports as its effects, plus the `DEL`s that expiry produces, in execution
 order. A follower would have applied that stream through its own dispatcher, and the
 leader's link to its own leader would have been a third kind of connection, exempt from
-the limits a client is under.
+the rate limit a client is under.
 
 Because the design was written before it was cut, three things in the code are present
-and cannot be reached, and I would rather say so than leave them to be found.
+and cannot be reached, and I would rather say so than leave them to be found. The first
+changed when the rate limiter was built.
 
-`Connection` knows three roles, `client`, `follower` and `leader_link`, and the tests
-construct a connection with the second; nothing in the server does. Every accepted
-connection is a `client`, and no flag sets either of the other two: the flag that would
-have started a server as a follower was never written. The extra values are there
-because a check written against two roles misclassifies the link to a leader as an
-ordinary client, and with nothing to exempt they exempt nothing. The `rate_limit_state`
-and `replication_state` slots on `Connection` are the same kind of thing: they hold
-`None` and nothing reads them.
+`Connection` knows three roles, `client`, `follower` and `leader_link`, and the rate
+limiter reads them: a `client` is limited and the other two are let through. Nothing in
+the server sets either of the other two. Every accepted connection is built as a
+`client`, and the flag that would have started a server as a follower was never written,
+so with a limit set the exemption runs on every command and has no connection it can
+apply to. Only the tests reach it, by constructing a connection with each of the two
+roles by hand. The test is for `client` and not against `follower` alone because the
+roles point opposite ways: a follower is a peer syncing off this process, and
+`leader_link` is this process's own outbound connection to its leader, which a check
+written against `follower` alone would take for an ordinary client and limit, with no
+error anywhere saying so. The `replication_state` slot on `Connection` is the same kind
+of thing: it holds `None` and nothing reads or sets it. `rate_limit_state` was in this
+group and is not any longer, since the limiter builds its window there.
 
 Every command handler returns its reply together with an effects list, the commands a
 follower would need replayed. A write that takes effect fills it in and everything else
@@ -295,8 +303,8 @@ and the persistence paragraphs under [Limits](#limits) give what a save costs on
 stated fixture. `docs/DESIGN.md` has the argument for why even a cheap in-process copy
 does not remove the pause.
 
-**Why would every reconnect cost a full sync, and why not `PSYNC`?** Replication is the
-unbuilt half, so this is a decision about a design that never ran. A follower that lost
+**Why would every reconnect cost a full sync, and why not `PSYNC`?** Replication is not
+built, so this is a decision about a design that never ran. A follower that lost
 its connection to the leader would have asked for the whole keyspace again.
 `PSYNC`-style partial resync lets it say where it stopped instead, and it needs the
 leader to keep a backlog of the stream and to do offset bookkeeping so that it can
@@ -715,20 +723,20 @@ pipeline and a threshold below it warns on an ordinary upload, so the level says
 can say exactly -- whether a reply was lost -- and the figure is read for the rest.
 
 `--shutdown-drain-timeout 0` reads the opposite way from the limits it sits beside. For
-`--write-buffer-limit`, `--max-value-size`, `--max-multibulk`, `--max-connections` and
-`--incomplete-command-timeout`, `0` removes the limit, so a check that closes or refuses
-something stops doing it and turning it off is permissive. This value is a time
-allowance and what it allows is the wait for clients, so `0` is no time at all, and
-means no drain pass — the setup pass and the two backlog sweeps still run, but nothing
-is read: turning it off is restrictive. (`--port 0` and the two intervals read in
-neither way: the kernel chooses a port, or a periodic task is switched off, and none of
-the three is a limit.) The two water marks read in neither way either, and each has a
-reading of its own: `--write-buffer-high-water 0` disables the pause, so reading goes on
-however much is queued, and `--write-buffer-low-water` is then unreachable, which is
-accepted and not refused; with the pause on, `--write-buffer-low-water 0` means resume
-only when the queue is empty, the most conservative resume and not a way of switching
-anything off. What is lost is the part of the replies the kernel will not take in the
-one best-effort flush each connection gets as it is closed, which still runs, and
+`--write-buffer-limit`, `--max-value-size`, `--max-multibulk`, `--max-connections`,
+`--rate-limit` and `--incomplete-command-timeout`, `0` removes the limit, so a check
+that closes or refuses something stops doing it and turning it off is permissive. This
+value is a time allowance and what it allows is the wait for clients, so `0` is no time
+at all, and means no drain pass — the setup pass and the two backlog sweeps still run,
+but nothing is read: turning it off is restrictive. (`--port 0` and the two intervals
+read in neither way: the kernel chooses a port, or a periodic task is switched off, and
+none of the three is a limit.) The two water marks read in neither way either, and each
+has a reading of its own: `--write-buffer-high-water 0` disables the pause, so reading
+goes on however much is queued, and `--write-buffer-low-water` is then unreachable,
+which is accepted and not refused; with the pause on, `--write-buffer-low-water 0` means
+resume only when the queue is empty, the most conservative resume and not a way of
+switching anything off. What is lost is the part of the replies the kernel will not take
+in the one best-effort flush each connection gets as it is closed, which still runs, and
 nothing after it does. No read pass runs either, so a request that arrives at any time
 after the loop's last pass, the whole of the snapshot save included, is still unread
 when its connection closes, and the close then resets it and discards what the kernel
@@ -798,6 +806,46 @@ reach exactly, and why this looks like an off-by-one until that is said. The cap
 how many clients there are, not what any one of them can hold: every limit above is
 still per element, per command or per connection, and the cap does not turn any of them
 into a bound on memory.
+
+**Two more flags cover how fast one connection may ask.** `--rate-limit REQUESTS`
+(default `0`) answers `-ERR rate limit exceeded` to a command, and does not run it, once
+its connection has sent REQUESTS commands inside the last `--rate-limit-window SECONDS`
+(default `1`, whole seconds). `0` turns the limiter off, and it is off unless asked for:
+the benchmark above uses `-c 50`, and a limiter that was on would have measured its own
+rejection path. The window slides rather than resetting on a fixed boundary, so no burst
+straddles one, and it is counted on the monotonic clock. The count is of commands and
+not of reads. A client that pipelines writes many commands in one `send()` and the
+server can read them in one `recv()`, so a check made once per readable event would
+charge the whole batch one unit and bound how often the socket was read, not how many
+requests were made; this one sits inside the loop that dispatches the batch, where
+`--write-buffer-limit` is also consulted, for the same reason. Against a real
+`server.py` process on a port the kernel chose, 500 `PING`s written in one `sendall`
+were answered with 500 `PONG` and none refused when no flag was given, and with 100
+`PONG` and 400 refused under `--rate-limit 100 --rate-limit-window 1`.
+
+A refused command gets that error and nothing else. It is not dispatched, the connection
+stays open and is still read, and its next command is judged on its own, because a close
+would look to the client like a protocol error and the reconnect that followed would
+arrive with a full budget. The budget is per connection and not per address, and that is
+the cost: a client that closes and reconnects starts again with a full one. I documented
+that rather than engineering it away, since counting per address needs a table shared
+between connections and this loop has none, and `--max-connections` bounds how many
+connections, and so how many budgets, exist at once. A connection whose role is not
+`client` is never limited, which changes nothing in a running server today because
+nothing sets any other role; [Designed and not built](#designed-and-not-built) says why
+the exemption is there.
+
+`--rate-limit-window` takes no `0`. It is the one numeric flag here with no reading of
+`0`: every other has one -- off, no drain, resume only when the queue is empty, a port
+the kernel chooses -- and on a window `0` could only mean a limiter that permits
+everything, since 100 requests per 0 seconds puts every reading outside the window the
+moment it is taken, so an operator who typed `0` meaning off would have a limiter
+configured that never fires and says nothing. The window refuses `0`, and a negative
+value, with a message that names `--rate-limit 0` as what turns the limiter off. A
+negative `--rate-limit` is refused as well, both flags at the CLI and again in
+`Server.__init__`, and the window takes the same `2**63 - 1` ceiling as the other
+durations. `docs/DESIGN.md` has why the clock is monotonic and why a refusal is not a
+close.
 
 **Two more flags cover where the server listens and what it says.** `--host HOST`
 (default `127.0.0.1`) is the IPv4 address to listen on, or a name that resolves to one.
@@ -956,14 +1004,14 @@ filter what they report.
 ## Layout
 
 ```
-server.py       entry point, listener, signals, shutdown drain, connection cap, water marks, dispatch
+server.py       entry point, listener, signals, shutdown drain, connection cap, rate limit, water marks, dispatch
 event_loop.py   selectors readiness dispatch (on_readable / on_writable / on_accept)
 connection.py   per-connection socket, read/write buffers, lifecycle
 resp.py         RESP2 parser and serializer
 store.py        keyspace, expiry index, pending-effects queue
 persistence.py  versioned snapshot format, atomic save/load
-ratelimit.py    docstring only; designed in full and deliberately unbuilt
-replication.py  docstring only; designed in full and deliberately unbuilt
+ratelimit.py    per-connection sliding-window rate limiter, off by default
+replication.py  a docstring and nothing else; specified in full, deliberately unbuilt
 commands/       __init__.py, registry.py, server.py, string.py and list.py; twenty-six commands total
 Dockerfile      single-service image: non-root user, snapshot in a volume at /data
 .dockerignore   the build context is an allowlist of the files the image runs from
