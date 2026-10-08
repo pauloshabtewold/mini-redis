@@ -73,13 +73,6 @@ LISTEN_HOST = "127.0.0.1"
 SELECT_TIMEOUT_SECONDS = 0.1
 # the most one connection may have queued once the kernel has taken what it will, past which it is closed. with the water marks below in force this is not what slows a client down: one that stops reading is paused rather than throttled here, so what this bounds is a reply larger than it, or the replies to one read's batch of pipelined requests, which the pause cannot unqueue once they are parsed. what the pause does not do is hold such a client near the mark -- the batch that crossed the mark is still dispatched whole, and measured a paused connection holds almost the whole of this default, so the pause keeps it from being closed here rather than keeping it far away; README.md carries the figure. 0 turns the check off. see Server._flush for why exceeding it closes the connection instead of slowing it down
 # a local choice and not the reference's, which leaves an ordinary client unlimited. it is below DEFAULT_MAX_VALUE_SIZE, so a value that was stored can be too large to read back: the reply to a GET of it exceeds this and the connection is closed. that is what a hard limit does, and neither default is moved to hide it
-# off, and this is the one default that is off rather than a value: with a limit on,
-# redis-benchmark at -c 50 -n 100000 trips it on the first batch and the published
-# benchmark would measure the rejection path instead of the server
-DEFAULT_RATE_LIMIT = 0
-# the window the limit is counted over. a duration, so time.monotonic() deals in it and
-# not the wall clock the expiry deadlines use
-DEFAULT_RATE_LIMIT_WINDOW_SECONDS = 1
 DEFAULT_WRITE_BUFFER_LIMIT = 32 * 1024 * 1024
 # a connection with more than this queued for it stops being read, and is read again once the queue falls to the low-water mark below. the gap between the two is the reason there are two: equal marks would pause and resume the connection on every event. 0 disables the pause. the pause is what keeps a client that pipelines faster than it reads from being closed by the limit above, and not what keeps it away from it: a paused connection holds this mark plus the one batch that crossed it, which the limit in turn caps at the limit plus one reply, so at the two shipped defaults it holds almost the whole of that ceiling rather than anything near this mark -- README.md carries the measured figure and the aggregate it implies
 DEFAULT_WRITE_BUFFER_HIGH_WATER = 1024 * 1024
@@ -116,6 +109,16 @@ DEFAULT_EXPIRY_SWEEP_INTERVAL_MS = 100
 DEFAULT_SHUTDOWN_DRAIN_TIMEOUT_SECONDS = 5
 # a local choice, and it must not fall under 50: redis-benchmark -c 50 is the standard invocation, and a cap under it refuses some of the benchmark's own clients and turns it into a test of the cap. a cap of exactly 50 admits exactly 50, since a count equal to the cap is full
 DEFAULT_MAX_CONNECTIONS = 1024
+# off, and this is the one default here that is off rather than a value: with a limit on,
+# redis-benchmark at -c 50 -n 100000 trips it on the first batch and the published benchmark
+# would measure the rejection path instead of the server. placed here and not beside
+# DEFAULT_WRITE_BUFFER_LIMIT, where these two were first put: they went in between that
+# constant's comment and the constant, so the comment described this line instead and the write
+# buffer limit was left with none
+DEFAULT_RATE_LIMIT = 0
+# the window the limit is counted over. a duration, so time.monotonic() deals in it and not the
+# wall clock the expiry deadlines use
+DEFAULT_RATE_LIMIT_WINDOW_SECONDS = 1
 # the sweep's own three constants, read off the tagged sources rather than assumed:
 # 7.2.7's expire.c:109-111 and 5.0.14's server.h:172-174 compile in 20 keys a pass, a
 # 1000-microsecond budget and 25 per cent, and the 20 and the 1 ms here are those. the
@@ -540,10 +543,13 @@ def build_arg_parser() -> argparse.ArgumentParser:
         type=_rate_limit,
         default=DEFAULT_RATE_LIMIT,
         metavar="REQUESTS",
-        help="answer an error, without dispatching, once a connection has sent REQUESTS "
-             "commands inside --rate-limit-window; 0 disables the limiter, which is the "
-             "default, and the budget is per connection, so a client gets a fresh one by "
-             "reconnecting -- --max-connections is what bounds that",
+        help="answer an error, without dispatching, once a connection has been PERMITTED "
+             "REQUESTS commands inside --rate-limit-window; 0 disables the limiter, which "
+             "is the default. permitted and not sent: a refusal records nothing, so the "
+             "budget returns one window after the permits and a refused command never "
+             "delays it. the budget is per connection, so a client gets a fresh one by "
+             "reconnecting and nothing here bounds how often it may -- --max-connections "
+             "bounds how many budgets exist at once, which is not the same thing",
     )
     parser.add_argument(
         "--rate-limit-window",
@@ -636,9 +642,13 @@ class Server:
         write_buffer_high_water: int = DEFAULT_WRITE_BUFFER_HIGH_WATER,
         write_buffer_low_water: int = DEFAULT_WRITE_BUFFER_LOW_WATER,
         incomplete_command_timeout: int = DEFAULT_INCOMPLETE_COMMAND_TIMEOUT_SECONDS,
+        host: str = LISTEN_HOST,
+        # after host and not before it, which is what the comment above means by appended: these
+        # two were inserted ahead of host, moving it from positional 14 to 16, and a fourteen
+        # positional call that worked before raised a TypeError afterwards. no caller in this
+        # repository passes that many positionally, which is exactly why nothing caught it
         rate_limit: int = DEFAULT_RATE_LIMIT,
         rate_limit_window: int = DEFAULT_RATE_LIMIT_WINDOW_SECONDS,
-        host: str = LISTEN_HOST,
     ) -> None:
         # both checked here as well as in the parser, for the same reason: Server is
         # constructed directly by tests and will be by anything embedding this, so a
@@ -1050,19 +1060,27 @@ class Server:
             # command alone, and the connection left open to send its next one -- a close
             # would make a limiter indistinguishable from a protocol error to the client
             if not self._rate_limit_permits(conn):
+                # queued and then fallen THROUGH to the size check below, never `continue`d
+                # past it. a refusal is a reply like any other and a batch of them is a batch
+                # of bytes: with a `continue` here, a refused flood skipped the one check that
+                # bounds what a single recv can queue, and the peak published as "the limit
+                # plus one reply" became 283,953 bytes past a 100-byte limit where the
+                # permitted path held to 105. measured, the in-loop check fired 9,855 times
+                # with the limiter off and once with it on, which is the per-batch throttling
+                # this placement exists to prevent -- the sixth review's finding 35
                 conn.queue(resp.encode_error(_RATE_LIMITED))
-                continue
-            response, effects = commands.dispatch(self._store, conn, argv)
-            # drained once per command and before the reply is queued: the queue holds
-            # effects the lookups inside THIS command produced, so they precede the
-            # command's own -- an INCR that lazily expired its key must be preceded by the
-            # DEL, or a follower ends with the key absent while this server holds the new
-            # value. both lists are discarded because nothing consumes them: the only
-            # reader an effect was ever for is replication, which is specified in full and
-            # deliberately unbuilt, and the drain still runs because lazy expiry fills the
-            # queue from here on and nothing else would ever empty it
-            self._store.take_effects()
-            conn.queue(response)
+            else:
+                response, effects = commands.dispatch(self._store, conn, argv)
+                # drained once per command and before the reply is queued: the queue holds
+                # effects the lookups inside THIS command produced, so they precede the
+                # command's own -- an INCR that lazily expired its key must be preceded by the
+                # DEL, or a follower ends with the key absent while this server holds the new
+                # value. both lists are discarded because nothing consumes them: the only
+                # reader an effect was ever for is replication, which is specified in full and
+                # deliberately unbuilt, and the drain still runs because lazy expiry fills the
+                # queue from here on and nothing else would ever empty it
+                self._store.take_effects()
+                conn.queue(response)
             # one recv can carry thousands of commands, and queueing every reply before
             # the first send is what lets a few kilobytes of request commit gigabytes.
             # the limit has to be consulted here as well as after the batch, or it bounds
@@ -1371,7 +1389,7 @@ class Server:
                 # reading is switched back on for every connection that owes bytes, because one whose reading is off here was switched off by the high-water mark and by nothing else: outside the drain _flush is the only thing that clears it, and end of input outside the drain closes the connection instead of holding it. left off, the requests it had not read would stay in its receive queue for the whole drain, and the close at the end would be a reset, which discards what the kernel had not yet sent. switched on, _read_and_dispatch reads and discards them as it does for any other connection. the mask cannot reach 0 by this: the buffer is non-empty and _flush keeps write interest equal to that, so write interest is registered, and for a connection already being read nothing changes. unlike _flush's resume, this does NOT re-arm conn.incomplete_since, and the asymmetry is the point: _flush resumes a connection this server intends to keep serving, where a half-sent command still has to be finished or timed out, while the drain resumes one only to empty its receive queue before closing it. nothing reads the deadline here -- the drain drives run_once() and never _tick(), so the sweep cannot run -- and arming it would mean a sweep that ever did run during a drain could close a connection the drain is still trying to deliver bytes to, which is the loss the drain exists to prevent
                 self._loop.set_read_interest(conn, True)
             # write interest is not set for these: _flush leaves it equal to whether the buffer is non-empty after every send, and the only two places a reply is queued -- _dispatch_batch, and the protocol error in _read_and_dispatch -- each end in a _flush, so a connection that owes bytes is already registered for EVENT_WRITE. read interest does not last the drain: end of input on a connection that owes bytes clears it, leaving that connection registered for writing only, and the _draining guard in _flush keeps the resume there from undoing that. when its buffer empties _flush clears the write bit too, which leaves mask 0 and the applier spells that unregistered. the connection is still open and still in the set, and a connection that owes nothing has nothing left to wake the loop for, so that is the intended end of its part in the drain and not a lost registration
-            # run_once() alone, not the main loop's pairing with _tick(): a tick here would run the expiry sweep, whose DELs after the snapshot are writes no snapshot holds, and a periodic save inside a shutdown that has already saved. the deadline is read between passes, so the timeout plus one select timeout bounds the part of the drain that waits on connections. three steps between the loop stopping and exit sit outside that bound and have no deadline of their own: the snapshot save, which this flag does not limit either; the two accept-backlog sweeps, which run at this drain's entry and in its finally; and _shutdown's teardown pass, whose per-connection _close() calls Connection.flush(), a loop that sends until the buffer empties, once per surviving connection and so bounded only by --max-connections. the count was published as two until the third was measured, and as one until the save was. what bounds a sweep is arrivals and not the backlog's size: its loop ends the first time accept() finds the backlog empty, so a client connecting during it extends it, and one sweep accepted more connections than SOMAXCONN. docs/DESIGN.md carries the measured costs
+            # run_once() alone, not the main loop's pairing with _tick(): a tick here would run the expiry sweep, whose DELs after the snapshot are writes no snapshot holds, and a periodic save inside a shutdown that has already saved. the deadline is read between passes, so the timeout plus one select timeout bounds the part of the drain that waits on connections. four steps between the loop stopping and exit sit outside that bound and have no deadline of their own: the snapshot save, which this flag does not limit either; the two accept-backlog sweeps, which run at this drain's entry and in its finally; the survivor walk below, which became one when its ask became a read -- O(queued bytes) where the ioctl was O(connections), measured at 1.84 GB/s and inside the noise at 400 connections, with no worst case taken; and _shutdown's teardown pass, whose per-connection _close() calls Connection.flush(), a loop that sends until the buffer empties, once per surviving connection and so bounded only by --max-connections. the count was published as two until the third was measured, and as one until the save was. what bounds a sweep is arrivals and not the backlog's size: its loop ends the first time accept() finds the backlog empty, so a client connecting during it extends it, and one sweep accepted more connections than SOMAXCONN. docs/DESIGN.md carries the measured costs
             while any(conn.write_buffer for conn in self._connections) and time.monotonic() < deadline:
                 self._loop.run_once()
         finally:
@@ -1384,7 +1402,7 @@ class Server:
             # listener's own close in _shutdown -- the same irreducible window the survivors have
             if listener is not None:
                 self._discarded_request_bytes += self._count_unaccepted_backlog(listener)
-            # the connections the drain did not dispose of: still open, so _close has not asked them yet, and holding whatever arrived that no pass of the drain reached. the set at this point holds exactly the open members of this list, since the setup pass abandoned every connection that was not added to it and nothing has been added since. what is left unaccounted is what the peer's own kernel still holds unsent, which FIONREAD cannot reach for anyone: it answers for this socket's receive queue alone. how much that is depends on the client and not on the timeout, and it is usually nothing, because this host's loopback receive queue overcommits -- FIONREAD returned a whole 1,588,890-byte pipeline against an SO_RCVBUF of 408,300, so the walk below had already counted it and the client's send queue was empty by the time this ran. where it is not nothing it equals the client's own SO_NWRITE, which is the one quantity this process cannot ask for. docs/DESIGN.md carries the measurements and says which client shape each was taken with; nothing bounds the remainder
+            # the connections the drain did not dispose of: still open, so _close has not asked them yet, and holding whatever arrived that no pass of the drain reached. the set at this point holds exactly the open members of this list, since the setup pass abandoned every connection that was not added to it and nothing has been added since. what is left unaccounted is what the peer's own kernel still holds unsent, which FIONREAD cannot reach for anyone: it answers for this socket's receive queue alone. how much that is depends on the client and not on the timeout, and it is usually nothing, because this host's loopback receive queue overcommits -- measured on this host's loopback while the walk still ASKED, FIONREAD returned a whole 1,588,890-byte pipeline against an SO_RCVBUF of 408,300, and the client's send queue was empty by the time this ran. that observation is kept for the overcommit it shows and is no longer a premise of the count: the walk reads now, so what it reports is what it took, whatever the ioctl would have said. where it is not nothing it equals the client's own SO_NWRITE, which is the one quantity this process cannot ask for. docs/DESIGN.md carries the measurements and says which client shape each was taken with; nothing bounds the remainder
             for conn in owing:
                 if not conn.closed:
                     self._discarded_request_bytes += conn.discard_unread_from_kernel()

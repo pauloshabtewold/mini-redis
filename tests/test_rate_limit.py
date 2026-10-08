@@ -9,6 +9,9 @@ real second would be the slowest in the suite and would still be asserting the c
 rather than the window.
 """
 
+import contextlib
+import types
+
 import pytest
 
 import ratelimit
@@ -218,6 +221,192 @@ def test_a_refused_command_is_not_dispatched():
         assert server._store.lookup(b"a") == b"1", "the permitted write did not land"
         assert server._store.lookup(b"b") is None, (
             "the refused command was dispatched anyway, so the limiter only shapes replies")
+
+
+def test_a_batch_of_refusals_is_bounded_by_the_write_buffer_limit(make_refusing_connection):
+    # the sixth review's finding 35, found independently by two reviewers. a refusal is a reply
+    # like any other, and the in-loop size check is what bounds what one recv can queue -- the
+    # peak four published sentences call "the limit plus one reply". the refusal path used to
+    # `continue` past that check, so a batch of refusals queued without bound: measured, 283,953
+    # bytes past a 100-byte limit where the permitted path held to 105, and the in-loop flush
+    # fired 9,855 times with the limiter off against once with it on
+    server, conn = make_refusing_connection(rate_limit=1, write_buffer_limit=100)
+    server._dispatch_batch(conn, [[b"PING"]] * 200)
+    assert len(conn.write_buffer) <= 100 + len(REFUSED), (
+        "a batch of refusals queued past the limit, so the refusal path is skipping the in-loop "
+        "check that bounds one recv", len(conn.write_buffer))
+    assert conn.closed, "the limit was exceeded and the connection was not closed"
+
+
+def test_the_permitted_path_is_still_bounded_the_same_way(make_refusing_connection):
+    # the control: without it the test above would pass against a limiter that refused nothing,
+    # and against a dispatch loop whose size check had been deleted outright
+    server, conn = make_refusing_connection(rate_limit=0, write_buffer_limit=100)
+    server._dispatch_batch(conn, [[b"PING"]] * 200)
+    assert len(conn.write_buffer) <= 100 + len(b"+PONG\r\n"), len(conn.write_buffer)
+    assert conn.closed
+
+
+@pytest.fixture
+def make_refusing_connection():
+    # a connection whose send() always refuses, so the queue is observable rather than drained by
+    # the kernel. the limit is what closes it, which is the behaviour under test
+    import socket as socket_module
+
+    from connection import Connection
+    opened = []
+
+    def make(**settings):
+        server = Server(0, rate_limit_window=WINDOW, **settings)
+        first, second = socket_module.socketpair()
+        opened.extend((first, second, server))
+
+        class RefusesEverySend:
+            def __init__(self, sock):
+                self._sock = sock
+
+            def fileno(self):
+                return self._sock.fileno()
+
+            def send(self, data):
+                raise BlockingIOError()
+
+            def close(self):
+                self._sock.close()
+
+        conn = Connection(RefusesEverySend(first), ("stub", 0))
+        server._loop.register(conn)
+        server._connections.add(conn)
+        return server, conn
+
+    yield make
+    for item in opened:
+        if isinstance(item, Server):
+            item._loop.close()
+        else:
+            item.close()
+
+
+class _Clock:
+    def __init__(self, start=1_000.0):
+        self.t = start
+
+    def monotonic(self):
+        return self.t
+
+
+@contextlib.contextmanager
+def _injected_clock(start=1_000.0):
+    # the idiom this project already owns, from tests/test_incomplete_command_timeout.py: the
+    # server module's own `time` is rebound rather than time.monotonic itself, because patching
+    # the real function reaches every module in the process. a local copy for the reason that
+    # module gives for its own copy -- the name is private there, so reaching across for it means
+    # a rename in that file breaks this one silently
+    clock = _Clock(start)
+    real = server_module.time
+    server_module.time = types.SimpleNamespace(
+        monotonic=clock.monotonic, time=real.time, sleep=real.sleep)
+    try:
+        yield clock
+    finally:
+        server_module.time = real
+
+
+def test_the_server_level_window_slides_on_the_injected_clock():
+    # the sixth review's finding 38, the first of six mutants that survived every test in this
+    # module. `window.allow(time.monotonic())` replaced by `allow(0.0)` passed all 51 tests in the
+    # two touched modules: the window slid only in the direct SlidingWindow tests, and nothing
+    # proved the LIMITER -- the thing the flag configures -- ever gives a permit back
+    server = Server(0, rate_limit=2, rate_limit_window=10)
+    try:
+        conn = _a_connection(server, role=Role.CLIENT)
+        with _injected_clock() as clock:
+            assert server._rate_limit_permits(conn)
+            assert server._rate_limit_permits(conn)
+            assert not server._rate_limit_permits(conn), "the budget was not spent"
+            clock.t += 9.0
+            assert not server._rate_limit_permits(conn), "a permit came back inside the window"
+            clock.t += 1.5
+            assert server._rate_limit_permits(conn), (
+                "no permit came back a window later, so the server-level window never slides")
+    finally:
+        server._loop.close()
+
+
+def test_the_server_reads_the_monotonic_clock_and_not_the_wall_clock():
+    # the headline claim of this feature's design -- a duration is measured on time.monotonic(),
+    # because a wall clock stepped forward empties the window and permits a flood -- and
+    # substituting time.time() for it passed the entire suite, 1,096 tests. the injected namespace
+    # advances monotonic alone, so a limiter reading the wall clock sees a frozen clock and never
+    # gives a permit back
+    server = Server(0, rate_limit=1, rate_limit_window=5)
+    try:
+        conn = _a_connection(server, role=Role.CLIENT)
+        with _injected_clock() as clock:
+            assert server._rate_limit_permits(conn)
+            assert not server._rate_limit_permits(conn)
+            clock.t += 6.0
+            assert server._rate_limit_permits(conn), (
+                "the window did not slide when only the monotonic reading advanced, so the "
+                "limiter is reading a different clock than the one it is specified to read")
+    finally:
+        server._loop.close()
+
+
+def test_the_window_the_flag_configures_is_the_window_the_limiter_uses():
+    # third surviving mutant: SlidingWindow(self.rate_limit, self.rate_limit_window) replaced by
+    # (self.rate_limit, 1) passed everything, because every server-level test used a window of 1,
+    # which is also the default. so --rate-limit-window could have been ignored entirely. the
+    # wiring test in test_size_caps.py only checks that the attribute arrives on the Server
+    server = Server(0, rate_limit=1, rate_limit_window=30)
+    try:
+        conn = _a_connection(server, role=Role.CLIENT)
+        with _injected_clock() as clock:
+            assert server._rate_limit_permits(conn)
+            clock.t += 2.0
+            assert not server._rate_limit_permits(conn), (
+                "a permit came back two seconds into a thirty-second window, so the limiter is "
+                "not using the window the flag configured")
+            assert conn.rate_limit_state.window == 30
+    finally:
+        server._loop.close()
+
+
+@pytest.mark.parametrize("kwargs, wanted", [
+    ({"rate_limit": -1}, "rate_limit cannot be negative"),
+    ({"rate_limit_window": -1}, "rate_limit_window must be positive"),
+], ids=["rate_limit", "rate_limit_window"])
+def test_a_negative_value_is_refused_at_the_constructor_door_too(kwargs, wanted):
+    # fourth surviving mutant: deleting _check_not_negative(rate_limit, ...) from Server.__init__
+    # passed every test, because nothing tested a negative at the constructor door -- only at the
+    # CLI. the design's criterion says BOTH doors, and Server is built directly by this suite and
+    # by anything embedding it, so the constructor is the door that matters more. a rate_limit of
+    # -1 would refuse every command, since len(readings) >= -1 is true of an empty deque
+    with pytest.raises(ValueError) as refusal:
+        Server(0, **kwargs)
+    assert wanted in str(refusal.value), str(refusal.value)
+
+
+def test_a_limit_of_zero_is_accepted_through_the_parser():
+    # fifth surviving mutant: --rate-limit's validator swapped for the window's, which refuses 0
+    # with "--rate-limit 0 is what disables the limiter" -- the very value it was telling you to
+    # use. no test passed 0 through the parser
+    assert build_arg_parser().parse_args(["--rate-limit", "0"]).rate_limit == 0
+
+
+def test_the_readings_are_popped_in_a_loop_and_not_one_at_a_time():
+    # sixth surviving mutant: the `while` that pops aged readings reduced to an `if`. every answer
+    # stays correct and the deque stops being bounded -- after a burst and then silence, len() is
+    # the whole burst instead of what is still inside the window. the existing pop test spaces its
+    # traffic evenly, which pops at most one per call and cannot tell the two apart
+    window = ratelimit.SlidingWindow(LIMIT, WINDOW)
+    for i in range(LIMIT):
+        window.allow(1.0 + i / (LIMIT * 10))
+    assert len(window) == LIMIT
+    window.allow(100.0)
+    assert len(window) == 1, (
+        "a burst followed by silence left more than the one reading inside the window, so the "
+        "aged readings are being popped one per call rather than in a loop", len(window))
 
 
 def _a_connection(server, role):

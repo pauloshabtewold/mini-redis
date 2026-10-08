@@ -954,6 +954,90 @@ def test_the_figure_is_right_on_a_kernel_that_answers_for_a_buffer_it_has_handed
         server._discarded_request_bytes, len(pipeline))
 
 
+def test_the_close_site_reads_the_queue_rather_than_asking_about_it(make_connection, monkeypatch):
+    # the sixth review's finding 47. the repair has two sites -- _close and the survivor walk --
+    # and reverting the _close one to the bare ioctl passed all 1,096 tests, because the three
+    # tests written for the repair only ever drove the walk. this drives _close: the connection
+    # owes nothing, so the drain's setup pass abandons it through _close before any pass runs,
+    # which is the site under test. one recv was read and DISPATCHED before the stop, so the
+    # over-reporting kernel answers for bytes this server already handled
+    # every send refuses, so the replies stay queued and are cleared below by hand: this test is
+    # about what the CLOSE counts, and a send that succeeds would only add scheduling noise
+    server, conn = make_connection([BlockingIOError] * 10)
+    _raise_the_buffers(conn._sock._sock, conn._sock.peer)
+    pipeline = _PING * 20_000
+    conn._sock.peer.settimeout(5)
+    conn._sock.peer.sendall(pipeline)
+    # read and dispatch one recv's worth before the stop, so the kernel has a partly-consumed
+    # buffer to lie about and those bytes are NOT discarded -- they were answered
+    server._read_and_dispatch(conn)
+    # counted from the replies, not from what the recv took: one recv of RECV_SIZE does not land
+    # on a command boundary, so a few bytes stay in the read buffer unparsed. those ARE discarded
+    # and the setup pass counts them correctly -- what must not be counted is the bytes that were
+    # dispatched, which is one +PONG each
+    dispatched = len(conn.write_buffer) // len(b"+PONG\r\n")
+    assert dispatched > 0, "the setup for this test dispatched nothing, so it proves nothing"
+    conn.write_buffer.clear()
+    answered = dispatched * len(_PING)
+    monkeypatch.setattr(
+        connection_module, "unread_in_kernel",
+        _a_kernel_that_answers_for_a_buffer_it_has_handed_over(len(pipeline)))
+    server._draining = True
+
+    server._drain_for(0)
+
+    assert conn.closed, "the case under test needs the connection abandoned for owing nothing"
+    assert server._discarded_request_bytes == len(pipeline) - answered, (
+        "the close counted bytes it had already dispatched, so that site is trusting the ioctl",
+        server._discarded_request_bytes, len(pipeline) - answered)
+
+
+@pytest.mark.parametrize("raised", [ValueError("closed descriptor"), OSError(errno.EBADF, "bad fd")],
+                         ids=["ValueError", "OSError"])
+def test_a_recv_that_raises_inside_the_walk_does_not_cost_the_drain_its_line(
+        make_connection, caplog, raised):
+    # finding 48's third mutant: narrowing the walk's `except (OSError, ValueError)` to
+    # BlockingIOError passed every test, because nothing here made recv raise anything else. the
+    # ioctl's own broad catch is tested; the READ's was not, and it is the newer of the two. a
+    # raise escaping here leaves the drain's finally clause without its one log line, which is the
+    # loss DL-004's invariant exists to prevent -- and ValueError is what a socket object whose
+    # descriptor has gone actually raises, which is why OSError alone is not enough
+    server, conn = make_connection([BlockingIOError])
+    conn.queue(b"x" * 10)
+    conn._sock.peer.sendall(_PING * 10)
+
+    def recv(_bufsize):
+        raise raised
+
+    conn._sock.recv = recv
+    server._draining = True
+
+    with caplog.at_level(logging.INFO, logger="server"):
+        server._drain_for(0)
+
+    drain_lines = [r for r in caplog.records if "shutdown drain" in r.getMessage()]
+    assert len(drain_lines) == 1, (
+        "the raise escaped the walk and the drain wrote no line, so a stop has no account of "
+        "itself at all", [r.getMessage() for r in caplog.records])
+    # and the figure keeps what the other sites had already counted rather than being lost
+    assert "request bytes discarded undispatched" in drain_lines[0].getMessage()
+
+
+def test_the_close_counts_nothing_when_the_drain_is_not_accounting(make_connection):
+    # the companion gap, finding 48: replacing the `if self._counting_unread_at_close` gate with
+    # `if True` also passed all 1,096 tests. it would make every ordinary close read and throw
+    # away whatever the kernel held, outside any stop, and add it to a figure nobody is reporting
+    server, conn = make_connection([BlockingIOError])
+    conn._sock.peer.sendall(_PING * 10)
+    assert not server._counting_unread_at_close, "this test needs the flag clear"
+
+    server._close(conn)
+
+    assert server._discarded_request_bytes == 0, (
+        "an ordinary close added to the stop's figure, so the accounting gate is not being read",
+        server._discarded_request_bytes)
+
+
 def test_the_survivor_walk_takes_the_bytes_it_counts_off_the_socket(make_connection):
     # what makes the figure independent of the kernel's own arithmetic: the walk reads the remainder
     # and reports what it actually got, rather than asking and reporting the answer. An emptied

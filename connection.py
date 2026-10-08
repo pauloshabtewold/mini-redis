@@ -154,19 +154,25 @@ class Connection:
     def discard_unread_from_kernel(self) -> int:
         # the same quantity unread_in_kernel() answers for, established by reading it off the
         # socket and throwing it away rather than by trusting the kernel's own figure. the ioctl is
-        # asked for a CEILING and not for the answer, because the answer is not portable: a kernel
-        # that walks its receive queue summing each queued buffer's whole length reports a buffer
-        # this process has already read half of as still unread in full, and the drain's read path
-        # has counted that half once already -- so the five shapes the figure is made of stop being
-        # additive, which is worse than a number being wrong. reads cannot find bytes that are not
-        # there, so what this returns is right on a kernel that answers either way, and the
-        # disagreement costs nothing but the syscalls. docs/DESIGN.md carries the measurements: the
-        # buffer size, the figure such a kernel reported, and what the emptied queue does to the
-        # close that follows
+        # asked for a CEILING and not for the answer, because the answer is not portable on every
+        # socket family: an AF_UNIX kernel that sums each queued buffer's whole length reports a
+        # buffer this process has already read half of as still unread in full, and the drain's
+        # read path has counted that half once already -- so the five shapes the figure is made of
+        # stop being additive, which is worse than a number being wrong
+        #
+        # where that is reachable is narrower than it first looked, and saying so is the point: every
+        # socket this server opens or accepts is AF_INET, where the figure is exact on every kernel
+        # read, so the double count arrives through the suite's own socketpair fixture and not
+        # through a client. this is kept anyway, because a count that is right whatever a kernel
+        # answers costs one ioctl plus the reads of bytes that were going to be discarded regardless,
+        # and it needs no argument about which platform is running. reads cannot find bytes that are
+        # not there, so what this returns is what it took. docs/DESIGN.md carries the measurements and
+        # says which platform and which family each was taken on
         #
         # the ceiling is also what bounds it. a peer that goes on sending while this runs cannot
-        # extend the loop past what the kernel claimed when it was asked, so this stays one bounded
-        # step at a point in the stop sequence that no deadline covers
+        # extend the loop past what the kernel claimed when it was asked -- but the read is
+        # O(queued bytes) where the ioctl was O(connections), which makes the survivor walk a fourth
+        # step in the stop sequence that no deadline covers rather than leaving the count at three
         #
         # a closed socket, or a kernel that refuses the question, gives a ceiling of 0 through the
         # method above and the loop below then does not run, which is the whole of the handling
