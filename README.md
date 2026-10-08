@@ -54,31 +54,39 @@ twenty per cent and some p99 figures by half again -- `PING_MBULK` came back at 
 and 76,161 against the 84,962 below, and the reference's `LRANGE_600` p99 at 4.255 ms and
 3.783 ms against 2.743 ms -- on a laptop carrying other work, which is what a laptop
 always is. What survived every repetition is the shape rather than the cell: the median
-share of native stayed within about a point of the figure quoted here, every test cleared
-the threshold with room to spare, and this server's p99 stayed a low multiple of the
+share of native stayed within about a point of the figure quoted here, every test
+cleared the threshold, though not always with room to spare, since one `-P 16` round
+put `SET` at 8.18% of native, and this server's p99 stayed a low multiple of the
 reference's on the small commands. Read a row as the order of magnitude it establishes,
 not as a number to compare against your own hardware.
 
 The table is the measurement the shipped version was judged on, and the tree has moved
 well past the tag it was taken at (`git rev-list v1..HEAD --count` says how far, and it
-keeps moving) -- one of those commits changed `take_commands()`,
-the read path all ten tests go through -- so it was taken again at the tip of this
-branch, against a private `redis-server 7.2.7` started for the run on a port of its own,
-at a load average of 4.2. What a re-measurement is for here is the figure this section
-says to read, the median share of native, and it held. At `-P 16` the eight small-reply
-commands ran at 19.6% to 27.2% of native, median 23.5%, against the 16.3% to 29.7% and
-22.1% below, and the two `LRANGE` tests at 49.9% and 60.9% against 46.9% and 59.7%; at
-`-P 1` the median share was 63.0% against 64.1%. No row's share moved by more than 6.4
-points, every test cleared the 8% threshold by the same wide margin, and the snapshot
-path was empty afterwards again. One sentence above did not hold: the reference's own
-p99 came back lower on the small commands than it had been, 0.375 to 0.951 ms against
-0.455 to 0.927, so the ratio this server stands at is 1.3 to 3.5 times rather than two
-to three. The rates in the table are left as they were taken, because each cell is one
-run and a newer run is no better evidence of a cell than an older one; what a
-re-measurement can settle is the share, and that is what is reported here. The rate
-limiter was built after that re-measurement, so neither table was taken with its check
-in the path. With the limit off, which is the default, the check is one call per command
-that tests one attribute and returns.
+keeps moving) -- one of those commits changed `take_commands()`, the read path all ten
+tests go through -- so I took it again, on a tree that did not yet hold the rate
+limiter, against a private `redis-server 7.2.7` started for the run on a port of its
+own. The fourteen `redis-benchmark` invocations ran at load averages of 3.97 to 9.82.
+What a re-measurement is for here is the figure this section says to read, the median
+share of native, and it held. At `-P 16` the eight small-reply commands ran at 19.6% to
+27.2% of native, median 23.5%, and the two `LRANGE` tests at 49.9% and 60.9%; at `-P 1`
+the median share was 63.0%. The paragraph after the second table holds the figures to
+set these beside. A row does not hold still the way the median does: in later
+repetitions a row's share was as much as 17.4 points above and 16.4 below its figure in
+the table at `-P 1`, with six of the ten rows more than 6.4 points off in a single run,
+and as much as 18.2 above and 11.1 below at `-P 16`. The reference's own p99 on the
+eight small commands does not hold still either: 0.455 to 0.927 ms in the first table,
+and 0.375 to 0.951, 0.775 to 1.231 and 0.679 to 2.047 ms in three later runs of the set.
+A ratio of the two p99 columns therefore describes one run and not the server, and the
+first table's own run gives 1.62 to 4.15 times. The snapshot path was still empty before
+each stop, which is what shows that no periodic save fired. It was not empty afterwards:
+the stop saves even at `--snapshot-interval 0`, and a 700,118-byte snapshot appeared
+after it in 7 of 7 instances. The rates in the table are left as they were taken,
+because each cell is one run and a newer run is no better evidence of a cell than an
+older one; what a re-measurement can settle is the share, and that is what is reported
+here. The rate limiter was built after that re-measurement, so neither table was taken
+with its check in the path. With the limit off, which is the default, the check is a
+method call that tests one attribute and returns: I measured it at 77 ns per command,
+and a `-P 16` comparison with and without it fell inside the noise.
 
 The list is pinned because the tool's default run stops at
 `SADD`, the first command in its sequence this server does not implement (see
@@ -240,9 +248,10 @@ order. A follower would have applied that stream through its own dispatcher, and
 leader's link to its own leader would have been a third kind of connection, exempt from
 the rate limit a client is under.
 
-Because the design was written before it was cut, three things in the code are present
-and cannot be reached, and I would rather say so than leave them to be found. The first
-changed when the rate limiter was built.
+Because the design was written before it was cut, four things in the code are
+present and nothing in a running server puts them to the use they were written
+for, and I would rather say so than leave them to be found. The first changed
+when the rate limiter was built.
 
 `Connection` knows three roles, `client`, `follower` and `leader_link`, and the rate
 limiter reads them: a `client` is limited and the other two are let through. Nothing in
@@ -272,6 +281,12 @@ command, and it is also the absolute form that `EXPIRE` and `PEXPIRE` report as 
 effect, so that a follower applying it later would compute the same deadline. The
 follower would have applied it through the same dispatcher a client uses. With no
 stream, that effect goes nowhere.
+
+The fourth is the `read`, `write` or `other` tag that each command carries from the
+decorator that registers it. Nothing in the server reads it: the rate limiter counts
+every command whatever its kind and exempts by the connection's role, and replication,
+the other reader it could have had, is not built. Only the tests read it.
+`docs/DESIGN.md` has why it is declared where the handler is.
 
 ## Alternatives I rejected
 
@@ -408,9 +423,10 @@ bound from the mechanism and not the largest thing measured: over 152 observatio
 batch from 28 to 40 replies, the most a still-open paused connection held was 33,239,356 bytes,
 99.1% of it, and the running maximum was still rising at the last observation. Take the 32 MiB as
 the bound and the 99.1% as how close a sample gets. The transient peak before the limit closes a
-connection is bounded by the limit plus one reply, 34,603,020 bytes at 1 MiB replies, and was
-measured to within 37,692 bytes of that. Neither bound was exceeded in the 152, and the pause
-fired exactly once in every one. The pause keeps
+connection is bounded by the limit plus one reply, 34,603,020 bytes at 1 MiB replies,
+and was measured to within 37,692 bytes of that. A rate-limit refusal counts as a
+reply: the refusal path queues its error and reaches the same check. Neither bound was
+exceeded in the 152, and the pause fired exactly once in every one. The pause keeps
 a client that stops reading from being closed by the limit; it does not keep it far away
 from the limit. The 32 MiB default is a choice, and a departure from the reference,
 which leaves an ordinary client's output buffer unlimited. This server does not: nothing
@@ -446,10 +462,11 @@ limit, and a `KEYS` reply is judged the same way. Only 0 reads every one of them
 or has not sent, so that flag does not bound it either; and it holds what is already
 queued for it, at least the high-water mark's worth plus whatever the one batch that
 crossed the mark queued, until it disconnects. That is bounded: per connection by the
-mark plus that batch, which the limit itself caps while the limit is on — the limit
-plus one reply is the transient peak before a close, not the hold — and over all
-connections by `--max-connections`. Read that bound as the product it is: the 32 MiB
-above, times the default `--max-connections 1024`, puts the aggregate at 32 GiB — far
+mark plus that batch, which the limit itself caps while the limit is on — the
+limit plus one reply, a refusal under `--rate-limit` included, is the transient
+peak before a close, not the hold — and over all connections by
+`--max-connections`. Read that bound as the product it is: the 32 MiB above,
+times the default `--max-connections 1024`, puts the aggregate at 32 GiB — far
 past the memory of any machine this is likely to run on, and the cap is what bounds the
 count of connections, not what makes the total small. Ninety-six paused connections
 drove 2.9 GB into swap on an 8 GiB machine, with every one still open and a fresh client
@@ -484,14 +501,24 @@ pipelined `SET`s whose bytes the kernels had accepted, all 50,000 were discarded
 none executed, with the server exiting 0. How many are executed is not fixed: earlier
 probes of the same shape executed up to about two thousand, so read the loss as the
 whole pipeline rather than as a figure near it. With `--write-buffer-high-water 0` and
-three seconds for the server to catch up, 50,000 of 50,000 executed in five runs. The
-client's end of input is clean, because the drain empties every receive queue it counts,
-including the ones no pass of it ever read. Measured at `--shutdown-drain-timeout 0`
-against a 700,000-byte pipeline the server never read, the client saw end of input in 10
-of 10 runs owing replies and 10 of 10 owing nothing, where before the queue was read
-rather than asked about it saw `ECONNRESET` in 10 of 10 of each, with the
-discarded-bytes figure unchanged in both arms. What is still a reset is a request that
-arrives after that last look, in the window between it and the close.
+three seconds for the server to catch up, 50,000 of 50,000 executed in five runs. A
+client's end of input is clean when everything it sent had reached the server's receive
+queue by the drain's last look, the walk it makes in its `finally` over the connections
+still open, because the drain reads and discards the receive queue of every connection
+it was serving, including the ones no pass of it ever read. A client still waiting in
+the accept backlog is never served, and one that had sent bytes sees a reset. Measured
+at `--shutdown-drain-timeout 0` against a 700,000-byte pipeline the server never read,
+a client that was owed nothing saw end of input in 10 of 10 runs where, before the
+queue was read rather than asked about, it saw `ECONNRESET` in 10 of 10. A client that
+was owed replies did not: it saw end of input in 0 of 10 runs, no different from
+before, and in 9 of 40 across variants of the setup. The pipeline outran what the
+connection's receive queue held. The client's own send queue, `SO_NWRITE`, read 568,968
+bytes at the stop, so only 131,032 of the 700,000 bytes had arrived, and the pipeline
+was 5.3 times what a paused connection's receive queue holds on this host; the rest
+reached the server after the last look and was reset at the close. The discarded-bytes
+figure was unchanged by the repair in both arms, at 131,032 and 131,040 bytes. What is
+still a reset is a request that arrives after the last look and before the close, and
+at that pipeline size that is the ordinary case and not a corner.
 The drain's own line counts the inbound bytes the stop threw away in
 all five shapes they come in, which for a client that never reads was exactly the bytes
 the kernels had accepted, in each of those twenty-three runs: the whole 1,588,890 bytes
@@ -520,13 +547,15 @@ the server had exited in 7 of the 8 and off by exactly 8,192 bytes in the other,
 there is no read pass, and the uncounted amount is what the peer still held, equal to
 `SO_NWRITE` in 9 of the 10 non-zero runs below and off by exactly 8,192 bytes in the
 tenth. Measured with a client that never reads, over 39 runs of a 1,588,890-byte
-pipeline in four harness shapes, it was non-zero in 10 of the 39 and in none of the 15
-where the stop came after the push had completed; across the ten it ran 45,498 to
-581,164 bytes, median 515,628, and the largest is 36.6% of the pipeline. It is usually
-zero because on loopback `FIONREAD` answered with the whole 1,588,890 bytes although
-`SO_RCVBUF` is 408,300, the receive queue overcommitting, so the server had already
-counted the entire pipeline from its own side and the client's send queue was empty by
-the time the drain's `finally` asked. What stays uncounted is what a client still
+pipeline in three harness shapes of 15, 12 and 12 runs, it was non-zero in 10 of
+the 39 and in none of the 15 where the stop came after the push had completed;
+across the ten it ran 45,498 to 581,164 bytes, median 515,628, and the largest
+is 36.6% of the pipeline. It is usually zero because by the time the drain's last
+look runs the client has usually handed its kernel everything it was going to send,
+and its own send queue is empty. These runs were taken while that look still asked
+the kernel with `FIONREAD`, which on macOS loopback answered with the whole 1,588,890
+bytes although `SO_RCVBUF` is 408,300, the receive queue overcommitting; the look now
+reads the queue off instead. What stays uncounted is what a client still
 pushing had not yet handed its kernel. On a 9,533,340-byte pipeline three runs gave
 532,012 to 843,308 bytes, equal to `SO_NWRITE` in all three, so the amount follows the
 client's send queue and not the size of the pipeline. Nothing in this server bounds it:
@@ -628,9 +657,10 @@ setup pass over the connections, then the wait, which is where the server sends 
 replies already queued for clients, and a second sweep in its `finally`. The wait is the
 one part this flag limits. The wait for the loop to notice the signal, up to one
 `select()` timeout, comes before the drain, and so does the snapshot save, which costs
-what the keyspace costs; the two sweeps have no deadline of their own, and the
-teardown's flush, described below, comes after the drain and has none either. This flag
-limits none of these. On `SIGINT` or `SIGTERM` the loop stops, and then, before anything
+what the keyspace costs; the two sweeps and the reads that empty and count the
+receive queues have no deadline of their own, and the teardown's flush, described
+below, comes after the drain and has none either. This flag limits none of these.
+On `SIGINT` or `SIGTERM` the loop stops, and then, before anything
 is torn down: the listening socket leaves the select set, so no connection that arrives
 from here on is served, though the socket itself stays open until the teardown and a
 replacement server cannot bind the port while this process is still running; a snapshot
@@ -669,16 +699,20 @@ and include the slowest sweep of each of the three floods below. With 4, 7 and 3
 processes connecting continuously at `--shutdown-drain-timeout 0`, `SIGTERM` to exit
 passed 0.07 s in 17 of 22 runs, median 0.0846 s, and reached 0.4199 s, the slowest sweep
 in each flood taking 139.0, 363.9 and 383.3 ms. Those are the largest seen, not a bound.
-They matter at `--shutdown-drain-timeout 0`, where three steps between the loop stopping
-and exit have no deadline: the snapshot save, the two sweeps, and the teardown's flush.
-The flush runs after the drain's line is written: `_shutdown` closes every connection
+They matter at `--shutdown-drain-timeout 0`, where four steps between the loop
+stopping and exit have no deadline: the snapshot save, the two sweeps, the reads
+that empty and count the receive queues, and the teardown's flush. The flush
+runs after the drain's line is written: `_shutdown` closes every connection
 still open, up to `--max-connections` of them, and each close sends in a loop until its
 buffer is empty or the kernel will take no more. Over 11 runs at
 `--shutdown-drain-timeout 0`, with no limits and 150 connections each owed one
 1,048,588-byte reply, the line read `incomplete` with 143 to 146 of the 150 still owed
 bytes, readers that began after the signal then received 63,918,688 to 143,578,892 of
 the 157,288,200 bytes queued, 40.6% to 91.3%, median 50.3%, and the process exited 0.052
-to 0.278 s after the signal. The drain ends in one log line however it ends, even when a
+to 0.278 s after the signal. The reads are the fourth step: each takes what the kernel
+reported queued when it was asked, so their cost follows the bytes queued and not the
+number of connections, and `docs/DESIGN.md` has the one measurement of it and says why
+it gives no worst case. The drain ends in one log line however it ends, even when a
 pass raises. The line carries two counts of replies, connections closed while they still
 owed bytes and connections still owing bytes when the drain ended, and it is a warning
 if either is non-zero and informational if both are zero. Both are shown at the default
@@ -738,9 +772,11 @@ resume only when the queue is empty, the most conservative resume and not a way 
 switching anything off. What is lost is the part of the replies the kernel will not take
 in the one best-effort flush each connection gets as it is closed, which still runs, and
 nothing after it does. No read pass runs either, so a request that arrives at any time
-after the loop's last pass, the whole of the snapshot save included, is still unread
-when its connection closes, and the close then resets it and discards what the kernel
-was holding unsent as well. An operator who reads the limits correctly and generalises
+after the loop's last pass, the whole of the snapshot save included, is never
+dispatched. It is not left to be reset at the close, though: the drain reads it off
+and counts it first, in the close of a connection that owed nothing and in the walk
+it makes over the connections still open as it ends, as the paragraph on the
+drain's two limits says. An operator who reads the limits correctly and generalises
 will set this to `0` expecting an unbounded wait, and lose queued replies on every
 restart. A negative value is refused, and so is one above the same `2**63 - 1` ceiling
 the two intervals have.
@@ -758,28 +794,34 @@ The drain has two limits worth knowing. The first is that a client that is still
 when it ends can still lose the tail of its replies. The drain finishes as soon as the
 last byte reaches the kernel, which on loopback is long before a slow client has read
 it, and handed to the kernel is not on the wire: the kernel can still be holding the
-tail unsent. A request arriving after the final read pass leaves unread bytes at the
+tail unsent. A request arriving after the drain's last look at the receive queues, the
+walk it makes over the connections still open as it ends, leaves unread bytes at the
 close, which resets the connection and discards what the kernel was holding. What the
 peer had already received stays received. A client that sends and then stops loses no
 reply tail this way, since by the last pass every reply it is owed has been handed over
-or counted as lost. At `--shutdown-drain-timeout 0` the limit begins earlier, because no
-pass of the drain reads at all: the last read is the main loop's, so a request arriving
-at any point after it, throughout the save, is unread at the close. This is a limitation
-of the design, and a half-close from the server's side does not remove it: with a
-request unread and replies still held by the kernel, a close after `shutdown(SHUT_WR)`
-lost as much as a plain close, and both ended in a reset at the client. What does work
-is a close that waits, either for the kernel's own send queue to empty or for the peer's
-end of input. The first is a question put to the kernel that this server does not ask,
-and it ties the exit to the pace of the slowest reader, up to the deadline; the second
-needs the client's cooperation and has no bound of its own against one that never gives
+or counted as lost. At `--shutdown-drain-timeout 0` the limit does not begin earlier,
+although no pass of the drain reads at all: the last look still runs, so a request
+arriving after the main loop's last read and before that walk, throughout the save, is
+read off, counted and thrown away and not left for the close to reset. Measured, 100,000
+bytes sent during a million-key save met a reset in 4 of 4 runs before the walk read the
+queue and an orderly close in 4 of 4 after, on macOS and on Linux. The window
+that remains is a limitation of the design, and a half-close from the server's
+side does not remove it: with a request unread and replies still held by the
+kernel, a close after `shutdown(SHUT_WR)` lost as much as a plain close, and both
+ended in a reset at the client. What does work is a close that waits, either for
+the kernel's own send queue to empty or for the peer's end of input. The first is
+a question put to the kernel that this server does not ask, and it ties the exit
+to the pace of the slowest reader, up to the deadline; the second needs the
+client's cooperation and has no bound of its own against one that never gives
 it. This server does neither. The second limit is the other direction, and it is the
 last of the pause's costs above: a request the stop never dispatches is a write the
-client was already told had left, whether the drain read and threw it away or the close
-reset it unread. That one is reported, in the drain line's third figure.
-`--write-buffer-high-water 0` removes the pause's share of it — the whole pipeline,
-lost with certainty — and not the loss itself: a stop still discards whatever the loop
-had not read, which is the loss the ten prompt-stop runs described above measured, with
-the pause unable to fire. `docs/DESIGN.md` has the reasoning.
+client was already told had left, whether a pass of the drain read and threw it away or
+the last look did. That one is reported, in the drain line's third figure, for
+everything either of them read; a request that arrives after the last look is neither
+read nor reported. `--write-buffer-high-water 0` removes the pause's share of it — the
+whole pipeline, lost with certainty — and not the loss itself: a stop still discards
+whatever the loop had not read, which is the loss the ten prompt-stop runs described
+above measured, with the pause unable to fire. `docs/DESIGN.md` has the reasoning.
 
 `--max-connections COUNT` (default `1024`) closes, without a reply, a connection that
 arrives while COUNT clients are already connected; `0` means no limit, and nothing is
@@ -808,29 +850,39 @@ still per element, per command or per connection, and the cap does not turn any 
 into a bound on memory.
 
 **Two more flags cover how fast one connection may ask.** `--rate-limit REQUESTS`
-(default `0`) answers `-ERR rate limit exceeded` to a command, and does not run it, once
-its connection has sent REQUESTS commands inside the last `--rate-limit-window SECONDS`
-(default `1`, whole seconds). `0` turns the limiter off, and it is off unless asked for:
-the benchmark above uses `-c 50`, and a limiter that was on would have measured its own
+(default `0`) answers `-ERR rate limit exceeded` to a command, and does not run it,
+once its connection has been permitted REQUESTS commands inside the last
+`--rate-limit-window SECONDS` (default `1`, whole seconds). Permitted, and not
+sent: a refusal records nothing, so a connection can send more than REQUESTS
+commands in a window, and a client was permitted at 8 sends inside a 2 s window
+with a limit of 5. `0` turns the limiter off, and it is off unless asked for: the
+benchmark above uses `-c 50`, and a limiter that was on would have measured its own
 rejection path. The window slides rather than resetting on a fixed boundary, so no burst
 straddles one, and it is counted on the monotonic clock. The count is of commands and
 not of reads. A client that pipelines writes many commands in one `send()` and the
 server can read them in one `recv()`, so a check made once per readable event would
 charge the whole batch one unit and bound how often the socket was read, not how many
 requests were made; this one sits inside the loop that dispatches the batch, where
-`--write-buffer-limit` is also consulted, for the same reason. Against a real
-`server.py` process on a port the kernel chose, 500 `PING`s written in one `sendall`
-were answered with 500 `PONG` and none refused when no flag was given, and with 100
-`PONG` and 400 refused under `--rate-limit 100 --rate-limit-window 1`.
+`--write-buffer-limit` is also consulted, for the same reason, and a refusal is queued
+and then reaches that same check, so a flood of refusals is held to the limit plus one
+reply like any other. Against a real `server.py` process on a port the kernel chose, 500
+`PING`s written in one `sendall` were answered with 500 `PONG` and none refused when no
+flag was given, and with 100 `PONG` and 400 refused under
+`--rate-limit 100 --rate-limit-window 1`.
 
 A refused command gets that error and nothing else. It is not dispatched, the connection
-stays open and is still read, and its next command is judged on its own, because a close
-would look to the client like a protocol error and the reconnect that followed would
-arrive with a full budget. The budget is per connection and not per address, and that is
-the cost: a client that closes and reconnects starts again with a full one. I documented
-that rather than engineering it away, since counting per address needs a table shared
-between connections and this loop has none, and `--max-connections` bounds how many
-connections, and so how many budgets, exist at once. A connection whose role is not
+stays open and is still read, and its next command is judged on its own, because a
+close would look to the client like a protocol error and the reconnect that followed
+would arrive with a full budget. That holds while the queue of replies stays under
+`--write-buffer-limit`: a refusal is a reply like any other and the limit applies to
+it, so under a small configured limit ten refusals closed the connection. The budget is
+per connection and not per address, and that is the cost: a client that closes and
+reconnects starts again with a full one. I documented that rather than engineering it
+away, since counting per address needs a table shared between connections and this loop
+has none. `--max-connections` is not a mitigation: it bounds how many connections, and
+so how many budgets, exist at once, and not how often a client may open a new one, and
+one client opening connections one after another was permitted 98,281 commands per
+second against a limit of 100 per second. A connection whose role is not
 `client` is never limited, which changes nothing in a running server today because
 nothing sets any other role; [Designed and not built](#designed-and-not-built) says why
 the exemption is there.
