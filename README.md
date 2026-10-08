@@ -56,8 +56,11 @@ and 76,161 against the 84,962 below, and the reference's `LRANGE_600` p99 at 4.2
 always is. What survived every repetition is the shape rather than the cell: the median
 share of native stayed within about a point of the figure quoted here, every test
 cleared the threshold, though not always with room to spare, since one `-P 16` round
-put `SET` at 8.18% of native, and this server's p99 stayed a low multiple of the
-reference's on the small commands. Read a row as the order of magnitude it establishes,
+put `SET` at 8.18% of native. What the p99 columns do not support is a ratio: the
+table's own eight small commands give 1.62 to 4.15 times the reference, and the
+reference's own p99 on those commands has been measured as low as 0.375 ms and as high
+as 2.047 across later runs, so a ratio taken from any one pair of runs says more about
+which pair than about this server. Read a row as the order of magnitude it establishes,
 not as a number to compare against your own hardware.
 
 The table is the measurement the shipped version was judged on, and the tree has moved
@@ -143,7 +146,9 @@ Three facts make these numbers reportable, and each is stated because its absenc
 change them. The snapshot interval was `0` for every run of this server, so no periodic
 save fell inside a measurement: a save blocks the one thread that answers clients, and a
 run that crossed one would carry an unattributed stall inside its p99. The snapshot path
-was still empty after the runs, which is how I know none fired. The rate limiter was
+was empty when each run started and still empty when it ended, which is how I know none
+fired -- checked before the stop, because the stop itself writes one even at
+`--snapshot-interval 0`, so a path checked after the process exits says nothing. The rate limiter was
 off, by construction and not by configuration, because it did not exist when either
 measurement was taken. It is off by default now, and the reason is this benchmark: a
 limit that was on would have tripped under `-c 50` at once, and the numbers would have
