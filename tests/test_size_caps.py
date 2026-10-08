@@ -114,6 +114,9 @@ _FLAGS_THAT_REACH_THE_SERVER = [
     (("--write-buffer-high-water", "4194304"), "write_buffer_high_water", 4194304),
     (("--write-buffer-low-water", "1000"), "write_buffer_low_water", 1000),
     (("--incomplete-command-timeout", "7"), "incomplete_command_timeout", 7),
+    (("--rate-limit", "100"), "rate_limit", 100),
+    # 2 and not 1: 1 is the default, and the test above refuses a case whose value is one
+    (("--rate-limit-window", "2"), "rate_limit_window", 2),
     # a name and not an address: it resolves to the loopback address the default is, so
     # nothing is exposed by the value, and it is not the string the default is spelt as
     (("--host", "localhost"), "host", "localhost"),

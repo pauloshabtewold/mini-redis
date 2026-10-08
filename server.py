@@ -14,6 +14,7 @@ from collections.abc import Callable
 import commands
 import persistence
 import resp
+import ratelimit
 from connection import BatchProtocolError, Connection, Role, unread_in_kernel
 from event_loop import EventLoop
 from store import Store
@@ -72,6 +73,13 @@ LISTEN_HOST = "127.0.0.1"
 SELECT_TIMEOUT_SECONDS = 0.1
 # the most one connection may have queued once the kernel has taken what it will, past which it is closed. with the water marks below in force this is not what slows a client down: one that stops reading is paused rather than throttled here, so what this bounds is a reply larger than it, or the replies to one read's batch of pipelined requests, which the pause cannot unqueue once they are parsed. what the pause does not do is hold such a client near the mark -- the batch that crossed the mark is still dispatched whole, and measured a paused connection holds almost the whole of this default, so the pause keeps it from being closed here rather than keeping it far away; README.md carries the figure. 0 turns the check off. see Server._flush for why exceeding it closes the connection instead of slowing it down
 # a local choice and not the reference's, which leaves an ordinary client unlimited. it is below DEFAULT_MAX_VALUE_SIZE, so a value that was stored can be too large to read back: the reply to a GET of it exceeds this and the connection is closed. that is what a hard limit does, and neither default is moved to hide it
+# off, and this is the one default that is off rather than a value: with a limit on,
+# redis-benchmark at -c 50 -n 100000 trips it on the first batch and the published
+# benchmark would measure the rejection path instead of the server
+DEFAULT_RATE_LIMIT = 0
+# the window the limit is counted over. a duration, so time.monotonic() deals in it and
+# not the wall clock the expiry deadlines use
+DEFAULT_RATE_LIMIT_WINDOW_SECONDS = 1
 DEFAULT_WRITE_BUFFER_LIMIT = 32 * 1024 * 1024
 # a connection with more than this queued for it stops being read, and is read again once the queue falls to the low-water mark below. the gap between the two is the reason there are two: equal marks would pause and resume the connection on every event. 0 disables the pause. the pause is what keeps a client that pipelines faster than it reads from being closed by the limit above, and not what keeps it away from it: a paused connection holds this mark plus the one batch that crossed it, which the limit in turn caps at the limit plus one reply, so at the two shipped defaults it holds almost the whole of that ceiling rather than anything near this mark -- README.md carries the measured figure and the aggregate it implies
 DEFAULT_WRITE_BUFFER_HIGH_WATER = 1024 * 1024
@@ -184,6 +192,14 @@ _ZERO_SKIPS_THE_READ_LOOP = "%d does not mean unlimited, and 0 means no drain pa
 _ZERO_RESUMES_WHEN_EMPTY = "%d does not turn anything off, and 0 means resume only when the queue is empty"
 # --snapshot-interval's own ending, because its 0 turns off the periodic save and no more: a clean stop still saves, unless --ignore-snapshot is set as well, so the shared ending would send an operator who typed -1 to a value that does not stop saving
 _ZERO_STOPS_THE_PERIODIC_SAVE = "%d does not turn saving off, and 0 stops only the periodic save"
+# the window takes no 0 at all, where --rate-limit's 0 is what disables the limiter. a
+# window of zero would put every reading instantly outside it and permit everything, so an
+# operator who typed it meaning "off" would get a limiter that never fires and says nothing
+_WINDOW_TAKES_NO_ZERO = "%d is not a window, and --rate-limit 0 is what disables the limiter"
+# what an over-limit command is answered with. terse and lowercase after the code, which is
+# every other error this server writes; it names no figure, because the limit is the
+# operator's configuration and not the client's business
+_RATE_LIMITED = b"ERR rate limit exceeded"
 
 
 def _check_not_negative(value: int, label: str, ending: str = _ZERO_DISABLES) -> None:
@@ -197,6 +213,13 @@ def _check_not_negative(value: int, label: str, ending: str = _ZERO_DISABLES) ->
     # reaching for the opposite of what it does
     if value < 0:
         raise ValueError(("%s cannot be negative; " + ending) % (label, value))
+
+
+def _check_rate_limit_window(value: int, label: str) -> None:
+    # not _check_not_negative with a different ending, because the rule itself differs:
+    # every other numeric setting here admits 0 as "off", and this one admits no 0 at all
+    if value <= 0:
+        raise ValueError(("%s must be positive; " + _WINDOW_TAKES_NO_ZERO) % (label, value))
 
 
 def _check_schedulable(value: int, label: str, unit: str) -> None:
@@ -360,6 +383,23 @@ def _expiry_sweep_interval(value: str) -> int:
     return number
 
 
+def _rate_limit(value: str) -> int:
+    return _numeric_limit(value, "rate limit", "requests")
+
+
+def _rate_limit_window(value: str) -> int:
+    try:
+        number = int(value)
+    except ValueError:
+        raise argparse.ArgumentTypeError("rate limit window must be an integer number of seconds") from None
+    try:
+        _check_rate_limit_window(number, "rate limit window")
+        _check_schedulable(number, "rate limit window", "seconds")
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(str(exc)) from None
+    return number
+
+
 def _shutdown_drain_timeout(value: str) -> int:
     number = _numeric_limit(value, "shutdown drain timeout", "seconds", _ZERO_SKIPS_THE_READ_LOOP)
     try:
@@ -496,6 +536,25 @@ def build_arg_parser() -> argparse.ArgumentParser:
              "already connected; 0 means no limit, and nothing is refused",
     )
     parser.add_argument(
+        "--rate-limit",
+        type=_rate_limit,
+        default=DEFAULT_RATE_LIMIT,
+        metavar="REQUESTS",
+        help="answer an error, without dispatching, once a connection has sent REQUESTS "
+             "commands inside --rate-limit-window; 0 disables the limiter, which is the "
+             "default, and the budget is per connection, so a client gets a fresh one by "
+             "reconnecting -- --max-connections is what bounds that",
+    )
+    parser.add_argument(
+        "--rate-limit-window",
+        type=_rate_limit_window,
+        default=DEFAULT_RATE_LIMIT_WINDOW_SECONDS,
+        metavar="SECONDS",
+        help="the span --rate-limit counts over, sliding rather than fixed, so no burst "
+             "straddles a boundary; it takes no 0, because 100 requests per 0 seconds is a "
+             "limiter that permits everything",
+    )
+    parser.add_argument(
         "--write-buffer-high-water",
         type=_write_buffer_high_water,
         default=DEFAULT_WRITE_BUFFER_HIGH_WATER,
@@ -577,6 +636,8 @@ class Server:
         write_buffer_high_water: int = DEFAULT_WRITE_BUFFER_HIGH_WATER,
         write_buffer_low_water: int = DEFAULT_WRITE_BUFFER_LOW_WATER,
         incomplete_command_timeout: int = DEFAULT_INCOMPLETE_COMMAND_TIMEOUT_SECONDS,
+        rate_limit: int = DEFAULT_RATE_LIMIT,
+        rate_limit_window: int = DEFAULT_RATE_LIMIT_WINDOW_SECONDS,
         host: str = LISTEN_HOST,
     ) -> None:
         # both checked here as well as in the parser, for the same reason: Server is
@@ -609,6 +670,14 @@ class Server:
         _check_not_negative(shutdown_drain_timeout, "shutdown_drain_timeout", _ZERO_SKIPS_THE_READ_LOOP)
         _check_schedulable(shutdown_drain_timeout, "shutdown_drain_timeout", "seconds")
         self.shutdown_drain_timeout = shutdown_drain_timeout
+        # the limit takes the shared zero rule and the window takes its own, which is the
+        # asymmetry --rate-limit-window's refusal names: 0 requests per second is off, and
+        # 100 requests per 0 seconds is a limiter that permits everything in silence
+        _check_not_negative(rate_limit, "rate_limit")
+        self.rate_limit = rate_limit
+        _check_rate_limit_window(rate_limit_window, "rate_limit_window")
+        _check_schedulable(rate_limit_window, "rate_limit_window", "seconds")
+        self.rate_limit_window = rate_limit_window
         _check_not_negative(max_connections, "max_connections")
         self.max_connections = max_connections
         _check_not_negative(write_buffer_high_water, "write_buffer_high_water")
@@ -973,6 +1042,16 @@ class Server:
             # guarded, because the arguments are built before logger.debug is called and this is the hot loop: at the default level an unguarded call would pay for them once per dispatched command and write nothing. the name is cut and the arguments are counted, never shown -- a command name is a bulk element and may be as large as --max-value-size, and a key or a value does not belong in a log
             if logger.isEnabledFor(logging.DEBUG):
                 logger.debug("connection %d: %r with %d arguments", conn.id, argv[0][:32], len(argv) - 1)
+            # inside the per-command loop and not once per readable event, which is the
+            # same place --write-buffer-limit is consulted and for the same reason: one
+            # recv carries a batch, so a check run per event would charge thousands of
+            # pipelined commands one unit and the limiter would bound read events rather
+            # than requests. refused means not dispatched, an error queued for that
+            # command alone, and the connection left open to send its next one -- a close
+            # would make a limiter indistinguishable from a protocol error to the client
+            if not self._rate_limit_permits(conn):
+                conn.queue(resp.encode_error(_RATE_LIMITED))
+                continue
             response, effects = commands.dispatch(self._store, conn, argv)
             # drained once per command and before the reply is queued: the queue holds
             # effects the lookups inside THIS command produced, so they precede the
@@ -1224,6 +1303,28 @@ class Server:
                     logger.exception("could not close a swept backlog socket")
         return total
 
+    def _rate_limit_permits(self, conn: Connection) -> bool:
+        """True when this command may be dispatched; spends one permit when it is."""
+        # off by default and off by this line: with no limit configured there is no window
+        # object, no clock reading and no deque, so a default server pays one attribute
+        # test per command for a feature it is not running
+        if not self.rate_limit:
+            return True
+        # the exemption, and it is a three-value test rather than `is not Role.FOLLOWER`
+        # because the roles point opposite ways: FOLLOWER is a peer syncing off us,
+        # LEADER_LINK is our own outbound connection to our leader. A two-value check
+        # classifies that link as an ordinary client and rate-limits this process's own
+        # replication stream, with no error anywhere that says so
+        if conn.role is not Role.CLIENT:
+            return True
+        window = conn.rate_limit_state
+        if window is None:
+            # built on first use rather than at accept, so a connection that never sends a
+            # command costs nothing, and so the slot stays None for the roles above
+            window = conn.rate_limit_state = ratelimit.SlidingWindow(
+                self.rate_limit, self.rate_limit_window)
+        return window.allow(time.monotonic())
+
     def _request_stop(self, signum, frame) -> None:
         self._running = False
 
@@ -1465,6 +1566,8 @@ def _parse_and_run(argv) -> None:
             write_buffer_high_water=args.write_buffer_high_water,
             write_buffer_low_water=args.write_buffer_low_water,
             incomplete_command_timeout=args.incomplete_command_timeout,
+            rate_limit=args.rate_limit,
+            rate_limit_window=args.rate_limit_window,
             host=args.host,
         )
     except persistence.SnapshotError as exc:

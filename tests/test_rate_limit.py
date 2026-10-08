@@ -1,0 +1,258 @@
+"""The sliding-window limiter, its two flags and the role exemption.
+
+Pinned at --rate-limit 100 / --rate-limit-window 1 wherever the shape matters, because
+that pairing is what makes the flood deterministic: 100 permitted, the 101st refused, and
+a boundary case exactly one window later.
+
+The window takes an injected clock reading rather than a real one. A test that slept out a
+real second would be the slowest in the suite and would still be asserting the clock
+rather than the window.
+"""
+
+import pytest
+
+import ratelimit
+import resp
+import server as server_module
+from connection import Role
+from server import DEFAULT_RATE_LIMIT, DEFAULT_RATE_LIMIT_WINDOW_SECONDS, Server, build_arg_parser
+from tests.test_server_lifecycle import listening, pump
+
+LIMIT = 100
+WINDOW = 1
+PING = b"*1\r\n$4\r\nPING\r\n"
+REFUSED = resp.encode_error(b"ERR rate limit exceeded")
+
+
+def test_the_limit_permits_exactly_its_budget_and_refuses_the_next():
+    window = ratelimit.SlidingWindow(LIMIT, WINDOW)
+    # every reading inside one window, so nothing can be popped and the count is the budget
+    assert all(window.allow(i / (LIMIT * 10)) for i in range(LIMIT)), "the budget itself was refused"
+    assert not window.allow(0.5), "the command past the budget was permitted"
+
+
+def test_the_window_slides_rather_than_resetting_on_a_boundary():
+    # a FIXED window would let 100 land at 0.99 and another 100 at 1.01, which is the burst
+    # this shape exists to prevent. so the assertion is not just that a later command is
+    # permitted, it is that the permits come back ONE AT A TIME as the old ones age out
+    #
+    # the probe is 0.5 ms past one window rather than exactly one window, and that margin is
+    # deliberate: `2.0 - WINDOW` is 1.0 exactly, but a cutoff computed from a reading that is
+    # not a dyadic rational is not -- 1.9 - 1 is 0.8999999999999999, which leaves a reading
+    # at 0.9 inside the window and refuses a command that should be permitted. an earlier
+    # draft of this test asserted at exactly one window and failed on that, against a
+    # limiter that was correct. the boundary itself gets its own test below, on values
+    # binary floating point represents exactly
+    window = ratelimit.SlidingWindow(LIMIT, WINDOW)
+    for i in range(LIMIT):
+        assert window.allow(1.0 + i / 1000)
+    assert not window.allow(1.0995), "the budget was spent and this was permitted"
+    # past the oldest reading by half a millisecond and no further: exactly one has aged out
+    assert window.allow(2.0005), "the oldest reading did not age out of the window"
+    assert not window.allow(2.0005), "two permits came back where one reading had aged out"
+
+
+def test_a_reading_exactly_one_window_old_has_left_the_window():
+    # the boundary itself, both sides of it. <= and not <, for the reason an expiry
+    # deadline equal to now is already expired
+    window = ratelimit.SlidingWindow(1, WINDOW)
+    assert window.allow(0.0)
+    assert not window.allow(0.999999), "a reading inside the window was treated as expired"
+    assert window.allow(1.0), "a reading exactly one window old was treated as still inside"
+
+
+def test_the_readings_are_popped_rather_than_counted():
+    # the failure this catches answers every other test here correctly: a window that
+    # filtered on read instead of popping would permit and refuse exactly as it should and
+    # keep one reading per request for the life of the connection
+    window = ratelimit.SlidingWindow(LIMIT, WINDOW)
+    for i in range(LIMIT * 5):
+        window.allow(float(i))
+    assert len(window) <= LIMIT, (
+        "the deque grew past the budget, so nothing is being popped and this is a leak "
+        "that behaves correctly", len(window))
+    assert len(window) == 1, (
+        "one reading per whole window should survive this spacing", len(window))
+
+
+@pytest.mark.parametrize("role", [Role.FOLLOWER, Role.LEADER_LINK],
+                         ids=["follower", "leader_link"])
+def test_a_connection_that_is_not_a_client_is_never_limited(role):
+    # both roles, separately and by name. a check written `is not Role.FOLLOWER` passes the
+    # first of these and fails the second, and the second is this process's own outbound
+    # connection to its leader -- rate-limiting that would throttle the replication stream
+    # with no error anywhere saying so. that is the whole reason the enum has three values
+    server = Server(0, rate_limit=1, rate_limit_window=WINDOW)
+    try:
+        conn = _a_connection(server, role=role)
+        for _ in range(LIMIT):
+            assert server._rate_limit_permits(conn), "%s was rate-limited" % role
+        assert conn.rate_limit_state is None, (
+            "an exempt connection was given limiter state, so the exemption is after the "
+            "window rather than before it")
+    finally:
+        server._loop.close()
+
+
+def test_a_client_is_limited_where_the_other_roles_are_not():
+    # the control for the two cases above: without it they would pass against a limiter
+    # that never refuses anybody
+    server = Server(0, rate_limit=1, rate_limit_window=WINDOW)
+    try:
+        conn = _a_connection(server, role=Role.CLIENT)
+        assert server._rate_limit_permits(conn)
+        assert not server._rate_limit_permits(conn), "the client was not limited"
+    finally:
+        server._loop.close()
+
+
+def test_the_limiter_is_off_with_no_flag_and_allocates_nothing():
+    assert DEFAULT_RATE_LIMIT == 0, "the default must be off; the benchmark depends on it"
+    assert build_arg_parser().parse_args([]).rate_limit == 0
+    server = Server(0)
+    try:
+        conn = _a_connection(server, role=Role.CLIENT)
+        for _ in range(LIMIT * 3):
+            assert server._rate_limit_permits(conn), "a default server refused a command"
+        assert conn.rate_limit_state is None, (
+            "a server with no limit built limiter state, which every command then pays for")
+    finally:
+        server._loop.close()
+
+
+def test_the_window_default_is_one_second_at_both_doors():
+    assert DEFAULT_RATE_LIMIT_WINDOW_SECONDS == 1
+    assert build_arg_parser().parse_args([]).rate_limit_window == 1
+    server = Server(0)
+    try:
+        assert server.rate_limit_window == 1
+    finally:
+        server._loop.close()
+
+
+def test_the_window_refuses_zero_with_its_own_ending_at_both_doors(capsys):
+    # every other numeric setting here reads 0 as "off". this one cannot: 100 requests per
+    # 0 seconds puts every reading instantly outside the window and permits everything, so
+    # an operator who typed it meaning "off" would get a limiter that never fires and says
+    # nothing. the refusal has to point at the flag that does turn it off
+    with pytest.raises(ValueError) as refusal:
+        Server(0, rate_limit_window=0)
+    assert "--rate-limit 0" in str(refusal.value), (
+        "the refusal does not say which flag disables the limiter", str(refusal.value))
+    with pytest.raises(SystemExit) as exited:
+        build_arg_parser().parse_args(["--rate-limit-window", "0"])
+    assert exited.value.code == 2
+    assert "--rate-limit 0" in capsys.readouterr().err
+
+    # and the ending is this flag's own, not the shared one: a test asserting only
+    # "cannot be negative" would pass for a flag handed the wrong message
+    assert "0 disables the check" not in str(refusal.value)
+
+
+@pytest.mark.parametrize("flag, value", [("--rate-limit", "-1"), ("--rate-limit-window", "-1")])
+def test_a_negative_value_is_refused_at_the_cli(flag, value, capsys):
+    with pytest.raises(SystemExit) as exited:
+        build_arg_parser().parse_args([flag, value])
+    assert exited.value.code == 2
+    assert flag.lstrip("-").replace("-", " ") in capsys.readouterr().err
+
+
+def test_a_window_past_the_scheduling_ceiling_is_refused_at_both_doors():
+    past = server_module.MAX_SCHEDULABLE_INTERVAL + 1
+    with pytest.raises(ValueError):
+        Server(0, rate_limit_window=past)
+    with pytest.raises(SystemExit):
+        build_arg_parser().parse_args(["--rate-limit-window", str(past)])
+
+
+def test_n_pipelined_commands_consume_n_units_not_one():
+    # the clause the gate names, asserted through a real accept and a real read so that the
+    # check's POSITION is what is under test: one recv carries the whole batch, and a check
+    # run once per readable event would charge all of it one unit. the budget is small so
+    # the whole thing fits in one buffer
+    budget = 4
+    with listening(rate_limit=budget, rate_limit_window=WINDOW) as (server, connect, _listener):
+        sock = connect()
+        pump(server)
+        sock.sendall(PING * (budget + 2))
+        pump(server)
+        replies = _read_until_quiet(sock)
+    assert replies.count(b"+PONG\r\n") == budget, (
+        "the batch did not consume one unit per command", replies[:200])
+    assert replies.count(REFUSED) == 2, (
+        "the commands past the budget were not refused individually", replies[:200])
+    # order matters: the permitted ones come first, then the refusals
+    assert replies == b"+PONG\r\n" * budget + REFUSED * 2, replies[:300]
+
+
+def test_a_refused_command_leaves_the_connection_open_and_serving():
+    # refused is not closed. a limiter that closed the connection would be
+    # indistinguishable from a protocol error to the client, and the next window would
+    # never arrive because the client would have to reconnect -- which also hands it a
+    # fresh budget, so closing would defeat the limit it is enforcing
+    with listening(rate_limit=1, rate_limit_window=WINDOW) as (server, connect, _listener):
+        sock = connect()
+        pump(server)
+        sock.sendall(PING * 3)
+        pump(server)
+        assert _read_until_quiet(sock) == b"+PONG\r\n" + REFUSED * 2
+        assert len(server._connections) == 1, "the refusal closed the connection"
+        assert not next(iter(server._connections)).closed
+        # and it is still being read: the window has not moved, so this is refused too,
+        # which is the proof the connection is live rather than merely unclosed
+        sock.sendall(PING)
+        pump(server)
+        assert _read_until_quiet(sock) == REFUSED
+
+
+def test_a_refused_command_is_not_dispatched():
+    # the reply says refused; this says the keyspace never saw it, which is the half a
+    # reply assertion cannot reach
+    with listening(rate_limit=1, rate_limit_window=WINDOW) as (server, connect, _listener):
+        sock = connect()
+        pump(server)
+        sock.sendall(b"*3\r\n$3\r\nSET\r\n$1\r\na\r\n$1\r\n1\r\n"
+                     b"*3\r\n$3\r\nSET\r\n$1\r\nb\r\n$1\r\n2\r\n")
+        pump(server)
+        assert _read_until_quiet(sock) == b"+OK\r\n" + REFUSED
+        assert server._store.lookup(b"a") == b"1", "the permitted write did not land"
+        assert server._store.lookup(b"b") is None, (
+            "the refused command was dispatched anyway, so the limiter only shapes replies")
+
+
+def _a_connection(server, role):
+    import socket as socket_module
+
+    from connection import Connection
+    first, second = socket_module.socketpair()
+    conn = Connection(first, ("stub", 0))
+    conn.role = role
+    server._connections.add(conn)
+    _OPENED.extend((first, second))
+    return conn
+
+
+_OPENED = []
+
+
+@pytest.fixture(autouse=True)
+def _close_the_stub_sockets():
+    yield
+    while _OPENED:
+        _OPENED.pop().close()
+
+
+def _read_until_quiet(sock, rounds=4):
+    # bounded by rounds that achieve nothing rather than by a clock: a reply this misses is
+    # a failing assertion below, not a hang
+    sock.settimeout(0.2)
+    out = bytearray()
+    for _ in range(rounds):
+        try:
+            chunk = sock.recv(65536)
+        except TimeoutError:
+            break
+        if not chunk:
+            break
+        out.extend(chunk)
+    return bytes(out)

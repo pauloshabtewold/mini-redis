@@ -25,9 +25,10 @@ REPO_ROOT = pathlib.Path(__file__).resolve().parent.parent
 
 
 @contextlib.contextmanager
-def listening():
+def listening(**settings):
+    # settings are forwarded to the Server, so a test needing a non-default one gets it here rather than rebuilding this setup: eight modules import this helper and a second copy of it is what the fourth review's finding 54(c) was
     # a real listener on an ephemeral port, driven a step at a time: exercises the accept, read and close wiring without a subprocess or a signal
-    server = Server(0)
+    server = Server(0, **settings)
     listener = server._open_listener()
     server._loop.register_listener(listener)
     server._loop._timeout = 0.02
