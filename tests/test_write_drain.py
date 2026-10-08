@@ -14,6 +14,7 @@ import types
 
 import pytest
 
+import connection as connection_module
 import server as server_module
 from connection import RECV_SIZE, Connection
 from server import Server, build_arg_parser
@@ -889,6 +890,125 @@ def test_the_survivor_walk_sums_the_receive_queues_of_every_connection_still_owi
     assert not first.closed and not second.closed, "the case under test needs both connections still owing at the deadline"
     assert server._discarded_request_bytes == len(first_sent) + len(second_sent), (
         server._discarded_request_bytes, len(first_sent), len(second_sent))
+
+
+# SKB_MAX_HEAD(0) + UNIX_SKB_FRAGS_SZ: what one buffer on an AF_UNIX stream receive queue holds --
+# a page less the shared-info footer (4,096 - 320 = 3,776) plus the 32 KiB of paged fragments one
+# sendmsg will attach to it. Measured rather than taken on faith: one non-blocking send() of 10 MiB
+# into a socketpair whose SO_SNDBUF had been raised to 2 MiB was accepted 438,528 bytes at a time
+# on Linux 6.8, which is twelve of these with nothing left over
+_UNIX_SKB_BYTES = 36_544
+
+
+def _a_kernel_that_answers_for_a_buffer_it_has_handed_over(total_sent):
+    # the answer the kernel CI runs gives, reproduced on any kernel. It walks the receive queue
+    # summing each queued buffer's WHOLE length, so a buffer whose front half a recv() has already
+    # taken is reported as still unread in full; this host's kernel sums only the part of each that
+    # nobody has taken yet. Derived from the real answer rather than from a table: what has been
+    # read is total_sent minus what is really left, and the head buffer's consumed prefix is that
+    # modulo one buffer's size, which is exactly the excess such a kernel reports
+    real = connection_module.unread_in_kernel
+
+    def answer(sock):
+        really_left = real(sock)
+        taken = total_sent - really_left
+        return really_left + taken % _UNIX_SKB_BYTES
+
+    return answer
+
+
+def test_the_figure_is_right_on_a_kernel_that_answers_for_a_buffer_it_has_handed_over(
+        make_connection, monkeypatch):
+    # the one test here whose evidence comes from a kernel this host does not have. CI reported
+    # 308,992 for this exact scenario against 280,000 sent, on both the 3.11 and the 3.13 leg and at
+    # two different commits, because one recv() of RECV_SIZE empties the first 36,544-byte buffer and
+    # leaves 28,992 bytes consumed inside the second, and a queue walk that sums whole lengths then
+    # reports 243,456 still unread where 214,464 is the truth. 65,536 + 243,456 = 308,992, and the
+    # 28,992 the read path had already counted is counted a second time -- which is not a figure
+    # being wrong by a margin, it is the additivity the five shapes are specified to have failing.
+    # Asserting against what the peer sent is what makes this independent of which kernel is
+    # running it: the substituted answer is wrong by construction, and the figure has to come out
+    # right anyway
+    server, conn = make_connection([BlockingIOError, 10])
+    conn.queue(b"x" * 10)
+    server._flush(conn)
+    _raise_the_buffers(conn._sock._sock, conn._sock.peer)
+    pipeline = _PING * 20_000
+    conn._sock.peer.settimeout(5)
+    conn._sock.peer.sendall(pipeline)
+    monkeypatch.setattr(
+        connection_module, "unread_in_kernel",
+        _a_kernel_that_answers_for_a_buffer_it_has_handed_over(len(pipeline)))
+    # the control: the substituted kernel really does over-report for this scenario, and by the
+    # amount CI reported. Without it a fix that stopped calling the ioctl at all would pass this
+    # test against an answer that happened to be correct
+    assert conn.unread_in_kernel() == len(pipeline), (
+        "before a single read the whole pipeline sits in whole buffers, where the two kernels agree")
+    server._draining = True
+
+    server._drain_for(10)
+
+    assert not conn.closed and not conn.write_buffer, (
+        "the drain was meant to end on an emptied buffer with the connection still open")
+    assert server._discarded_request_bytes == len(pipeline), (
+        server._discarded_request_bytes, len(pipeline))
+
+
+def test_the_survivor_walk_takes_the_bytes_it_counts_off_the_socket(make_connection):
+    # what makes the figure independent of the kernel's own arithmetic: the walk reads the remainder
+    # and reports what it actually got, rather than asking and reporting the answer. An emptied
+    # receive queue is the observable, and it is worth having for its own sake too -- the close
+    # _shutdown makes next is a FIN over an empty queue where it was a reset over a full one, and a
+    # reset discards whatever the flush in _close had just handed the kernel
+    server, conn = make_connection([BlockingIOError, 10])
+    conn.queue(b"x" * 10)
+    server._flush(conn)
+    _raise_the_buffers(conn._sock._sock, conn._sock.peer)
+    pipeline = _PING * 20_000
+    conn._sock.peer.settimeout(5)
+    conn._sock.peer.sendall(pipeline)
+    server._draining = True
+
+    server._drain_for(10)
+
+    assert server._discarded_request_bytes == len(pipeline), (
+        server._discarded_request_bytes, len(pipeline))
+    assert conn.unread_in_kernel() == 0, (
+        "the walk counted the remainder without taking it, so the close that follows is still a reset",
+        conn.unread_in_kernel())
+
+
+def test_the_walk_reads_no_more_than_the_kernel_claimed_when_it_was_asked(make_connection):
+    # the bound. Reading until the queue is empty would hand a peer that keeps sending a loop with no
+    # end, at a point in the stop sequence that no deadline covers -- so the ioctl's answer is a
+    # ceiling and the loop stops there whatever has arrived since. --shutdown-drain-timeout 0, so no
+    # drain pass runs and the only recv() calls in the whole stop are the walk's own, which is what
+    # lets the flood below be attributed to it
+    server, conn = make_connection([BlockingIOError])
+    conn.queue(b"x" * 10)
+    waiting = _PING * 100
+    conn._sock.peer.sendall(waiting)
+    arrives_during_the_walk = _PING * 100
+    reads = []
+    real_recv = conn._sock.recv
+
+    def recv(bufsize):
+        # a peer that sends again between the ceiling and the read that was bounded by it
+        conn._sock.peer.sendall(arrives_during_the_walk)
+        reads.append(bufsize)
+        return real_recv(bufsize)
+
+    conn._sock.recv = recv
+    server._draining = True
+
+    server._drain_for(0)
+
+    assert reads, "the walk never read, so this test bounded nothing"
+    assert server._discarded_request_bytes == len(waiting), (
+        server._discarded_request_bytes, len(waiting))
+    assert conn.unread_in_kernel() == len(arrives_during_the_walk) * len(reads), (
+        "the walk read past the ceiling it was given",
+        conn.unread_in_kernel(), len(arrives_during_the_walk), len(reads))
 
 
 def test_a_socket_closed_behind_its_connections_back_does_not_cost_the_drain_its_line(make_connection, caplog):

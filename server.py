@@ -1056,9 +1056,10 @@ class Server:
         # idempotent, because the protocol-error path closes twice: _flush closes on a failed send and the caller closes again, and a second unregister raises from inside _guard's own recovery -- the one exception that escapes the boundary and takes the process with it
         if conn.closed:
             return
-        # asked before anything below touches the socket, and only while the drain is accounting: what is still in this connection's receive queue is about to go, because a close over a non-empty one is a reset and nothing dispatches it either way. counted here rather than in _drain_for's walk so that one figure covers every connection the stop disposes of -- the ones the setup pass abandons for owing nothing, and the ones _flush closes mid-drain for a dead peer or the write-buffer limit -- and not only the ones still open when the drain ends, which _drain_for adds itself
+        # taken before anything below touches the socket, and only while the drain is accounting: what is still in this connection's receive queue is about to go, because a close over a non-empty one is a reset and nothing dispatches it either way. counted here rather than in _drain_for's walk so that one figure covers every connection the stop disposes of -- the ones the setup pass abandons for owing nothing, and the ones _flush closes mid-drain for a dead peer or the write-buffer limit -- and not only the ones still open when the drain ends, which _drain_for adds itself
+        # read off the socket rather than asked of the kernel, because this connection has been read from and that is the state the ioctl cannot be trusted in: a kernel that sums each queued buffer's whole length answers for the half of one that a previous recv already took, which the drain's read path has already counted. emptying the queue also makes the close below a FIN where it would have been a reset, so the flush on the next line keeps what it hands the kernel
         if self._counting_unread_at_close:
-            self._discarded_request_bytes += conn.unread_in_kernel()
+            self._discarded_request_bytes += conn.discard_unread_from_kernel()
         # a queued reply is owed to the client and conn.close() discards it, so take whatever the kernel will still accept. not wrapped: measured, flush() catches BlockingIOError and OSError below this point and returns False rather than raising, even on a socket whose peer is gone
         conn.flush()
         # unregister before closing: fileno() is -1 once the socket is closed, and the selector then finds the registration only by scanning its whole map for a matching object.
@@ -1209,6 +1210,12 @@ class Server:
                     "does not count what it still held", exc)
                 break
             try:
+                # the ioctl and not a read, and this is the one site where it is the answer rather
+                # than a ceiling: this socket was accepted a moment ago and nothing has ever read
+                # it, so every buffer on its receive queue is whole and a kernel that sums their
+                # whole lengths and one that sums only the unconsumed part of each cannot
+                # disagree. the two sites that ask about a connection this process has read from
+                # go through Connection.discard_unread_from_kernel() instead, where they can
                 total += unread_in_kernel(sock)
             finally:
                 try:
@@ -1279,7 +1286,7 @@ class Server:
             # the connections the drain did not dispose of: still open, so _close has not asked them yet, and holding whatever arrived that no pass of the drain reached. the set at this point holds exactly the open members of this list, since the setup pass abandoned every connection that was not added to it and nothing has been added since. what is left unaccounted is what the peer's own kernel still holds unsent, which FIONREAD cannot reach for anyone: it answers for this socket's receive queue alone. how much that is depends on the client and not on the timeout, and it is usually nothing, because this host's loopback receive queue overcommits -- FIONREAD returned a whole 1,588,890-byte pipeline against an SO_RCVBUF of 408,300, so the walk below had already counted it and the client's send queue was empty by the time this ran. where it is not nothing it equals the client's own SO_NWRITE, which is the one quantity this process cannot ask for. docs/DESIGN.md carries the measurements and says which client shape each was taken with; nothing bounds the remainder
             for conn in owing:
                 if not conn.closed:
-                    self._discarded_request_bytes += conn.unread_in_kernel()
+                    self._discarded_request_bytes += conn.discard_unread_from_kernel()
             # a close that discarded a reply leaves it in the buffer, so a connection that is closed and still has bytes queued was lost, and one that is closed with an empty buffer had everything handed to the kernel first
             closed_owing = sum(1 for conn in owing if conn.closed and conn.write_buffer)
             still_owing = sum(1 for conn in owing if not conn.closed and conn.write_buffer)

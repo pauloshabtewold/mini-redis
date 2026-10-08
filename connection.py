@@ -135,19 +135,60 @@ class Connection:
         return self._sock.fileno()
 
     def unread_in_kernel(self) -> int:
-        # how many bytes the peer has sent that this process has not read, asked of the kernel
-        # rather than read out of it, so it costs one syscall and takes nothing out of the receive
-        # queue. the one caller counts these at a stop, where they are bytes about to be thrown
-        # away: a close over a non-empty receive queue is a reset, and nothing dispatches what is
-        # sitting in it. a read is not the alternative -- reading them is what the drain already
-        # does for as long as it runs, and this is the question asked about whatever it did not
-        # reach
+        # what the kernel says the peer has sent that this process has not read, in one syscall and
+        # taking nothing out of the receive queue. it is not the figure a stop reports: on a socket
+        # this process has read from, a kernel that sums each queued buffer's whole length answers
+        # for a buffer it has already handed half of over, so discard_unread_from_kernel() below
+        # takes this as a ceiling and reads the rest to find out. the ioctl is the answer only
+        # where nothing has ever read the socket, which is the accept-backlog sweep's case and
+        # reaches the module-level function above directly, on a socket that never became a
+        # Connection
         # 0 rather than a raise for a closed socket, or a kernel that refuses the question on some
-        # descriptor this never sees, because the only caller is assembling a figure for one log
-        # line and a report that raises on the way out is worse than one that is short
+        # descriptor this never sees, because what is being assembled is a figure for one log line
+        # and a report that raises on the way out is worse than one that is short -- and a 0 here
+        # is also what keeps the loop below from running at all for such a socket
         if self.closed:
             return 0
         return unread_in_kernel(self._sock)
+
+    def discard_unread_from_kernel(self) -> int:
+        # the same quantity unread_in_kernel() answers for, established by reading it off the
+        # socket and throwing it away rather than by trusting the kernel's own figure. the ioctl is
+        # asked for a CEILING and not for the answer, because the answer is not portable: a kernel
+        # that walks its receive queue summing each queued buffer's whole length reports a buffer
+        # this process has already read half of as still unread in full, and the drain's read path
+        # has counted that half once already -- so the five shapes the figure is made of stop being
+        # additive, which is worse than a number being wrong. reads cannot find bytes that are not
+        # there, so what this returns is right on a kernel that answers either way, and the
+        # disagreement costs nothing but the syscalls. docs/DESIGN.md carries the measurements: the
+        # buffer size, the figure such a kernel reported, and what the emptied queue does to the
+        # close that follows
+        #
+        # the ceiling is also what bounds it. a peer that goes on sending while this runs cannot
+        # extend the loop past what the kernel claimed when it was asked, so this stays one bounded
+        # step at a point in the stop sequence that no deadline covers
+        #
+        # a closed socket, or a kernel that refuses the question, gives a ceiling of 0 through the
+        # method above and the loop below then does not run, which is the whole of the handling
+        # this needs for either
+        ceiling = self.unread_in_kernel()
+        discarded = 0
+        while discarded < ceiling:
+            try:
+                chunk = self._sock.recv(min(RECV_SIZE, ceiling - discarded))
+            except (OSError, ValueError):
+                # BlockingIOError is an OSError, so an emptied queue ends this loop by the same arm
+                # as a descriptor that will not answer, and neither is worth a line: the first is
+                # the ordinary way out on a kernel whose ceiling was generous, and the second is
+                # the case unread_in_kernel() already answers 0 for
+                break
+            if not chunk:
+                break
+            discarded += len(chunk)
+        # deliberately not extended into read_buffer: these bytes are discarded undispatched, and a
+        # buffer the drain's own read path counts and clears is the one place they could be counted
+        # twice
+        return discarded
 
     @property
     def has_incomplete_command(self) -> bool:
