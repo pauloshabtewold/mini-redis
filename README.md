@@ -439,9 +439,10 @@ the bound and the 99.1% as how close a sample gets. The transient peak before th
 connection is bounded by the limit plus one reply, 34,603,020 bytes at 1 MiB replies,
 and was measured to within 37,692 bytes of that. A rate-limit refusal counts as a
 reply: the refusal path queues its error and reaches the same check. Neither bound was
-exceeded in the 152, and the pause fired exactly once in every one. The pause keeps
-a client that stops reading from being closed by the limit; it does not keep it far away
-from the limit. The 32 MiB default is a choice, and a departure from the reference,
+exceeded in the 152, and the pause fired exactly once in every one. The pause postpones
+the limit for a client that stops reading and does not prevent it for one that keeps
+reading slowly; it never keeps either far away from the limit, and the paragraph on the
+pause below says why. The 32 MiB default is a choice, and a departure from the reference,
 which leaves an ordinary client's output buffer unlimited. This server does not: nothing
 else here bounds what a few kilobytes of pipelined requests can queue, and a bounded
 queue is worth being different over. `--write-buffer-limit 0` is the reference's
@@ -469,10 +470,19 @@ queues the whole list as one reply, judged whole against the limit, so a list of
 elements that are all far under the cap can be stored and not read back at any finite
 limit, and a `KEYS` reply is judged the same way. Only 0 reads every one of them back.
 
-**A client that stops reading is paused, not closed.** The pause is what keeps
-`--write-buffer-limit` from firing for it, not what keeps it away from the limit;
+**A client that stops reading entirely is paused, not closed. One that merely reads
+slowly is closed.** The pause postpones `--write-buffer-limit` for the first and does not
+prevent it for the second, and it never keeps either away from the limit. The reason is
+that the pause manufactures the batch the limit is judged against: a paused connection's
+requests pile up in its kernel receive queue, the resume reads that pile in one go, and
+every command in it is answered, so "the replies to one read's batch" is not bounded by
+the mark at all. At the shipped defaults a client that never pipelines — one request per
+`send()` — and reads steadily but slower than this server produces is closed mid-reply,
+with the value still stored; `--write-buffer-limit 0` is what prevents that, and a
+lock-step client that reads each whole reply before sending again is safe at the
+defaults. `docs/DESIGN.md` has the measurement and the two controls.
 `--incomplete-command-timeout` is suspended for every paused connection, whatever it has
-or has not sent, so that flag does not bound it either; and it holds what is already
+or has not sent, so that flag does not bound it either; and the pause holds what is already
 queued for it, at least the high-water mark's worth plus whatever the one batch that
 crossed the mark queued, until it disconnects. That is bounded: per connection by the
 mark plus that batch, which the limit itself caps while the limit is on — the
@@ -598,13 +608,19 @@ leaving the snapshot it could not replace intact. At `--snapshot-interval 0` the
 does not run, so a path no save could write -- a directory that does not exist, say --
 starts without complaint and fails at the first save there is, which is the one a clean
 stop makes on the way out: the failure is logged, and the exit status stays `0`. What
-such a failure reports is bounded: the first one is logged with its traceback, and after
+such a failure reports is bounded: the first one is logged as one line naming the
+exception's class and what it says, which for an `OSError` is the errno and the path it
+failed on, and after
 that a single line says how many times in a row it has now failed, once per hundred.
+No traceback, at either step, and for a reason the same bound is about: rendering one
+opens source files, and a descriptor table with no room left is one of the ways every
+task guarded there fails, so the attempt would fail the same way and leave the operator
+`--- Logging error ---` and no account at all.
 That bound is not cosmetic. Logging writes to standard error with a blocking write, and
 this server has one thread, so a reader that stops — a stalled collector, a pipeline
 whose far end died — can fill its buffer and park the loop inside the tick, after which
 nothing is served and nothing more is logged. A failure that repeats on a timer would
-write a traceback every interval for as long as the server ran, and the bound above stops
+write its line every interval for as long as the server ran, and the bound above stops
 that one; it is not the only writer that can fill the buffer, and the connection lines
 further down are the others. The residual is that a buffer filled from any of them still
 parks the next write, and closing that needs either a descriptor this process does not own
@@ -635,12 +651,21 @@ form of it that keeps that file in place. Left set permanently -- in a unit file
 it starts every restart with an empty keyspace, not just the first, because it never
 reads the file.
 
-**A clean stop saves, and a crash can still lose recent writes.** On `SIGINT` or
-`SIGTERM` the server writes a snapshot of the keyspace as it stood when the loop
+**A clean stop saves, and a crash can still lose recent writes.** On `SIGTERM`, and on
+`SIGINT` unless this process inherited that signal ignored, the server writes a snapshot
+of the keyspace as it stood when the loop
 stopped, and then spends up to `--shutdown-drain-timeout` seconds sending the replies
 already queued for its clients before it exits; a save that fails is logged and the stop
 carries on, and the one pairing of flags that skips the save is the one described with
-the persistence flags above. What a crash leaves is the window between two saves: a
+the persistence flags above. The exception is not a corner. `nohup`, `setsid` and a
+non-interactive shell's background job each hand a child `SIGINT` set to `SIG_IGN`, and a
+server started that way installs no handler for it, by choice: a disposition this process
+inherited as ignored is one its parent meant it to ignore, and overriding it would make
+`SIGINT` stop a server the operator had arranged could not be stopped that way. So a
+`SIGINT` sent to such a server does nothing at all — no save, no drain, no log line, and
+the process goes on serving — and `SIGTERM` is what stops it. Measured: ignored, still
+answering `PONG`, and `SIGTERM` then exiting 0 with a snapshot written.
+What a crash leaves is the window between two saves: a
 `SIGKILL`, a power cut or a process that dies mid-run loses whatever the last save did
 not hold. The interval is counted from the moment a save finishes rather than from the
 moment it starts — the rule `CONFIG GET save` publishes, and the reference's own — so
@@ -673,7 +698,7 @@ one part this flag limits. The wait for the loop to notice the signal, up to one
 what the keyspace costs; the two sweeps and the reads that empty and count the
 receive queues have no deadline of their own, and the teardown's flush, described
 below, comes after the drain and has none either. This flag limits none of these.
-On `SIGINT` or `SIGTERM` the loop stops, and then, before anything
+On a stop signal -- `SIGTERM`, or `SIGINT` where that signal was not inherited ignored -- the loop stops, and then, before anything
 is torn down: the listening socket leaves the select set, so no connection that arrives
 from here on is served, though the socket itself stays open until the teardown and a
 replacement server cannot bind the port while this process is still running; a snapshot
@@ -988,7 +1013,8 @@ The `until` line is not decoration. `docker run -d` returns as soon as the conta
 created, and a `PING` sent before the server has bound answers
 `Error: Server closed the connection` -- 3 of 3 without it. The server prints
 `listening on` once the listener is bound, which `run()` does after installing its own
-stop handlers, for `SIGTERM` and `SIGINT`, and so after the snapshot has loaded. That is
+stop handlers, for `SIGTERM` always and for `SIGINT` unless the process inherited that
+signal ignored, and so after the snapshot has loaded. That is
 what makes it the right line to wait for before sending a command, and the same line the
 test suite's own launcher reads; it is a later point than the one `main()`'s handler
 marks, which the paragraphs below measure. A stop that arrives during startup prints it

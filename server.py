@@ -469,10 +469,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
         metavar="BYTES",
         help="close a connection whose queued replies still exceed BYTES once the kernel "
              "has taken what it will; 0 means no limit, and nothing is closed for it. "
-             "with --write-buffer-high-water in force this bounds a reply larger than "
-             "BYTES, or the replies to one read's batch of pipelined requests, rather "
-             "than a client that reads slowly, and a value stored under "
-             "--max-value-size can be too large to read back under it",
+             "this is a hard limit and it closes a connection for holding too much, "
+             "not for failing to read: a client that reads slower than this server "
+             "produces reaches it too, and the pause above does not prevent that, since "
+             "the resume reads a paused connection's whole piled-up receive queue in one "
+             "go and every command in it is answered. 0 is what prevents it. a value "
+             "stored under --max-value-size can also be too large to read back under it",
     )
     parser.add_argument(
         "--max-value-size",
@@ -1138,8 +1140,7 @@ class Server:
         # that has stopped reading cannot slow it down, because a client that writes its
         # requests before reading any reply then blocks in send() waiting for room only
         # its own reading would create, and both sides wait forever. the pause below
-        # refuses to read anyway and accepts that cost, because it holds a slow reader
-        # where the limit alone would close it; docs/DESIGN.md has why. the reference
+        # refuses to read anyway and accepts that cost, for the pipelining client alone. it does not save a slow reader: the resume reads the whole receive queue that piled up while the connection was paused, and every command in it is answered, so the pause manufactures the oversized batch this check then judges. measured at the shipped defaults, a client sending one GET of a 1 MiB value per send() and reading 64 KiB every 20 ms is closed here; docs/DESIGN.md has the figures. the reference
         # closes here too. a follower link would have needed exempting from this, on the
         # same reasoning that would have kept it off the rate limiter -- a follower that
         # falls behind is not a client that has stopped reading -- but replication is
