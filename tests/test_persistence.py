@@ -1586,3 +1586,62 @@ def test_check_writable_writes_nothing_into_the_directory_it_checks(tmp_path):
     assert entries_after == entries_before, (
         "the check changed what stands in the directory it was asked about",
         entries_before, entries_after)
+
+
+def test_check_writable_refuses_a_device_that_takes_the_file_but_not_the_bytes(
+    tmp_path, monkeypatch
+):
+    # the defect this exists for: the probe created and removed a file and never wrote to
+    # it, so a device with no room left passed the one check whose job is to refuse a path
+    # the first save fails on. measured on a hard-filled APFS volume, where df still
+    # reported 1,012 KiB available: mkstemp succeeded and one byte answered ENOSPC. the
+    # write is substituted here for the same reason test_write_drain.py substitutes
+    # FIONREAD -- filling a real device is not something a unit test can do, and the
+    # question is whether check_writable asks at all
+    written = []
+    real_write = os.write
+
+    def no_room(descriptor, data):
+        written.append(data)
+        raise OSError(errno.ENOSPC, "No space left on device")
+
+    monkeypatch.setattr(os, "write", no_room)
+    with pytest.raises(persistence.SnapshotError, match="not the bytes a save writes"):
+        persistence.check_writable(str(tmp_path / "dump.mrdb"))
+    monkeypatch.setattr(os, "write", real_write)
+    assert written, (
+        "check_writable never wrote to its probe, so a device out of room passes it and "
+        "the keyspace is lost at the first save instead")
+    assert len(written[0]) >= 1, (
+        "the probe has to write at least one byte: a zero-length write is what the device "
+        "accepts and is the behaviour this test exists to refuse", written)
+    # and the probe is not left behind, since a stranded file is reported at every later
+    # start as one an interrupted save may have left
+    assert not list(tmp_path.iterdir()), (
+        "the refusal stranded its own probe file", [p.name for p in tmp_path.iterdir()])
+
+
+def test_check_writable_refuses_a_device_whose_sync_cannot_allocate(tmp_path, monkeypatch):
+    # a filesystem that defers allocation answers at the flush and not at the write, which
+    # is ext4 and so the platform the image runs, so the probe syncs as well as writes
+    synced = []
+
+    def no_room(descriptor):
+        synced.append(descriptor)
+        raise OSError(errno.ENOSPC, "No space left on device")
+
+    monkeypatch.setattr(persistence, "_sync_to_the_device", no_room)
+    with pytest.raises(persistence.SnapshotError, match="not the bytes a save writes"):
+        persistence.check_writable(str(tmp_path / "dump.mrdb"))
+    assert synced, "check_writable never synced its probe"
+    assert not list(tmp_path.iterdir()), (
+        "the refusal stranded its own probe file", [p.name for p in tmp_path.iterdir()])
+
+
+def test_check_writable_still_accepts_a_directory_with_room(tmp_path):
+    # the control: the write and the sync are added to a check that must still pass the
+    # paths it passed before, or the server refuses to start on every ordinary directory
+    persistence.check_writable(str(tmp_path / "dump.mrdb"))
+    assert not list(tmp_path.iterdir()), (
+        "the probe was left behind on the accepting path",
+        [p.name for p in tmp_path.iterdir()])

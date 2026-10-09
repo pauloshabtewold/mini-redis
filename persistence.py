@@ -415,12 +415,22 @@ def check_writable(path: str) -> None:
     the rename that finishes a save -- the one operation a trial below cannot perform
     without destroying the snapshot, so it is checked separately rather than by trying
     it. Everything else is checked by trying it: a file made in `path`'s own directory
-    with the same prefix and suffix `save()`'s temporary file uses, then removed. A
-    server started over a path this refuses answers every write and loses all of them,
-    with a traceback per interval as the only sign, so the refusal belongs before it
-    starts. This sees the directory, and the existing snapshot if there is one, as they
-    are at the call -- a directory made read-only afterwards, an ACL changed afterwards,
-    or a disk that fills up later, is met by the save itself, not by this.
+    with the same prefix and suffix `save()`'s temporary file uses, written to, synced,
+    then removed. A server started over a path this refuses answers every write and
+    loses all of them, with one logged failure per interval as the only sign, so the
+    refusal belongs before it starts. This sees the directory, and the existing snapshot
+    if there is one, as they are at the call -- a directory made read-only afterwards, an
+    ACL changed afterwards, or a device that fills up afterwards, is met by the save
+    itself, not by this.
+
+    The write is one byte, so what it answers is whether the device takes a byte, not
+    whether it has room for the next snapshot, whose size this cannot know. A device
+    with room for the probe and not for the keyspace therefore starts and fails at the
+    save, exactly as one that filled up afterwards does. What the byte does catch is a
+    device already out of room at the call, which a probe that wrote nothing did not: a
+    volume with no room left accepts the directory entry and refuses the first byte, and
+    before the write was added such a path started, answered `SET` with `OK` and lost the
+    keyspace at the stop under a drain line reading complete.
 
     So is one thing present at the call: a permission that blocks the removal of the
     existing snapshot's own directory entry, which is what the rename needs and what no
@@ -430,8 +440,8 @@ def check_writable(path: str) -> None:
     that; a version of this check did the latter, and in two rounds it deleted a file it
     had not created and made concurrent starts refuse each other, to catch a configuration
     that fails safely anyway. Uncaught, such a path starts and then fails every save,
-    leaving the snapshot it could not replace intact: the first failure carries its
-    traceback and the repeats after it are counted rather than reprinted, because what
+    leaving the snapshot it could not replace intact: the first failure names the
+    exception and the repeats after it are counted rather than reprinted, because what
     fails here fails once an interval for as long as the server runs, and `server.py`'s
     `_guard_task` says what an unbounded stream of them costs. That is the trade: this
     check refuses what it can prove, and does not write into the operator's directory to
@@ -495,6 +505,24 @@ def check_writable(path: str) -> None:
                 "cannot write snapshot %s: %s is not writable: %s"
                 % (path, directory, exc)) from exc
         raise SnapshotError("cannot write snapshot %s: %s" % (path, exc)) from exc
+    # a save's defining act is the write, and a device with no room takes the directory entry and refuses the bytes, so a probe that only creates and removes a file passes a path the first save fails on, measured: a volume df called 1,012 KiB available accepted the mkstemp and answered ENOSPC to one byte
+    # synced as well as written, because a filesystem that defers allocation answers at the flush rather than at the write, and Linux is what the image runs
+    try:
+        os.write(descriptor, b"\0")
+        _sync_to_the_device(descriptor)
+    except OSError as exc:
+        # best-effort, since the refusal below is what the operator acts on and a probe left behind is named by stale_temporaries() at the next start
+        try:
+            os.close(descriptor)
+        except OSError:
+            pass
+        try:
+            os.remove(probe_path)
+        except OSError:
+            pass
+        raise SnapshotError(
+            "cannot write snapshot %s: %s took the file but not the bytes a save writes: %s"
+            % (path, directory, exc)) from exc
     try:
         os.close(descriptor)
     except OSError:
@@ -503,7 +531,7 @@ def check_writable(path: str) -> None:
         os.remove(probe_path)
     except OSError as exc:
         # the probe file itself is stranded by the same failure that refuses the start,
-        # so the refusal names it: it is empty, it is the operator's to remove, and at
+        # so the refusal names it: it is the operator's to remove, and at
         # the next start it is reported among the files an interrupted save may have
         # left, where its name alone cannot say which of the two it is
         raise SnapshotError(

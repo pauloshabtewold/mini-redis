@@ -970,8 +970,8 @@ class Server:
                 # the handler swallows it, which leaves the operator "--- Logging error ---" and
                 # no account of what failed: measured, a full table lost the whole shutdown save
                 # and printed nothing else, under a drain line reading complete and exit 0.
-                # %r rather than %s because OSError's str() drops the errno
-                logger.error("%s failed: %r", what, exc)
+                # the class name and str(exc), not %r: OSError's str() carries the errno AND the path, "[Errno 2] No such file or directory: '/no/such/dir/dump.mrdb'", where %r gives "FileNotFoundError(2, 'No such file or directory')" and drops the one thing an operator needs. the class is named separately because str() of an exception raised with no argument is empty
+                logger.error("%s failed: %s: %s", what, type(exc).__name__, exc)
             elif failures % FAILURE_REPEATS_PER_LINE == 0:
                 # no traceback and no exc_info: this line exists to say the failure is
                 # still going, and the one that named it is already in the log above
