@@ -543,8 +543,13 @@ def build_arg_parser() -> argparse.ArgumentParser:
         metavar="SECONDS",
         help="on SIGTERM, and on SIGINT unless this process inherited it ignored, save a snapshot and then keep sending the replies "
              "already queued for clients, for no longer than SECONDS plus one "
-             f"{SELECT_TIMEOUT_SECONDS} second select() timeout, before exiting whether "
-             "or not the kernel took all of them. 0 is not unlimited here, it is the "
+             f"{SELECT_TIMEOUT_SECONDS} second select() timeout, then exit whether "
+             "or not the kernel took all of them. that bounds the WAIT and not the "
+             "exit: the snapshot save ahead of it, the two sweeps of the accept "
+             "backlog, the reads that empty the receive queues and the teardown's "
+             "final flush all sit outside it and have no deadline of their own, so "
+             "signal-to-exit runs over SECONDS by however much those cost. 0 is not "
+             "unlimited here, it is the "
              "opposite: no drain pass, so whatever the kernel will not take in one "
              "pass is discarded, and a request still unread at the close can take the "
              "kernel's unsent tail with it",

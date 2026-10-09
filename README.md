@@ -54,8 +54,8 @@ redis-benchmark -h 127.0.0.1 -p <port> -n 100000 -c 50 -P 1 -q \
   -t ping_mbulk,set,get,incr,lpush,rpush,lpop,rpop,lrange_100,lrange_600
 ```
 
-`-q` prints a rate and nothing else, so the table below comes from the same command
-without `-q`, the only form that reports the latency distribution; each row's rate and
+`-q` prints a rate and one point of the distribution, `p50`, so the table below comes
+from the same command without `-q`, the only form that reports the distribution whole; each row's rate and
 p99 come from the same run. **Each row is one run, and one run is worth less than it
 looks on this machine.** Re-running the whole set moved individual rates by as much as
 twenty per cent and some p99 figures by half again -- `PING_MBULK` came back at 65,147
@@ -262,7 +262,8 @@ At the pinned request count, with `redis-benchmark` 7.2.7 driving each of the tw
 servers in turn, the run reports nothing missing: over nine alternated pairs of runs, a
 real `redis-server 7.2.7` carried 4 lines with the seeding label in four of the five
 runs at load 6.5 or below, the fifth run's count not being recorded, and 5 to 11 at
-higher load, eleven having reproduced once, at load 8.05, and this server carried 7 or 8
+higher load -- though 5 has since been measured at load 4.21, the lowest reading in a
+later set, so do not read 4 as the low-load count, eleven having reproduced once, at load 8.05, and this server carried 7 or 8
 below that load and 8 or 9 above it. How many there are is not fixed — the reason is
 the repainting described below — and the gap between the servers is not constant
 either: 3 or 4 lines at load 6.5 or below and from -2 to +4 above it, this server's
@@ -393,8 +394,11 @@ wraps the batch in `MULTI`/`EXEC`, neither of which this server implements, so i
 on `EXEC`. `r.pipeline(transaction=False)` sends the same commands and works for a batch
 of some tens of thousands of small commands. It packs the whole batch and writes it
 before it reads any reply, which is the client the pause described under the water marks
-below leaves hanging, so a batch of hundreds of thousands can hang it at the shipped
-defaults; `--write-buffer-high-water 0` is what lets it complete. `redis-benchmark`'s
+below leaves hanging. What decides it is the total size of the replies against the
+high-water mark and not the number of commands, so no count is the threshold: 300,000
+`SET`s, whose replies are five bytes each, completed in 2.27 s, while 600,000 hung and
+300,000 `PING`s hung in two attempts of four and completed in about a second in the
+other two. `--write-buffer-high-water 0` is what lets any of them complete. `redis-benchmark`'s
 default run completes nine tests — `PING_INLINE` and `PING_MBULK` both, then `SET`,
 `GET`, `INCR`, `LPUSH`, `RPUSH`, `LPOP` and `RPOP` — and exits at `SADD`, the first
 command in its sequence this server does not implement at all. Two of the nine are `PING`,
@@ -624,8 +628,15 @@ measurements and the reasoning.
 
 **Four more flags cover persistence and the active sweep.** Persistence is on by
 default. `--snapshot-path` names the file a snapshot is written to and read back from
-and defaults to `./dump.mrdb`, resolved against the directory the server was started in;
-a file that is present but will not decode refuses startup rather than starting empty
+and defaults to `./dump.mrdb`, resolved against the directory the server was started in.
+Nothing stops two servers sharing one, and the default plus one working directory is how
+that happens: start the Quickstart twice in the same place and both answer `+OK`, both
+exit 0, and the last stop to run overwrites the other's keyspace with its own. There is
+no lock and no warning in either log, and neither process can tell the other is there.
+Give each server its own `--snapshot-path`, or its own directory. The reference behaves
+the same way with a shared `dir`, which is the only reason this is a caveat here rather
+than a defect.
+A file that is present but will not decode refuses startup rather than starting empty
 over it, and so does anything else at that path that is not a regular file -- a
 directory, a named pipe. Whenever `--snapshot-interval` is non-zero, the startup check
 tries the write it guards against rather than only inspecting the path: it creates and
@@ -704,7 +715,11 @@ answering `PONG`, and `SIGTERM` then exiting 0 with a snapshot written.
 What a crash leaves is the window between two saves: a
 `SIGKILL`, a power cut or a process that dies mid-run loses whatever the last save did
 not hold. The interval is counted from the moment a save finishes rather than from the
-moment it starts — the rule `CONFIG GET save` publishes, and the reference's own — so
+moment it starts — the rule `CONFIG GET save` publishes, and the reference's own. That
+reply is spelt in the reference's syntax, where a rule fires once a clock is *more than*
+`<seconds>` past the last save, so this server's one-save-every-N rule reads as `N-1 0`
+and a default server answers `59 0` rather than `60 0`. It is not an off-by-one;
+`docs/DESIGN.md` has why that spelling is the honest one. So
 the window between two saves is the interval plus the duration of the one before it. At
 the default and the snapshot size measured below that is a little over sixty seconds; on
 a keyspace large enough for a save to outlast its own interval it is the interval plus
@@ -937,8 +952,15 @@ into a bound on memory.
 once its connection has been permitted REQUESTS commands inside the last
 `--rate-limit-window SECONDS` (default `1`, whole seconds). Permitted, and not
 sent: a refusal records nothing, so a connection can send more than REQUESTS
-commands in a window, and a client was permitted at 8 sends inside a 2 s window
-with a limit of 5. `0` turns the limiter off, and it is off unless asked for: the
+commands in a window: with a limit of 5 and a 2 s window, a client whose 8 sends spanned
+3.1 s was permitted 7 of them. Spread is what buys that, not the refusals — the same 8
+sends inside one 2 s window were permitted 5 and refused 3, and no window span in any
+run held more than 5 permits. A client library's own handshake spends the budget too, and
+`redis-py`'s spends two of it: it opens with two `CLIENT SETINFO` commands, which this
+server answers `unknown command`, and a refusal of that kind spends the permit exactly as
+a dispatched command does. So `--rate-limit N` leaves a `redis-py` client N minus 2 for
+its own work, and at `--rate-limit 1` or `2` it cannot run a single user command.
+`0` turns the limiter off, and it is off unless asked for: the
 benchmark above uses `-c 50`, and a limiter that was on would have measured its own
 rejection path. The window slides rather than resetting on a fixed boundary, so no burst
 straddles one, and it is counted on the monotonic clock. The count is of commands and
@@ -958,7 +980,9 @@ stays open and is still read, and its next command is judged on its own, because
 close would look to the client like a protocol error and the reconnect that followed
 would arrive with a full budget. That holds while the queue of replies stays under
 `--write-buffer-limit`: a refusal is a reply like any other and the limit applies to
-it, so under a small configured limit ten refusals closed the connection. The budget is
+it. What that takes is more refusals than the kernel will absorb, and not many: the
+limit is judged after the send, and on loopback ten refusals' 267 bytes leave every
+time, so ten do not close the connection and about fifty thousand do. The budget is
 per connection and not per address, and that is the cost: a client that closes and
 reconnects starts again with a full one. I documented that rather than engineering it
 away, since counting per address needs a table shared between connections and this loop
@@ -1040,8 +1064,11 @@ The `listening on 127.0.0.1:<port>` line at startup is what tells you this one a
 ```
 
 The four crash-consistency tests kill a real server with `SIGKILL` and check what a
-restart recovers. Each run takes seconds where the rest of the suite takes milliseconds,
-so `pyproject.toml` deselects them, and
+restart recovers. They are deselected for what they do rather than for what they cost:
+each starts servers of its own and waits out a real snapshot interval, so a default run
+neither kills a process nor sits on a wall clock. They are not the slow part of the
+suite -- all four together are about 6 s, where a default run's own slowest two tests
+are about 10 s and 8 s. So `pyproject.toml` deselects them, and
 `python -m pytest -m manual tests/test_crash_consistency.py` selects them.
 
 ### In a container
