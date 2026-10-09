@@ -410,6 +410,18 @@ protocol version`, so every call fails before it reaches any of the commands abo
 unless the client is built with `protocol=2`, which everything above about `redis-py`
 assumes.
 
+`redis-cli` works for ordinary commands and for `--pipe`, `-x`, `-r`, `--no-raw`,
+`--stat` and `--latency`, and the modes that walk the keyspace do not work at all, because
+`SCAN` is not implemented: `--scan`, `--bigkeys` and `--memkeys` each print
+`SCAN error: ERR unknown command 'SCAN'` and stop. Two of them print it *before* their own
+"Scanning the entire keyspace" banner, so the banner reads as though the scan is starting
+when it has already failed. `--eval` needs `EVAL` and `--rdb` needs `SYNC`, neither of
+which exists here. Three more print a failure and then work anyway: `-a` and `--user`
+send `AUTH`, and `-3` and `--json` send `HELLO 3`, so you see one line of complaint and
+then correct output. The interactive prompt works, and quietly has no argument hints:
+`redis-cli` asks for them with `COMMAND DOCS` and then bare `COMMAND`, both answer
+`unknown command`, and the client swallows both.
+
 **Nothing bounds how much memory a client can use.** There is no cap on key count, no
 cap on total keyspace size, and no eviction policy to fall back on if there were — a
 client with nothing but `SET` can grow the process until the host runs out of memory.
@@ -496,7 +508,11 @@ limit, because the limit is judged after the send, on what the kernel would not 
 For a reply well over the limit that is nearly every time, and for one only just over
 it, such as a 32 MiB value's, 13 bytes over, almost never. The reply is the value plus
 its `$<length>` line and terminator, so the range begins at 33,554,420 bytes, twelve
-under 32 MiB, and runs to the size cap. The value stays stored either way. A hard limit
+under 32 MiB, and runs to the size cap. The value stays stored either way, and the client
+is told nothing: it receives as much of the reply as the kernel took and then a closed
+connection, with no error, which is indistinguishable from the server having crashed.
+`redis-cli` renders it as `Error: Server closed the connection`. The account is on the
+server's own log, as a warning naming the queued size and the limit. A hard limit
 does the same in the reference, so the choice here is to say so and leave both numbers
 alone; `docs/DESIGN.md` has the sizes measured against this server and against the
 reference. To read back every string value the size cap admits, set
@@ -671,7 +687,12 @@ write its line every interval for as long as the server ran, and the bound above
 that one; it is not the only writer that can fill the buffer, and the connection lines
 further down are the others. The residual is that a buffer filled from any of them still
 parks the next write, and closing that needs either a descriptor this process does not own
-or a second thread. A save writes a
+or a second thread. A snapshot this server creates is `0600`, but a save replaces an
+existing entry rather than creating one, and it carries that entry's mode over — through
+`stat`, so through a symlink. So the file's permissions are whatever was at the path
+before, and a world-readable entry there leaves the keyspace world-readable. This server
+has no authentication and the snapshot is the keyspace on disk, so if that matters, own
+the path. A save writes a
 temporary file beside the snapshot, named after it, and renames it into place; a file
 left under that name, as a process killed mid-save leaves one, is never read or removed,
 and every start over the same path names it in a warning, so long as the directory can
@@ -710,7 +731,14 @@ server started that way installs no handler for it, by choice: a disposition thi
 inherited as ignored is one its parent meant it to ignore, and overriding it would make
 `SIGINT` stop a server the operator had arranged could not be stopped that way. So a
 `SIGINT` sent to such a server does nothing at all — no save, no drain, no log line, and
-the process goes on serving — and `SIGTERM` is what stops it. Measured: ignored, still
+the process goes on serving — and `SIGTERM` is what stops it. One place `SIGINT` does
+something else: during the snapshot load, before `run()` has armed anything, it is still
+Python's own default handler, and it abandons the load with a `KeyboardInterrupt`
+traceback and a non-zero exit rather than the one `error:` line every other startup
+failure here gives. That is deliberate — Ctrl-C has to be able to abandon a load that is
+going to take a while — and nothing is lost, since the listener is not bound yet, so no
+write can have been acknowledged and the snapshot is left byte-unchanged. It simply looks
+like a crash, and is not. Measured: ignored, still
 answering `PONG`, and `SIGTERM` then exiting 0 with a snapshot written.
 What a crash leaves is the window between two saves: a
 `SIGKILL`, a power cut or a process that dies mid-run loses whatever the last save did
@@ -763,7 +791,11 @@ is torn down: the listening socket leaves the select set, so no connection that 
 from here on is served, though the socket itself stays open until the teardown and a
 replacement server cannot bind the port while this process is still running; a snapshot
 is saved; and the server spends up to SECONDS sending the replies already queued for
-clients, then exits whether or not the kernel took all of them. The save comes before
+clients, then exits whether or not the kernel took all of them. Nothing shortens that
+wait once it has begun: a second `SIGINT` or `SIGTERM` is not a second stop, the handler
+has already done its work, and a drain held open by a client that never reads runs to its
+full timeout however many signals arrive. `SIGKILL` is the only thing that ends it early,
+and it ends the save and the teardown with it. The save comes before
 the drain on purpose. A client that never reads holds the drain to its whole timeout,
 and an operator who gives up and sends `SIGKILL` should not find that the snapshot was
 the thing waiting behind it. It runs whether or not `--snapshot-interval` is `0`: that
