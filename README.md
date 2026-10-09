@@ -25,8 +25,8 @@ tag does not contain it and the tree does, and it is off unless `--rate-limit` i
 **Two tags, and neither is where the tree is.** `v1` is the commit the build ended at
 and `v1.5` the commit the rate limiter closed at, and both stay where they are: moving a
 pushed tag rewrites what anyone who already fetched it sees. So the tree is past both of
-them, and deliberately — every commit since has either repaired something a cold review
-of the closing commits found or corrected something this front page claimed. Read a tag
+them, and deliberately — every commit since has either repaired something found in the
+closing commits or corrected something this front page claimed. Read a tag
 as the milestone it marks, and `main` as what the server is. `git rev-list v1..HEAD
 --count` says how far apart they are, and it keeps moving.
 [Benchmark](#benchmark) has what the server costs against real Redis, and
