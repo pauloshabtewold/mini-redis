@@ -10,7 +10,11 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        python-version: ["3.11", "3.13"]
+        # 3.11 is the floor requires-python states, 3.14 is what `python3` resolves to on a
+        # current machine and so what the quickstart's own `python3 -m venv` produces, and 3.13 is
+        # between them. The floor and the ceiling are the two that can break; 3.13 is kept because
+        # the published figures were taken on it
+        python-version: ["3.11", "3.13", "3.14"]
     steps:
       - uses: actions/checkout@v7
       - uses: actions/setup-python@v7
@@ -24,3 +28,32 @@ jobs:
         run: pip install -e '.[dev]'
       - name: Run tests
         run: python -m pytest
+      # a separate step rather than addopts, so a warning that becomes an error shows as its own
+      # failure and not as a suite that broke. it ran green on a host and nowhere else for weeks,
+      # which is how a red build outlived two rounds of review of this same repository
+      - name: Run tests with warnings as errors
+        run: python -m pytest -W error
+
+  package:
+    # the path MANIFEST.in exists for, and the one that broke once: setuptools' default sdist glob
+    # leaves out the package marker and both non-test-prefixed helpers the test modules import, so
+    # the packaged suite died at import. Nothing re-checked it until this job, and nothing
+    # published said how to build one
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.13"
+      - name: Install redis-tools
+        run: sudo apt-get update && sudo apt-get install -y redis-tools
+      - name: Build a source distribution and a wheel
+        run: |
+          pip install -e '.[build]'
+          python -m build
+      - name: Install the sdist and run the suite it ships
+        run: |
+          python -m venv /tmp/sdist-venv
+          /tmp/sdist-venv/bin/pip install "$(ls dist/*.tar.gz)[dev]"
+          mkdir -p /tmp/unpacked && tar -xzf dist/*.tar.gz -C /tmp/unpacked
+          cd /tmp/unpacked/* && /tmp/sdist-venv/bin/python -m pytest -q

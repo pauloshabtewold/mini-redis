@@ -479,7 +479,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
         default=DEFAULT_WRITE_BUFFER_LIMIT,
         metavar="BYTES",
         help="close a connection whose queued replies still exceed BYTES once the kernel "
-             "has taken what it will; 0 means no limit, and nothing is closed for it. "
+             f"has taken what it will; the default is {DEFAULT_WRITE_BUFFER_LIMIT} ({DEFAULT_WRITE_BUFFER_LIMIT // (1024 * 1024)} MiB). 0 means no limit, and nothing is closed for it. "
              "this is a hard limit and it closes a connection for holding too much, "
              "not for failing to read: a client that reads slower than this server "
              "produces reaches it too, and the pause above does not prevent that, since "
@@ -493,14 +493,16 @@ def build_arg_parser() -> argparse.ArgumentParser:
         default=DEFAULT_MAX_VALUE_SIZE,
         metavar="BYTES",
         help="refuse a single inbound bulk element -- including the command name and "
-             "any key -- declaring more than BYTES; 0 disables the check",
+             f"any key -- declaring more than BYTES; the default is {DEFAULT_MAX_VALUE_SIZE}"
+             f" ({DEFAULT_MAX_VALUE_SIZE // (1024 * 1024)} MiB). 0 disables the check",
     )
     parser.add_argument(
         "--max-multibulk",
         type=_max_multibulk,
         default=DEFAULT_MAX_MULTIBULK,
         metavar="COUNT",
-        help="refuse a command declaring more than COUNT elements; 0 disables the check",
+        help=f"refuse a command declaring more than COUNT elements; the default is"
+             f" {DEFAULT_MAX_MULTIBULK}. 0 disables the check",
     )
     parser.add_argument(
         "--snapshot-path",
@@ -511,7 +513,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
              "PATH cannot be loaded, unless --ignore-snapshot is given, and, with a "
              "non-zero --snapshot-interval, if a save could not write PATH as things "
              "stand at startup -- a missing or read-only directory, or a directory "
-             "standing at PATH",
+             f"standing at PATH. the default is {DEFAULT_SNAPSHOT_PATH}, resolved against the"
+             " directory the server was started in, so leaving this off still writes a file",
     )
     parser.add_argument(
         "--snapshot-interval",
@@ -520,7 +523,10 @@ def build_arg_parser() -> argparse.ArgumentParser:
         metavar="SECONDS",
         help="save a snapshot to --snapshot-path every SECONDS, and on a clean stop; 0 "
              "disables the periodic save only -- a clean stop still saves, except with "
-             "--ignore-snapshot, where 0 leaves the file at --snapshot-path alone",
+             f"--ignore-snapshot, where 0 leaves the file at --snapshot-path alone. the default"
+             f" is {DEFAULT_SNAPSHOT_INTERVAL_SECONDS}. CONFIG GET save reports the schedule in"
+             " the reference's own syntax, where a rule fires once a clock is MORE than its"
+             " seconds past the last save, so a default server answers 59 0 rather than 60 0",
     )
     parser.add_argument(
         "--expiry-sweep-interval",
@@ -531,7 +537,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
              f"loop, no later than that plus one {SELECT_TIMEOUT_SECONDS} second select() "
              "timeout -- a snapshot save or a long command holding the loop delays it "
              "further; not a promise about any one key: a key nobody looks up is reclaimed "
-             "on some later pass rather than at its deadline; 0 disables the sweep",
+             f"on some later pass rather than at its deadline; the default is"
+             f" {DEFAULT_EXPIRY_SWEEP_INTERVAL_MS}. 0 disables the sweep",
     )
     parser.add_argument(
         "--ignore-snapshot",
@@ -563,7 +570,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
              "unlimited here, it is the "
              "opposite: no drain pass, so whatever the kernel will not take in one "
              "pass is discarded, and a request still unread at the close can take the "
-             "kernel's unsent tail with it",
+             f"kernel's unsent tail with it. the default is"
+             f" {DEFAULT_SHUTDOWN_DRAIN_TIMEOUT_SECONDS}",
     )
     parser.add_argument(
         "--max-connections",
@@ -571,7 +579,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
         default=DEFAULT_MAX_CONNECTIONS,
         metavar="COUNT",
         help="close, without a reply, a connection that arrives while COUNT clients are "
-             "already connected; 0 means no limit, and nothing is refused",
+             f"already connected; the default is {DEFAULT_MAX_CONNECTIONS}. 0 means no limit,"
+             " and nothing is refused",
     )
     parser.add_argument(
         "--rate-limit",
@@ -593,7 +602,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
         metavar="SECONDS",
         help="the span --rate-limit counts over, sliding rather than fixed, so no burst "
              "straddles a boundary; it takes no 0, because 100 requests per 0 seconds is a "
-             "limiter that permits everything",
+             f"limiter that permits everything. the default is"
+             f" {DEFAULT_RATE_LIMIT_WINDOW_SECONDS}",
     )
     parser.add_argument(
         "--write-buffer-high-water",
@@ -603,7 +613,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help="stop reading from a connection while more than BYTES of replies are queued "
              "for it, and resume once the queue falls to --write-buffer-low-water; 0 "
              "disables the pause, so reading goes on however much is queued, and "
-             "--write-buffer-low-water is then unused",
+             f"--write-buffer-low-water is then unused. the default is"
+             f" {DEFAULT_WRITE_BUFFER_HIGH_WATER} ({DEFAULT_WRITE_BUFFER_HIGH_WATER // 1024} KiB)",
     )
     parser.add_argument(
         "--write-buffer-low-water",
@@ -613,7 +624,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help="resume reading from a paused connection once its queued replies fall to "
              "BYTES or fewer; must be below --write-buffer-high-water unless that is 0. "
              "0 means resume only when the queue is empty, which is the most "
-             "conservative resume and not a way to switch anything off",
+             f"conservative resume and not a way to switch anything off. the default is"
+             f" {DEFAULT_WRITE_BUFFER_LOW_WATER} ({DEFAULT_WRITE_BUFFER_LOW_WATER // 1024} KiB)",
     )
     parser.add_argument(
         "--incomplete-command-timeout",
@@ -624,8 +636,9 @@ def build_arg_parser() -> argparse.ArgumentParser:
              "SECONDS, counted from when the command began and not from its latest byte. "
              "the count stops while --write-buffer-high-water has the connection paused "
              "and starts over from zero when reading resumes, so time held before a "
-             "pause is not carried across it. 0 means no limit, and nothing is closed "
-             "for it",
+             f"pause is not carried across it. the default is"
+             f" {DEFAULT_INCOMPLETE_COMMAND_TIMEOUT_SECONDS}. 0 means no limit, and nothing is"
+             " closed for it",
     )
     parser.add_argument(
         "--host",
@@ -652,7 +665,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
              "line per stop, INFO when it lost nothing and WARNING when it lost "
              "something, so WARNING hides the confirmation of a clean stop along with "
              "the per-connection lines and shows that line only when something was "
-             "lost; ERROR hides it either way",
+             f"lost; ERROR hides it either way. the default is {DEFAULT_LOG_LEVEL}",
     )
     return parser
 

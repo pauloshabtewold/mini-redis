@@ -7,6 +7,7 @@ import pytest
 
 import resp
 from connection import Connection
+import server as server_mod
 from server import MAX_SCHEDULABLE_INTERVAL, Server, build_arg_parser, main
 from tests.test_server_lifecycle import listening, pump
 
@@ -519,3 +520,56 @@ def test_a_value_inside_the_inbound_cap_can_exceed_the_outbound_limit():
         assert len(server._connections) == 0, (
             "a value under the inbound cap must still respect the outbound limit "
             "once it is read back at enough volume")
+
+
+def test_every_flag_that_takes_a_value_states_its_default_in_help():
+    # --help is the whole in-product reference, and thirteen of these said nothing about what the
+    # flag does if you leave it off -- --snapshot-path among them, whose text was entirely about
+    # refusals, so a reader of --help alone could not learn that omitting it still writes a file or
+    # where. the defaults are interpolated from the module's own constants rather than restated, so
+    # a default that changes cannot leave a stale number here; this test is what catches the next
+    # flag added without one
+    import argparse
+    parser = build_arg_parser()
+    missing = []
+    for action in parser._actions:
+        if isinstance(action, argparse._HelpAction):
+            continue
+        if action.nargs == 0 or action.const is not None:
+            # a store_true takes no value, so it has no default to state: passed or not passed is
+            # the whole of it, and --ignore-snapshot's help already says what each means
+            continue
+        if "default" not in (action.help or ""):
+            missing.append(action.option_strings)
+    assert missing == [], (
+        "every flag that takes a value has to say what it is if you leave it off", missing)
+
+
+def test_the_defaults_help_states_are_the_defaults_it_uses():
+    # the control on the test above: "default" appearing in the text is not the same as the right
+    # number appearing in it, and a hand-written clause can go stale the moment the constant moves
+    parser = build_arg_parser()
+    for option, value in (
+        ("--port", server_mod.DEFAULT_PORT),
+        ("--write-buffer-limit", server_mod.DEFAULT_WRITE_BUFFER_LIMIT),
+        ("--max-value-size", server_mod.DEFAULT_MAX_VALUE_SIZE),
+        ("--max-multibulk", server_mod.DEFAULT_MAX_MULTIBULK),
+        ("--snapshot-interval", server_mod.DEFAULT_SNAPSHOT_INTERVAL_SECONDS),
+        ("--expiry-sweep-interval", server_mod.DEFAULT_EXPIRY_SWEEP_INTERVAL_MS),
+        ("--shutdown-drain-timeout", server_mod.DEFAULT_SHUTDOWN_DRAIN_TIMEOUT_SECONDS),
+        ("--max-connections", server_mod.DEFAULT_MAX_CONNECTIONS),
+        ("--rate-limit-window", server_mod.DEFAULT_RATE_LIMIT_WINDOW_SECONDS),
+        ("--write-buffer-high-water", server_mod.DEFAULT_WRITE_BUFFER_HIGH_WATER),
+        ("--write-buffer-low-water", server_mod.DEFAULT_WRITE_BUFFER_LOW_WATER),
+        ("--incomplete-command-timeout", server_mod.DEFAULT_INCOMPLETE_COMMAND_TIMEOUT_SECONDS),
+    ):
+        action = next(a for a in parser._actions if option in a.option_strings)
+        assert str(value) in action.help, (
+            "the help text names a default that is not the one the parser uses",
+            option, value, action.help)
+        assert action.default == value, (option, action.default, value)
+    for option, value in (("--snapshot-path", server_mod.DEFAULT_SNAPSHOT_PATH),
+                          ("--log-level", server_mod.DEFAULT_LOG_LEVEL)):
+        action = next(a for a in parser._actions if option in a.option_strings)
+        assert value in action.help, (option, value, action.help)
+        assert action.default == value, (option, action.default, value)

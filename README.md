@@ -1039,7 +1039,10 @@ takes a number, so neither has a `0` to misread.
 
 ## Quickstart
 
-Python 3.11+.
+Python 3.11+, and `redis-cli` if you want to follow the transcript below — it is not a
+runtime dependency, there are none, but it is what the examples here and the suite's own
+client tests use. On a Mac, `brew install redis`; on Debian, `apt-get install
+redis-tools`.
 
 ```bash
 python3 -m venv .venv && .venv/bin/pip install -e '.[dev]'
@@ -1081,7 +1084,40 @@ each starts servers of its own and waits out a real snapshot interval, so a defa
 neither kills a process nor sits on a wall clock. They are not the slow part of the
 suite -- all four together are about 6 s, where a default run's own slowest two tests
 are about 10 s and 8 s. So `pyproject.toml` deselects them, and
-`python -m pytest -m manual tests/test_crash_consistency.py` selects them.
+`python -m pytest -m manual tests/test_crash_consistency.py` selects them. Naming that
+file without the flag deselects every test in it and pytest exits 5 saying `4 deselected`
+and nothing about either the marker or the flag, which is the one way to run it that looks
+like a pass and is not.
+
+A healthy run ends `1 skipped, 4 deselected`, and no count of passes is quoted here
+because that one goes stale every time a test is added. The skip is expected and is not
+something missing on your machine: one test needs a second loopback address and macOS
+gives `lo0` only `127.0.0.1`, so it skips there and runs in CI. Without `redis-cli` on
+`PATH` you will see two skips rather than one, for the same reason the prerequisite is
+named above. `-rs` prints the reason for either. The four deselected are the
+crash-consistency tests below.
+
+Two other installs, neither needed to run the server or the suite. `pip install -e
+'.[profile]'` adds `py-spy`, which is only of use if you are profiling — and it needs root
+on macOS, so nothing here uses it. `pip install -e '.[build]'` adds what builds a
+distribution:
+
+```bash
+.venv/bin/pip install -e '.[build]'
+.venv/bin/python -m build
+```
+
+That path exists because `MANIFEST.in` does. setuptools' default sdist glob is
+`test*/test*.py`, which leaves out the package marker and both helpers the test modules
+import, so the packaged suite once died at import; `MANIFEST.in` puts them back and ships
+`docs/DESIGN.md`, which this page links to. CI builds the sdist, installs it and runs the
+suite it ships, because nothing re-checked that until it did.
+
+An installed copy runs as `python -m server`, which is the same entry point by a different
+name — there is no console script. The modules install at the top level under their own
+names (`server`, `store`, `resp`, `connection`, `commands` and the rest), which are
+generic enough to shadow something else of the same name on `sys.path`, so a virtual
+environment of its own is the right place for it.
 
 ### In a container
 

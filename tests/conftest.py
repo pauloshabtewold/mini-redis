@@ -20,6 +20,23 @@ from store import Store
 REPO_ROOT = pathlib.Path(__file__).resolve().parent.parent
 
 
+def pytest_configure(config):
+    # pyproject.toml sets timeout = 300 to turn a parser hang into a failure, and that setting is
+    # pytest-timeout's, not pytest's: without the plugin the whole bound disappears behind one
+    # PytestConfigWarning that a quiet run never shows, and the suite runs with no bound at all.
+    # Under -W error the same warning becomes an INTERNALERROR instead, so the two ways of running
+    # it fail differently and neither says what is missing. Refused here, by name, because a run
+    # with no deadline is a run that can hang CI rather than fail it
+    if config.pluginmanager.hasplugin("timeout"):
+        assert config.getini("timeout"), (
+            "pytest-timeout is installed but timeout is unset, so nothing bounds a hung test")
+        return
+    raise pytest.UsageError(
+        "pytest-timeout is not installed, so pyproject.toml's `timeout = 300` does nothing and "
+        "a test that hangs will hang this run instead of failing it. Install the dev extra: "
+        "pip install -e '.[dev]'")
+
+
 def free_port():
     # bound and released rather than fixed: the port is free when chosen and could in
     # principle be taken before the server binds it, but a fixed port collides with a

@@ -15,6 +15,11 @@ dependencies = []
 [project.optional-dependencies]
 dev = ["pytest", "pytest-timeout", "redis>=5,<9"]
 profile = ["py-spy"]
+# the sdist path MANIFEST.in exists for. a group of its own rather than a line in dev, because it
+# is needed to build a distribution and not to run the suite, and it is here at all because
+# `python -m build` in a fresh clone answered "No module named build" and no published file said
+# where to get it
+build = ["build"]
 
 [tool.setuptools]
 py-modules = [
