@@ -65,7 +65,8 @@ _DRAIN = re.compile(
 # and at which level, and the drain's own arithmetic is pinned where the drain is tested. Left
 # out of the pattern altogether the whole line would read as a stray, which is how a figure
 # added to it turns every "nothing else was written" assertion here red at once
-_COMMAND = re.compile(_at("DEBUG") + r"connection (\d+): b'([^']*)' with (\d+) arguments")
+# "argument" or "arguments": a bare %d wrote "1 arguments", so the line is singular at one
+_COMMAND = re.compile(_at("DEBUG") + r"connection (\d+): b'([^']*)' with (\d+) arguments?")
 _REFUSAL = re.compile(r"(\w+):[^:]+:refusing " + _PEER + r": .*--max-connections.*")
 _IGNORED = re.compile(
     _at("WARNING") + r"ignoring the snapshot at .*dump\.mrdb; periodic saving is off, so the file is left in place")
@@ -442,7 +443,7 @@ def test_nothing_names_a_command_at_info(start, connect):
     found, stray = _sorted_lines(lines)
     assert stray == [], "stderr at the default level held a line that is not a connection or the drain: %r" % stray
     assert [len(found[name]) for name in ("accepted", "closed", "drain", "command")] == [1, 1, 1, 0]
-    named = [line for line in lines if _COMMAND_NAMES.search(line) or "arguments" in line]
+    named = [line for line in lines if _COMMAND_NAMES.search(line) or "argument" in line]
     assert named == [], named
 
     # from inside: the lines above cannot show that the debug call was skipped, because the logger drops a debug record below its level whether or not the call is guarded, and the output is the same either way. what differs is that an unguarded call builds its arguments for every dispatched command and then throws them away, and that shows as a call to debug() that nothing logs
@@ -642,3 +643,38 @@ def test_the_guarded_debug_call_at_info_is_measured_and_printed():
         % (per_command, round(min(spent_with) / batch_size), repeats, batch_size,
            sys.implementation.name, *sys.version_info[:3]))
 
+
+
+def test_an_unknown_log_level_is_quoted_as_the_operator_typed_it(tmp_path):
+    # type=str.upper folded the value before argparse compared it, so a lower-case unknown level
+    # was refused as invalid choice: 'VERBOSE' -- naming a spelling the operator never used, which
+    # reads as the parser having mangled the input rather than rejected it
+    for level in ("verbose", "Loud", "tRaCe"):
+        done = subprocess.run(
+            [sys.executable, "-B", str(REPO_ROOT / "server.py"), "--port", "0",
+             "--snapshot-path", str(tmp_path / "dump.mrdb"), "--log-level", level],
+            cwd=tmp_path, capture_output=True, text=True, timeout=20)
+        assert done.returncode == 2, (level, done.returncode, done.stderr)
+        assert "invalid choice: '%s'" % level in done.stderr, (
+            "the refusal has to quote what was typed, not a folded form of it",
+            level, done.stderr)
+        assert level.upper() not in done.stderr, (
+            "and must not quote the folded form at all", level, done.stderr)
+
+
+def test_the_debug_line_is_singular_at_one_argument(start, connect):
+    # a bare %d wrote "1 arguments" for every single-argument command, which is most of them
+    server = start("--log-level", "DEBUG")
+    conn = connect(server.port)
+    _round_trip(conn, _resp(b"GET", b"k"), b"$-1\r\n")
+    _round_trip(conn, _resp(b"PING"), b"+PONG\r\n")
+    _round_trip(conn, _resp(b"SET", b"k", b"v"), b"+OK\r\n")
+    conn.close()
+    rc, lines = server.stop()
+    assert rc == 0, rc
+    said = [l for l in lines if "argument" in l]
+    assert any("with 1 argument" in l and "with 1 arguments" not in l for l in said), (
+        "one argument has to read 'with 1 argument'", said)
+    assert any("with 0 arguments" in l for l in said), ("zero stays plural", said)
+    assert any("with 2 arguments" in l for l in said), ("two stays plural", said)
+    assert not any("1 arguments" in l for l in said), ("'1 arguments' survives", said)

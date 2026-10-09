@@ -377,6 +377,17 @@ def _write_buffer_low_water(value: str) -> int:
     return _numeric_limit(value, "write buffer low water", "bytes", _ZERO_RESUMES_WHEN_EMPTY)
 
 
+LOG_LEVELS = ("DEBUG", "INFO", "WARNING", "ERROR")
+
+
+def _log_level(value: str) -> str:
+    # folded only when the folded form is a level, so argparse's own "invalid choice" quotes what
+    # the operator typed. type=str.upper refused "verbose" as invalid choice: 'VERBOSE', naming a
+    # value nobody wrote, and leaving the comparison to argparse keeps one refusal rather than two
+    folded = value.upper()
+    return folded if folded in LOG_LEVELS else value
+
+
 def _max_value_size(value: str) -> int:
     return _numeric_limit(value, "max value size", "bytes")
 
@@ -567,7 +578,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
         type=_rate_limit,
         default=DEFAULT_RATE_LIMIT,
         metavar="REQUESTS",
-        help="answer an error, without dispatching, once a connection has been PERMITTED "
+        help="answer an error, without dispatching, once a connection has been permitted "
              "REQUESTS commands inside --rate-limit-window; 0 disables the limiter, which "
              "is the default. permitted and not sent: a refusal records nothing, so the "
              "budget returns one window after the permits and a refused command never "
@@ -629,8 +640,11 @@ def build_arg_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--log-level",
-        type=str.upper,
-        choices=("DEBUG", "INFO", "WARNING", "ERROR"),
+        # the level is folded for the comparison and the refusal quotes what was typed: with
+        # type=str.upper, "verbose" was refused as invalid choice: 'VERBOSE', naming a value
+        # the operator never wrote
+        type=_log_level,
+        choices=LOG_LEVELS,
         default=DEFAULT_LOG_LEVEL,
         help="how much to log, in any case. INFO reports each connection opened and "
              "closed; DEBUG adds a line per dispatched command naming the command and "
@@ -832,6 +846,14 @@ class Server:
             # socket() itself was what failed, where there is nothing to close
             if listener is not None:
                 listener.close()
+            # an IPv6 literal gets EAI_NONAME from an AF_INET bind, byte-identical to a
+            # misspelled hostname's, so it is named: ::1 is neither unknown nor unresolvable
+            # and the reason it is refused is that this listener is IPv4
+            if ":" in self.host:
+                raise ListenFailed(
+                    "cannot listen on %s:%d: this server listens on IPv4 only, and %s is "
+                    "an IPv6 address; pass an IPv4 address or a name that resolves to one"
+                    % (self.host, self.port, self.host)) from exc
             raise ListenFailed(
                 "cannot listen on %s:%d: %s" % (self.host, self.port, exc)) from exc
         listener.setblocking(False)
@@ -1074,8 +1096,9 @@ class Server:
         # every command take_commands() returns is dispatched: level-triggered readiness re-reports unread socket bytes, not commands already taken out of the buffer, so a leftover here is never revisited and the client waits forever
         for argv in parsed_commands:
             # guarded, because the arguments are built before logger.debug is called and this is the hot loop: at the default level an unguarded call would pay for them once per dispatched command and write nothing. the name is cut and the arguments are counted, never shown -- a command name is a bulk element and may be as large as --max-value-size, and a key or a value does not belong in a log
+            # the count's own plural is spelt rather than left to %d, because "1 arguments" is what a bare one wrote, and this comment sits above the guard rather than inside it because tests/test_logging.py cuts the guard and the one line it guards out of this function's source to measure what the call costs, and a line between them is a line it cannot cut
             if logger.isEnabledFor(logging.DEBUG):
-                logger.debug("connection %d: %r with %d arguments", conn.id, argv[0][:32], len(argv) - 1)
+                logger.debug("connection %d: %r with %d argument%s", conn.id, argv[0][:32], len(argv) - 1, "" if len(argv) == 2 else "s")
             # inside the per-command loop and not once per readable event, which is the
             # same place --write-buffer-limit is consulted and for the same reason: one
             # recv carries a batch, so a check run per event would charge thousands of
@@ -1618,6 +1641,17 @@ def _parse_and_run(argv) -> None:
         # was never meant to describe it
         # exit 1 rather than argparse's 2: a corrupt snapshot is not a usage error
         print(f"error: {exc}", file=sys.stderr)
+        # the remedy, named here and not in the message: persistence.py knows nothing about flags,
+        # and every numeric refusal this parser writes already points at its own way out, where
+        # the one refusal with a flag built for it said nothing. only for a load that was refused
+        # -- a path no save could write is not what --ignore-snapshot is for, since it would start
+        # and then fail at the first save
+        if "snapshot" in str(exc) and "cannot write" not in str(exc):
+            print(
+                "       --ignore-snapshot starts with an empty keyspace without reading that "
+                "file; with --snapshot-interval 0 beside it the file is left untouched, which "
+                "is what to use if you mean to keep it",
+                file=sys.stderr)
         raise SystemExit(1)
     try:
         server.run()

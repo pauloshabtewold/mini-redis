@@ -174,7 +174,13 @@ def _decode(blob: bytes) -> Store:
     # flipped length prefix would cause below
     (version,) = struct.unpack_from("<I", blob, 4)
     if version != SNAPSHOT_VERSION:
-        raise SnapshotError("unsupported snapshot version: %d" % version)
+        # the direction is named, because "corrupt snapshot: unsupported snapshot version" sends
+        # an operator looking for bad hardware when what they have is a file a newer build wrote
+        written_by = "a newer build" if version > SNAPSHOT_VERSION else "an older build"
+        raise SnapshotError(
+            "unsupported snapshot version: %d, where this build writes and reads %d, so this "
+            "file was written by %s rather than corrupted"
+            % (version, SNAPSHOT_VERSION, written_by))
     (count,) = struct.unpack_from("<I", blob, 8)
     offset = 12
     items = []
@@ -687,4 +693,8 @@ def load(path: str) -> Store:
     try:
         return decode(blob)
     except SnapshotError as exc:
+        # a version this build does not know is not corruption and is not labelled as it: the
+        # checksum passed, so the bytes are exactly what some build wrote
+        if str(exc).startswith("unsupported snapshot version"):
+            raise SnapshotError("cannot read snapshot %s: %s" % (path, exc)) from exc
         raise SnapshotError("corrupt snapshot %s: %s" % (path, exc)) from exc

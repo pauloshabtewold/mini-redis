@@ -925,6 +925,59 @@ def test_main_exits_one_naming_the_path_when_the_snapshot_is_corrupt(tmp_path):
         assert exc.code == 1, (
             "a corrupt snapshot is not a usage error, so not argparse's 2", exc.code)
     assert str(bad) in err.getvalue(), err.getvalue()
+    # and the way past it is named: --ignore-snapshot's own help calls itself the escape hatch for
+    # a file that refuses to load, and none of these refusals used to mention it, while every
+    # numeric refusal this parser writes already points at its own way out
+    assert "--ignore-snapshot" in err.getvalue(), (
+        "the refusal that announces an unloadable snapshot has to name the flag that exists "
+        "for exactly that file", err.getvalue())
+    assert "--snapshot-interval 0" in err.getvalue(), (
+        "and the pairing that keeps the file, since the flag alone overwrites it",
+        err.getvalue())
+
+
+def test_a_snapshot_a_newer_build_wrote_is_not_called_corrupt(tmp_path):
+    # "corrupt snapshot: unsupported snapshot version" sent an operator looking for bad hardware
+    # when what they had was version skew. the checksum passed, so the bytes are exactly what some
+    # build wrote and nothing about them is corrupt
+    import struct, zlib
+    for version, expected in ((persistence.SNAPSHOT_VERSION + 1, "a newer build"),
+                              (persistence.SNAPSHOT_VERSION - 1, "an older build")):
+        body = persistence.MAGIC + struct.pack("<I", version) + struct.pack("<I", 0)
+        path = tmp_path / ("v%d.mrdb" % version)
+        path.write_bytes(body + struct.pack("<I", zlib.crc32(body)))
+        err = io.StringIO()
+        try:
+            with contextlib.redirect_stderr(err):
+                server_mod.main(["--port", "0", "--snapshot-path", str(path)])
+            pytest.fail("main() started over version %d" % version)
+        except SystemExit as exc:
+            assert exc.code == 1, (version, exc.code)
+        said = err.getvalue()
+        assert "corrupt" not in said.split("rather than corrupted")[0], (
+            "a version this build does not know is not corruption", version, said)
+        assert expected in said, ("the direction has to be named", version, expected, said)
+        assert str(persistence.SNAPSHOT_VERSION) in said, (
+            "and what this build does read", version, said)
+        assert "--ignore-snapshot" in said, ("and the way past it", version, said)
+        assert path.read_bytes() == body + struct.pack("<I", zlib.crc32(body)), (
+            "the refusal must leave the file alone", version)
+
+
+def test_an_unwritable_path_is_not_offered_the_ignore_snapshot_remedy(tmp_path):
+    # the control on the line above: --ignore-snapshot is not the answer to a path no save could
+    # write, because such a server starts and then fails at its first save, so offering it there
+    # would send the operator past the one refusal that was right
+    missing = tmp_path / "nope" / "dump.mrdb"
+    err = io.StringIO()
+    try:
+        with contextlib.redirect_stderr(err):
+            server_mod.main(["--port", "0", "--snapshot-path", str(missing)])
+        pytest.fail("main() started over an unwritable path")
+    except SystemExit as exc:
+        assert exc.code == 1, exc.code
+    assert "--ignore-snapshot" not in err.getvalue(), (
+        "an unwritable path is not what that flag is for", err.getvalue())
 
 
 REPO_ROOT = pathlib.Path(__file__).resolve().parent.parent

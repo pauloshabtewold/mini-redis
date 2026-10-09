@@ -1057,7 +1057,19 @@ bar
 
 If you run on the default 6379 and a real Redis is already there, the bind fails with
 `Address already in use` — or worse, you get a healthy-looking `PONG` from *that* server.
-The `listening on 127.0.0.1:<port>` line at startup is what tells you this one answered.
+The `listening on <host>:<port>` line at startup is what tells you this one answered, and
+it names the address actually bound, so it reads `127.0.0.1:7000` here and
+`0.0.0.0:6379` inside the container. That line goes to standard output and every other
+line this server writes goes to standard error, which is worth knowing before you
+redirect either: `> /dev/null` loses the one line you are waiting for, and `2> /dev/null`
+loses every failure. It is also the one line that is not a log record, so `--log-level`
+does not govern it.
+
+A collision does not always announce itself. The bind only fails when something holds the
+same address, and a wildcard listener on the port is not the same address: on a stock Mac
+`ControlCenter` holds `*:7000`, and this server binds `127.0.0.1:7000` beside it quite
+happily, prints its line, and serves. So the line tells you this server answered on that
+address; it does not tell you nothing else is on the port.
 
 ```bash
 .venv/bin/python -m pytest
@@ -1076,14 +1088,38 @@ are about 10 s and 8 s. So `pyproject.toml` deselects them, and
 ```bash
 docker build -t mini-redis .
 docker run -d --name mini-redis -p 127.0.0.1:7000:6379 -v mini-redis-data:/data mini-redis
-until docker logs mini-redis 2>&1 | grep -q 'listening on'; do sleep 0.1; done
+until docker logs --since "$(docker inspect -f '{{.State.StartedAt}}' mini-redis)" \
+        mini-redis 2>&1 | grep -q 'listening on'; do
+  [ "$(docker inspect -f '{{.State.Running}}' mini-redis)" = true ] ||
+    { docker logs mini-redis; exit 1; }
+  sleep 0.1
+done
 redis-cli -p 7000 PING
 docker stop mini-redis
 ```
 
-The `until` line is not decoration. `docker run -d` returns as soon as the container is
-created, and a `PING` sent before the server has bound answers
-`Error: Server closed the connection` -- 3 of 3 without it. The server prints
+The `until` line is not decoration, and neither is either half of it. `docker run -d`
+returns as soon as the container is created, and a `PING` sent before the server has
+bound answers `Error: Server closed the connection` -- 3 of 3 with no wait at all.
+
+`--since` is there because `docker logs` is cumulative over a container's whole life. A
+loop that greps the whole log matches the *previous* run's line the moment you
+`docker start` a container you had stopped -- it matches, in fact, while the container is
+still stopped -- so it returns before the restarted server has bound, and the error it
+exists to prevent happens anyway: measured, `Error: Server closed the connection` 5 of 5
+over five restarts, with the count of `listening on` lines climbing 1 to 6 as each new
+one arrived after the loop had already finished. Scoped to this run it is 5 of 5 ready
+and answering, on the same container. That matters here because the whole point of the
+volume is that you can stop and start over it.
+
+The `Running` check is there because the loop is otherwise unbounded on a start that was
+refused, and the refusals are easy to hit -- a `/data` the container's user cannot write
+is one. Without the check the loop spins forever and prints nothing, while the reason is
+already sitting in `docker logs`; with it, it gives up at once and shows you, for example
+`error: cannot write snapshot /data/dump.mrdb: /data is not writable`. If you swap the
+named volume for a bind mount of a host directory, `-v ./data:/data`, that is the failure
+you will get, because the container runs as uid 10001: either `chown 10001:10001` the
+directory, pass `--user`, or stay on a named volume as above. The server prints
 `listening on` once the listener is bound, which `run()` does after installing its own
 stop handlers, for `SIGTERM` always and for `SIGINT` unless the process inherited that
 signal ignored, and so after the snapshot has loaded. That is
