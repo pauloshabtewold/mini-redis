@@ -77,11 +77,20 @@ keeps moving) -- one of those commits changed `take_commands()`, the read path a
 tests go through -- so I took it again, on a tree that did not yet hold the rate
 limiter, against a private `redis-server 7.2.7` started for the run on a port of its
 own. The fourteen `redis-benchmark` invocations ran at load averages of 3.97 to 9.82.
-What a re-measurement is for here is the figure this section says to read, the median
-share of native, and it held. At `-P 16` the eight small-reply commands ran at 19.6% to
-27.2% of native, median 23.5%, and the two `LRANGE` tests at 49.9% and 60.9%; at `-P 1`
-the median share was 63.0%. The paragraph after the second table holds the figures to
-set these beside. A row does not hold still the way the median does: in later
+What a re-measurement was for here was the figure this section says to read, the median
+share of native, and the honest answer is that it does not hold to a point either. At
+`-P 16` the eight small-reply commands ran at 19.6% to 27.2% of native, median 23.5%,
+and the two `LRANGE` tests at 49.9% and 60.9%; at `-P 1` the median share was 63.0%.
+Taken again later on CPython 3.13.9, the interpreter the first table was measured on,
+four paired runs at `-P 1` gave medians of 58.9%, 63.3%, 59.0% and 58.9% -- deviations of
+-4.1, +0.3, -4.0 and -3.1 points, so 63.0% is the top of the spread and not a value a
+re-measurement recovers -- and on 3.14.8, 57.6%. At `-P 16` on 3.13.9 the eight-small
+median came back 21.8% and 30.7% in two consecutive pairs on one host. The spread tracks
+the reference and not this server: its own `PING_MBULK` moved between 0.909M and 1.538M
+requests per second across those two pairs. So read the median as a range and not as a
+figure, and read the 8% ship threshold as the one claim here that reproduces: it was
+cleared in every row of every run, at a worst case of 17.2%. The paragraph after the
+second table holds the figures to set these beside. A row does not hold still the way the median does: in later
 repetitions a row's share was as much as 17.4 points above and 16.4 below its figure in
 the table at `-P 1`, with six of the ten rows more than 6.4 points off in a single run,
 and as much as 18.2 above and 11.1 below at `-P 16`. The reference's own p99 on the
@@ -96,8 +105,16 @@ because each cell is one run and a newer run is no better evidence of a cell tha
 older one; what a re-measurement can settle is the share, and that is what is reported
 here. The rate limiter was built after that re-measurement, so neither table was taken
 with its check in the path. With the limit off, which is the default, the check is a
-method call that tests one attribute and returns: I measured it at 77 ns per command,
-and a `-P 16` comparison with and without it fell inside the noise.
+method call that tests one attribute and returns. Measured with `python -m timeit` on
+the statement the dispatch loop actually writes, it costs about 38 ns per command on
+CPython 3.13.9 at load average 4 -- 26 ns once the attribute lookup is hoisted out --
+and the figure moves with the machine, 41 to 44 ns at load 5.2. That is about 5.7% of
+the server's own per-command dispatch work, 39 ns against 697 ns for one `PING` through
+`_dispatch_batch` measured on the same harness, and 1 to 2% of an observed pipelined
+round trip. A `-P 16` comparison with and without it fell inside the noise. A harness
+that wraps the call in a lambda and never subtracts the lambda's own 15 to 22 ns reads
+far higher, 70.7 to 93.1 ns on CPython 3.14.8, which is a property of the instrument and
+not of the check.
 
 The list is pinned because the tool's default run stops at
 `SADD`, the first command in its sequence this server does not implement (see
@@ -171,30 +188,49 @@ in the code unless it is written down here.
 **A length-prefixed format does not make a checksum redundant.** The argument for
 leaving one out is that every length prefix is a bounds check, so a corrupt snapshot
 fails at a known offset. Truncation does: it is refused at every offset. A flipped bit
-mostly does not. I ran 3,000 single-bit-flip trials, one random bit each, against the
-shipping encoder: a 2,036-byte snapshot of 41 keys holding a list and a TTL, 16,288 bit
-positions. Decoded with the trailer recomputed over the corrupted bytes, which is what a
-length-prefixed format with no checksum amounts to, **about 81% of the flips were
-silently accepted as a snapshot holding different data** and only about 19% were caught
-at all -- 475 of those by a length prefix running off the end, 48 by a type byte that
-named no kind, and 5 by a key arriving twice. With the CRC32 trailer in place, all 3,000
-were refused, 100%. The two shares are estimates from 3,000 random trials and are
-written as estimates for that reason: the exhaustive figure for a fixture of this shape
-is 80.9% accepted, which is the ceiling for that shape because only a flip in a key, a
-value or an expiry can be accepted as different data and every other byte is structure,
-with the 18.9% caught as its matching floor. That is the finding: most bytes in a
-snapshot are payload and not structure, so a flip inside a key, a value or an expiry
-passes every bounds check there is. On a smaller three-key fixture, flipped
-exhaustively, the same decode accepts 50.0% as different data — the share is a function
-of how much of the blob is payload, so it is the shape of the finding and not either
-number that carries. These corruptions are from that three-key fixture: `HELLOWORLD`
-came back as `HELLOWOVLD`; a key named `beta` came back as `beua`, so `GET beta`
-answered nil and a key nobody wrote existed; an expiry of 1700000000000 came back as
-1699995805696. `tests/test_persistence_properties.py` pins the refusal side exactly —
-every flip a `SnapshotError`, and for the right reason — and asserts of the other side
-only that it accepts something, on the smaller fixture. The shares above are not pinned
-by any test. `docs/DESIGN.md` has the other half of the picture, the count and version
-fields, where the length prefixes do catch every flip.
+mostly does not. Every bit position is swept, not sampled: a 2,036-byte snapshot of 41
+keys holding a list and a TTL is 16,288 bit positions, and each one is flipped in turn,
+so the figures below are exact and carry no "about". Decoded with the trailer recomputed
+over the corrupted bytes, which is what a length-prefixed format with no checksum
+amounts to, each flip lands in exactly one of three outcomes. **12,942 of the 16,288 —
+79.4573% — were silently accepted as a snapshot holding different data.** 3,314, or
+20.3463%, were caught, itemised in full because the parts have to sum to the whole:
+2,759 by a length prefix running off the end, 280 by a type byte that named no kind, 202
+by a key arriving twice, 32 by an unsupported version, 32 by a wrong magic, 8 by
+trailing bytes past the last entry, and 1 by a list entry holding no elements. The
+remaining 32, 0.1965%, are the four bytes of the CRC trailer itself: recomputing the
+trailer overwrites the flip, so the decoder is handed the original bytes and returns the
+original store — accepted, but as identical data rather than as different data, which is
+why the first two shares do not sum to 100%. With the CRC32 trailer verified instead of
+recomputed, every flip is refused, exhaustively, on every fixture: 94,960 positions,
+94,960 refusals.
+
+The accepted share is not a property of "a fixture of this shape". It is the payload
+byte share, and it moves with the key set: a flip in a key is accepted as different data
+unless it lands on a key some other entry already holds, in which case it is caught as a
+duplicate. `key00` and `key01` differ by one bit, so plainly numbered keys give 202 such
+catches and 79.4573% accepted, while a key set chosen so that no single flip can collide
+gives **zero** duplicate catches and 80.6974% accepted, with 19.1061% caught. The two
+fixtures differ in nothing but their keys, so the whole of the difference is those 202
+catches: 12,942 plus 202 is 13,144. That pair
+is the maximum over key choices at this size and not the figure for the shape — the two
+cannot describe one blob, since the maximum is reached only where the duplicate-key count
+is zero. The exact law, checked on every fixture swept: the accepted-different count plus
+the duplicate-key count equals the payload bits, and the caught count minus the
+duplicate-key count plus the trailer's 32 equals the structure bits. That is the finding:
+most bytes in a snapshot are payload and not structure, so a flip inside a key, a value
+or an expiry passes every bounds check there is, and no length-prefix, count, magic or
+version bit is ever accepted. How much of the blob is payload moves the share far more
+than the key set does: on a three-key fixture the decode accepts exactly 50.0000% as
+different data, which is exactly its 51 payload bytes of 102. These corruptions are from
+that three-key fixture, each reachable by a single flip: `HELLOWORLD` came back as
+`HELLOWOVLD`; a key named `beta` came back as `beua`, so `GET beta` answered nil and a
+key nobody wrote existed; an expiry of 1700000000000 came back as 1699995805696.
+`tests/test_persistence_properties.py` pins the refusal side exactly — every flip a
+`SnapshotError`, and for the right reason — and now pins every figure in this paragraph
+as well, by running the same exhaustive sweep. `docs/DESIGN.md` has the other half of the
+picture, the count and version fields, where every flip is caught, though not all of them
+by a length prefix.
 
 **A bare `send()` is not a write path.** Against a copy of this server whose only write
 path was one `send()` with nothing behind it to catch what the kernel would not take, a
@@ -680,10 +716,19 @@ given up here — every non-tearing alternative needs a point-in-time view of th
 keyspace, and a pure-Python copy, cheaper in memory than it sounds (`docs/DESIGN.md`
 measures it), still leaves every list to copy element by element and the encode on this
 one thread, so the pause is priced and published rather than hidden. A snapshot of
-100,000 keys — 16-byte keys and 100-byte values — costs about 62.3 ms to serialize and
-about 80.4 ms to deserialize, a 12.7 MiB payload, and about 117.2 MiB of peak resident
-memory in a process that builds the keyspace, serializes it and then decodes the payload
-back into a second copy (`resource.getrusage(RUSAGE_CHILDREN).ru_maxrss`). The fixture
+100,000 keys — 16-byte keys and 100-byte values — is a 13,300,016-byte payload, which is
+12.7 MiB and is not a measurement at all: the format fixes it at twelve bytes of header,
+133 per entry and a four-byte trailer, and it came back identical in 45 of 45 runs. The
+three costs beside it are measurements and are published as the bands they came back in,
+over 30 runs on CPython 3.13.9 at load average 3.6 to 4.2: 64.2 to 78.1 ms to serialize,
+median 66.2; 83.2 to 93.8 ms to deserialize, median 85.7; and 106.3 to 115.5 MiB of peak
+resident memory, median 112.5, in a process that builds the keyspace, serializes it and
+then decodes the payload back into a second copy, with all three alive at the peak. Read
+through `resource.getrusage(resource.RUSAGE_SELF).ru_maxrss`, which macOS reports in
+bytes -- `RUSAGE_CHILDREN` is what this sentence used to name and it answers for
+waited-for children, so in the one process described here it returns 0. None of the
+three is a floor: a louder machine reads higher, which is why the load is part of each
+figure rather than a caveat on it. The fixture
 is stated because the payload is a function of it, and the figures come from measuring
 the tree that ships. These figures are published here, and `docs/DESIGN.md` cites
 them without repeating them.
