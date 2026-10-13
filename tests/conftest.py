@@ -27,14 +27,43 @@ def pytest_configure(config):
     # Under -W error the same warning becomes an INTERNALERROR instead, so the two ways of running
     # it fail differently and neither says what is missing. Refused here, by name, because a run
     # with no deadline is a run that can hang CI rather than fail it
-    if config.pluginmanager.hasplugin("timeout"):
-        assert config.getini("timeout"), (
-            "pytest-timeout is installed but timeout is unset, so nothing bounds a hung test")
-        return
-    raise pytest.UsageError(
-        "pytest-timeout is not installed, so pyproject.toml's `timeout = 300` does nothing and "
-        "a test that hangs will hang this run instead of failing it. Install the dev extra: "
-        "pip install -e '.[dev]'")
+    if not config.pluginmanager.hasplugin("timeout"):
+        # installed-and-disabled is named apart from absent, because `-p no:timeout` gets this arm
+        # with the plugin sitting in site-packages, and the remedy it used to print -- install the
+        # dev extra -- was already done
+        try:
+            import pytest_timeout  # noqa: F401
+        except ImportError:
+            raise pytest.UsageError(
+                "pytest-timeout is not installed, so pyproject.toml's `timeout = 300` does "
+                "nothing and a test that hangs will hang this run instead of failing it. "
+                "Install the dev extra: pip install -e '.[dev]'") from None
+        raise pytest.UsageError(
+            "pytest-timeout is installed but switched off for this run, so pyproject.toml's "
+            "`timeout = 300` does nothing and a test that hangs will hang this run instead of "
+            "failing it. Drop the -p no:timeout that disabled it")
+    # the EFFECTIVE bound, and a number greater than zero. the version of this check that read
+    # `assert config.getini("timeout")` passed three ways that leave a run unbounded: the ini key
+    # is declared as a string, so "0" is truthy while the plugin's own code reads `timeout > 0`
+    # and arms nothing; `--timeout=0` and PYTEST_TIMEOUT=0 do not touch the ini value at all; and
+    # an unset-but-present key failed as an AssertionError, which pytest reports as an
+    # INTERNALERROR with a traceback at exit 3, where the arm above is a clean UsageError at
+    # exit 4. The plugin is asked for the option first, because that is what it honours
+    bound = config.getoption("timeout", None)
+    if bound is None:
+        bound = config.getini("timeout")
+    try:
+        seconds = float(bound)
+    except (TypeError, ValueError):
+        raise pytest.UsageError(
+            "pytest-timeout's bound is %r, which is not a number of seconds, so nothing bounds "
+            "a hung test" % (bound,)) from None
+    if seconds <= 0:
+        raise pytest.UsageError(
+            "pytest-timeout is installed but its bound is %s, and the plugin arms nothing at or "
+            "below zero, so a test that hangs will hang this run instead of failing it. "
+            "pyproject.toml sets `timeout = 300`; a zero here came from -o timeout, --timeout or "
+            "PYTEST_TIMEOUT" % (bound,))
 
 
 def free_port():

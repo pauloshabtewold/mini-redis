@@ -527,11 +527,21 @@ def test_every_flag_that_takes_a_value_states_its_default_in_help():
     # flag does if you leave it off -- --snapshot-path among them, whose text was entirely about
     # refusals, so a reader of --help alone could not learn that omitting it still writes a file or
     # where. the defaults are interpolated from the module's own constants rather than restated, so
-    # a default that changes cannot leave a stale number here; this test is what catches the next
-    # flag added without one
+    # a default that changes cannot leave a stale number here.
+    #
+    # it asserts the LITERAL clause, "the default is <what the parser uses>", built from the
+    # parser's own default rather than compared loosely. the version that asked whether
+    # `str(value)` appeared anywhere in the help text passed over eight mutated defaults one at a
+    # time: "1" is in "100 requests", "60" is in the same help's "rather than 60 0", "INFO" is in
+    # "INFO reports each connection", and asking only whether the word "default" appeared was
+    # satisfied by "a default server answers 59 0". Two flags were missing from the hand-written
+    # table it checked, and both turned out to be the two that stated no default at all:
+    # --rate-limit said "0 disables the limiter, which is the default" and --host said "the
+    # default is loopback", naming no address
     import argparse
     parser = build_arg_parser()
-    missing = []
+    wrong = []
+    checked = 0
     for action in parser._actions:
         if isinstance(action, argparse._HelpAction):
             continue
@@ -539,37 +549,33 @@ def test_every_flag_that_takes_a_value_states_its_default_in_help():
             # a store_true takes no value, so it has no default to state: passed or not passed is
             # the whole of it, and --ignore-snapshot's help already says what each means
             continue
-        if "default" not in (action.help or ""):
-            missing.append(action.option_strings)
-    assert missing == [], (
-        "every flag that takes a value has to say what it is if you leave it off", missing)
+        checked += 1
+        clause = "the default is %s" % (action.default,)
+        # the help strings are implicit concatenations that wrap, so a clause can arrive with a
+        # newline or a run of spaces inside it; the comparison is over collapsed whitespace
+        if clause not in " ".join((action.help or "").split()):
+            wrong.append((action.option_strings, clause, action.help))
+    assert wrong == [], (
+        "every flag that takes a value has to say, in --help, what it is if you leave it off, "
+        "and name the figure the parser actually uses", wrong)
+    assert checked == 16, (
+        "the count is pinned so that a flag dropped from the parser cannot leave this test "
+        "passing over fifteen", checked)
 
 
-def test_the_defaults_help_states_are_the_defaults_it_uses():
-    # the control on the test above: "default" appearing in the text is not the same as the right
-    # number appearing in it, and a hand-written clause can go stale the moment the constant moves
+def test_the_unit_renderings_beside_a_default_are_the_right_unit():
+    # the byte figures carry a second rendering, "33554432 (32 MiB)", and nothing checked the
+    # parenthesis: it was written by hand and a mutation to "(64 MiB)" passed. derived here from
+    # the same constant, so the two halves of one clause cannot disagree
     parser = build_arg_parser()
-    for option, value in (
-        ("--port", server_mod.DEFAULT_PORT),
-        ("--write-buffer-limit", server_mod.DEFAULT_WRITE_BUFFER_LIMIT),
-        ("--max-value-size", server_mod.DEFAULT_MAX_VALUE_SIZE),
-        ("--max-multibulk", server_mod.DEFAULT_MAX_MULTIBULK),
-        ("--snapshot-interval", server_mod.DEFAULT_SNAPSHOT_INTERVAL_SECONDS),
-        ("--expiry-sweep-interval", server_mod.DEFAULT_EXPIRY_SWEEP_INTERVAL_MS),
-        ("--shutdown-drain-timeout", server_mod.DEFAULT_SHUTDOWN_DRAIN_TIMEOUT_SECONDS),
-        ("--max-connections", server_mod.DEFAULT_MAX_CONNECTIONS),
-        ("--rate-limit-window", server_mod.DEFAULT_RATE_LIMIT_WINDOW_SECONDS),
-        ("--write-buffer-high-water", server_mod.DEFAULT_WRITE_BUFFER_HIGH_WATER),
-        ("--write-buffer-low-water", server_mod.DEFAULT_WRITE_BUFFER_LOW_WATER),
-        ("--incomplete-command-timeout", server_mod.DEFAULT_INCOMPLETE_COMMAND_TIMEOUT_SECONDS),
+    for option, divisor, unit in (
+        ("--write-buffer-limit", 1024 * 1024, "MiB"),
+        ("--max-value-size", 1024 * 1024, "MiB"),
+        ("--write-buffer-high-water", 1024, "KiB"),
+        ("--write-buffer-low-water", 1024, "KiB"),
     ):
         action = next(a for a in parser._actions if option in a.option_strings)
-        assert str(value) in action.help, (
-            "the help text names a default that is not the one the parser uses",
-            option, value, action.help)
-        assert action.default == value, (option, action.default, value)
-    for option, value in (("--snapshot-path", server_mod.DEFAULT_SNAPSHOT_PATH),
-                          ("--log-level", server_mod.DEFAULT_LOG_LEVEL)):
-        action = next(a for a in parser._actions if option in a.option_strings)
-        assert value in action.help, (option, value, action.help)
-        assert action.default == value, (option, action.default, value)
+        clause = "the default is %d (%d %s)" % (action.default, action.default // divisor, unit)
+        assert clause in " ".join(action.help.split()), (
+            "the figure and its rendering have to be one clause derived from one constant",
+            option, clause, action.help)
