@@ -1736,3 +1736,65 @@ def test_the_startup_probe_is_not_named_as_a_file_an_interrupted_save_may_have_l
         "the probe's suffix has to be exactly as long as a save's: one byte longer and the "
         "check refuses the longest basename a save can actually write, on a filesystem that "
         "counts a name's bytes")
+
+
+def test_the_startup_probe_syncs_after_it_writes_and_not_before(tmp_path, monkeypatch):
+    # the order is the whole reason the sync is there: a filesystem that defers allocation answers
+    # at the flush rather than at the write, so syncing an empty file asks nothing. nothing pinned
+    # the order, and a mutant that moved the sync above the write passed the suite
+    calls = []
+    real_write, real_sync = os.write, persistence._sync_to_the_device
+    monkeypatch.setattr(os, "write", lambda fd, data: (calls.append("write"), real_write(fd, data))[1])
+    monkeypatch.setattr(persistence, "_sync_to_the_device",
+                        lambda fd: (calls.append("sync"), real_sync(fd))[1])
+    persistence.check_writable(str(tmp_path / "dump.mrdb"))
+    monkeypatch.undo()
+    assert calls == ["write", "sync"], (
+        "the probe has to write before it syncs: a sync of an empty file does not ask the device "
+        "for room, which is the only reason the sync is here", calls)
+
+
+def test_the_startup_probe_closes_its_descriptor_on_every_arm(tmp_path, monkeypatch):
+    # the server holds one descriptor in reserve and its connection cap is a descriptor budget, so
+    # a probe that leaks one costs a client. two mutants survived here, one per arm
+    import resource
+    def open_count():
+        n = 0
+        for fd in range(3, 256):
+            try:
+                os.fstat(fd)
+            except OSError:
+                continue
+            n += 1
+        return n
+
+    before = open_count()
+    persistence.check_writable(str(tmp_path / "ok.mrdb"))
+    assert open_count() == before, "the accepting arm leaked a descriptor"
+
+    def no_room(fd, data):
+        raise OSError(errno.ENOSPC, "No space left on device")
+
+    monkeypatch.setattr(os, "write", no_room)
+    with pytest.raises(persistence.SnapshotError):
+        persistence.check_writable(str(tmp_path / "full.mrdb"))
+    monkeypatch.undo()
+    assert open_count() == before, "the refusing arm leaked a descriptor"
+
+
+def test_the_startup_probe_refuses_a_write_error_that_is_not_enospc(tmp_path, monkeypatch):
+    # the arm is written for OSError and not for ENOSPC alone, because EIO and EDQUOT from the
+    # probe are the same answer -- this device will not take the bytes a save writes -- and a
+    # mutant that narrowed it to ENOSPC let those escape as a bare OSError with a traceback
+    # instead of the one-line refusal every other startup failure gets
+    for number, name in ((errno.EIO, "Input/output error"),
+                         (errno.EDQUOT, "Disc quota exceeded"),
+                         (errno.EROFS, "Read-only file system")):
+        def failing(fd, data, number=number, name=name):
+            raise OSError(number, name)
+
+        monkeypatch.setattr(os, "write", failing)
+        with pytest.raises(persistence.SnapshotError, match="not the bytes a save writes"):
+            persistence.check_writable(str(tmp_path / ("e%d.mrdb" % number)))
+        monkeypatch.undo()
+        assert not list(tmp_path.iterdir()), [p.name for p in tmp_path.iterdir()]
