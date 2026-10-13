@@ -1347,6 +1347,7 @@ commands/       __init__.py, registry.py, server.py, string.py and list.py; twen
 Dockerfile      single-service image: non-root user, snapshot in a volume at /data
 .dockerignore   the build context is an allowlist of the files the image runs from
 tests/          pytest suite, run in CI against Python 3.11, 3.13 and 3.14; the crash tests are manual
+scripts/        check-the-front-page.sh: clones this repository and runs the commands on this page
 ```
 
 [Design notes](docs/DESIGN.md) cover why each of these is shaped the way it is, and the

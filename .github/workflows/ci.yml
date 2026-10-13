@@ -63,3 +63,23 @@ jobs:
           /tmp/sdist-venv/bin/pip install "$(ls dist/*.tar.gz)[dev]"
           mkdir -p /tmp/unpacked && tar -xzf dist/*.tar.gz -C /tmp/unpacked
           cd /tmp/unpacked/* && /tmp/sdist-venv/bin/python -m pytest -q
+
+  front-page:
+    # the one job that does not read the tree: it clones the repository, follows README.md and
+    # types the commands the page publishes, extracting them from the page rather than holding a
+    # copy. Every other control here reads source, prose, refs or metadata, which is why a
+    # published readiness loop that was a no-op on a restarted container, and a claim about a
+    # benchmarking flag that one invocation refutes, both survived six rounds of review. Docker
+    # here is the runner's own and disposable, so the container half runs; locally it is opt-in
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.13"
+      - name: Install redis-tools
+        run: sudo apt-get update && sudo apt-get install -y redis-tools
+      - name: Follow the front page
+        run: CONTAINER=1 sh scripts/check-the-front-page.sh
