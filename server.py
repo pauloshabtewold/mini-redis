@@ -497,10 +497,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
              f"has taken what it will; the default is {DEFAULT_WRITE_BUFFER_LIMIT} ({DEFAULT_WRITE_BUFFER_LIMIT // (1024 * 1024)} MiB). 0 means no limit, and nothing is closed for it. "
              "this is a hard limit and it closes a connection for holding too much, "
              "not for failing to read: a client that reads slower than this server "
-             "produces reaches it too, and the pause above does not prevent that, since "
-             "the resume reads a paused connection's whole piled-up receive queue in one "
-             "go and every command in it is answered. 0 is what prevents it. a value "
-             "stored under --max-value-size can also be too large to read back under it",
+             "produces can reach it too, because --write-buffer-high-water stops reading "
+             "such a connection but the resume then answers a whole read's worth of the "
+             "requests that piled up. whether that batch exceeds BYTES depends on the "
+             "size of the replies, so the pause prevents the close for small replies and "
+             "delays it for large ones; 0 prevents it in either case. a value stored "
+             "under --max-value-size can also be too large to read back under it",
     )
     parser.add_argument(
         "--max-value-size",
@@ -1202,7 +1204,7 @@ class Server:
         # that has stopped reading cannot slow it down, because a client that writes its
         # requests before reading any reply then blocks in send() waiting for room only
         # its own reading would create, and both sides wait forever. the pause below
-        # refuses to read anyway and accepts that cost, for the pipelining client alone. it does not save a slow reader: the resume reads the whole receive queue that piled up while the connection was paused, and every command in it is answered, so the pause manufactures the oversized batch this check then judges. measured at the shipped defaults, a client sending one GET of a 1 MiB value per send() and reading 64 KiB every 20 ms is closed here; docs/DESIGN.md has the figures. the reference
+        # refuses to read anyway and accepts that cost. what it does for a client that merely falls behind depends on the size of that client's replies: the resume takes up to RECV_SIZE of the receive queue that piled up while the connection was paused and every command in that read is answered, so the batch this check judges is bounded by what 64 KiB of requests produces. measured at the shipped defaults, a client asking for a 2 KiB value with a reader draining 64 KiB every 20 ms was never closed over 25 s, 2 of 2, where the same client with the pause off was closed inside a second; one asking for a 1 MiB value the same way was closed at 4.4 to 5.3 s against 2.7 to 2.8 s with the pause off. docs/DESIGN.md has the figures. the reference
         # closes here too. a follower link would have needed exempting from this, on the
         # same reasoning that would have kept it off the rate limiter -- a follower that
         # falls behind is not a client that has stopped reading -- but replication is

@@ -475,11 +475,11 @@ high-water one is refused, at the CLI and by `Server.__init__`, unless the high-
 mark is 0. A high-water mark of 0 switches the pause off, so reading goes on however
 much is queued and the low-water mark is never reached; with the pause on, a low-water
 mark of 0 means resume only when the queue is empty. `--write-buffer-limit` is the
-ceiling behind them. With the pause in force it is not what slows a client down, because
-it does not slow anything down: it closes, and the client that would have reached it is
-paused instead. What the limit catches is a reply larger than it is, or the replies to
-one read's worth of pipelined requests, which the pause cannot unqueue once they are
-parsed. What the pause does not do is hold such a client anywhere near the high-water
+ceiling behind them. It does not slow anything down: it closes. What it catches is a reply
+larger than it is, or the replies to one read's worth of requests, which the pause cannot
+unqueue once they are parsed -- and whether the pause keeps a connection under it depends
+on how much one read's worth of requests produces, which is a property of the client and
+not of the marks. The paragraph below measures both answers. What the pause does not do is hold such a client anywhere near the high-water
 mark. The batch that crossed the mark is still dispatched whole, so a paused connection
 holds the mark plus that batch — bounded at the shipped defaults by the limit itself, 32 MiB,
 thirty-two times the mark and the whole of the ceiling, because a connection that survives its
@@ -491,10 +491,11 @@ the bound and the 99.1% as how close a sample gets. The transient peak before th
 connection is bounded by the limit plus one reply, 34,603,020 bytes at 1 MiB replies,
 and was measured to within 37,692 bytes of that. A rate-limit refusal counts as a
 reply: the refusal path queues its error and reaches the same check. Neither bound was
-exceeded in the 152, and the pause fired exactly once in every one. The pause postpones
-the limit for a client that stops reading and does not prevent it for one that keeps
-reading slowly; it never keeps either far away from the limit, and the paragraph on the
-pause below says why. The 32 MiB default is a choice, and a departure from the reference,
+exceeded in the 152, and the pause fired exactly once in every one. What the pause does for a client that is behind
+depends on the size of its replies, and the paragraph on the pause below has both
+measurements: for small replies it holds the queue at about a fifth of the limit and the
+limit never fires, and for replies of a megabyte it postpones the close rather than
+preventing it. The 32 MiB default is a choice, and a departure from the reference,
 which leaves an ordinary client's output buffer unlimited. This server does not: nothing
 else here bounds what a few kilobytes of pipelined requests can queue, and a bounded
 queue is worth being different over. `--write-buffer-limit 0` is the reference's
@@ -526,17 +527,24 @@ queues the whole list as one reply, judged whole against the limit, so a list of
 elements that are all far under the cap can be stored and not read back at any finite
 limit, and a `KEYS` reply is judged the same way. Only 0 reads every one of them back.
 
-**A client that stops reading entirely is paused, not closed. One that merely reads
-slowly is closed.** The pause postpones `--write-buffer-limit` for the first and does not
-prevent it for the second, and it never keeps either away from the limit. The reason is
-that the pause manufactures the batch the limit is judged against: a paused connection's
-requests pile up in its kernel receive queue, the resume reads that pile in one go, and
-every command in it is answered, so "the replies to one read's batch" is not bounded by
-the mark at all. At the shipped defaults a client that never pipelines — one request per
-`send()` — and reads steadily but slower than this server produces is closed mid-reply,
-with the value still stored; `--write-buffer-limit 0` is what prevents that, and a
-lock-step client that reads each whole reply before sending again is safe at the
-defaults. `docs/DESIGN.md` has the measurement and the two controls.
+**Whether a client that falls behind is closed depends on how large its replies are, not
+on whether it is reading.** The pause bounds what a connection holds to the low-water
+mark plus the replies to one resume's batch, and whether that bound sits under
+`--write-buffer-limit` is a property of the client. A paused connection's requests pile
+up in its kernel receive queue, the resume takes up to one read's worth of them — 64 KiB,
+one `recv()` per readable event — and every command in that read is answered before
+anything throttles again, so the batch is bounded by what 64 KiB of requests produces and
+not by the mark. For small replies that product is small: measured at the shipped
+defaults, a client asking for a 2 KiB value and draining 64 KiB every 20 ms was never
+closed, in 2 of 2 runs of 25 seconds, having been sent about 60 MB — and with
+`--write-buffer-high-water 0`, the same client was closed in 2 of 2 runs inside a second.
+For replies of a megabyte the product is far over the limit, and the pause postpones the
+close rather than preventing it: 4.4 to 5.3 s at the defaults against 2.7 to 2.8 s with
+the pause off, over three runs each, with the bands not overlapping. So the pause is what
+keeps the limit from firing for the first client and what delays it for the second, and
+`--write-buffer-limit 0` is what prevents it in both cases; a lock-step client that reads
+each whole reply before sending again is safe at the defaults whatever its replies weigh.
+`docs/DESIGN.md` has the figures and the controls.
 `--incomplete-command-timeout` is suspended for every paused connection, whatever it has
 or has not sent, so that flag does not bound it either; and the pause holds what is already
 queued for it, at least the high-water mark's worth plus whatever the one batch that
@@ -655,17 +663,23 @@ than a defect.
 A file that is present but will not decode refuses startup rather than starting empty
 over it, and so does anything else at that path that is not a regular file -- a
 directory, a named pipe. Whenever `--snapshot-interval` is non-zero, the startup check
-tries the write it guards against rather than only inspecting the path: it creates and
-removes a temporary file shaped like the one a save writes, in the snapshot's own
-directory, so a directory that cannot take that file, a name the filesystem will not
-accept, and a directory that will not let the file be removed are all refused before the
-server starts, and an existing snapshot whose file flags would block a rename over it is
-refused too. What it judges at that path is the entry a save's rename would replace, not
+tries the write it guards against rather than only inspecting the path: it creates a
+temporary file in the snapshot's own directory, writes a byte to it, syncs that byte to
+the device and removes it again, so a directory that cannot take the file, a name the
+filesystem will not accept, a directory that will not let the file be removed, and a
+device with no room left for even one byte are all refused before the server starts, and
+an existing snapshot whose file flags would block a rename over it is refused too. The
+byte is what catches a full device: a probe that only created and removed a file passed a
+volume that then answered the first save `ENOSPC`, after which the server had answered
+`SET` with `OK` and lost the keyspace at the stop. What one byte cannot answer is whether
+there is room for the next snapshot, whose size the check cannot know, so a device with
+room for the probe and not for the keyspace starts and fails at the save. What it judges at that path is the entry a save's rename would replace, not
 whatever that entry points at, so a `--snapshot-path` that is a symlink is accepted and
 replaced, exactly as the rename replaces it. It writes nothing else there and removes
 nothing it did not create, so what it cannot see it says nothing about: a disk that
-fills later, a directory changed after startup, and a permission that blocks the removal
-of the existing snapshot's own entry, which is what the rename needs and what no file
+fills after startup, or that has room for a byte and not for the keyspace, a directory
+changed after startup, and a permission that blocks the removal of the existing
+snapshot's own entry, which is what the rename needs and what no file
 created beside it can answer for. A path like that starts, and then every save fails,
 leaving the snapshot it could not replace intact. At `--snapshot-interval 0` the check
 does not run, so a path no save could write -- a directory that does not exist, say --
@@ -1282,7 +1296,7 @@ replication.py  a docstring and nothing else; specified in full, deliberately un
 commands/       __init__.py, registry.py, server.py, string.py and list.py; twenty-six commands total
 Dockerfile      single-service image: non-root user, snapshot in a volume at /data
 .dockerignore   the build context is an allowlist of the files the image runs from
-tests/          pytest suite, run in CI against Python 3.11 and 3.13; the crash tests are manual
+tests/          pytest suite, run in CI against Python 3.11, 3.13 and 3.14; the crash tests are manual
 ```
 
 [Design notes](docs/DESIGN.md) cover why each of these is shaped the way it is, and the
