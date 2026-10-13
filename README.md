@@ -721,7 +721,9 @@ stop makes on the way out: the failure is logged, and the exit status stays `0`.
 such a failure reports is bounded: the first one is logged as one line naming the
 exception's class and what it says, which for an `OSError` is the errno and the path it
 failed on, and after
-that a single line says how many times in a row it has now failed, once per hundred.
+that a single line says how many times in a row it has now failed, once per hundred. What
+is not logged is the recovery: a save that starts working again writes nothing, so after a
+device has been given room the only evidence in the log is the old failure.
 No traceback, at either step, and for a reason the same bound is about: rendering one
 opens source files, and a descriptor table with no room left is one of the ways every
 task guarded there fails, so the attempt would fail the same way and leave the operator
