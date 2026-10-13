@@ -1154,11 +1154,18 @@ file without the flag deselects every test in it and pytest exits 5 saying `4 de
 and nothing about either the marker or the flag, which is the one way to run it that looks
 like a pass and is not.
 
-A healthy run ends `4 deselected`, with one skip on macOS and none on Linux, and no
-count of passes is quoted here because that one goes stale every time a test is added.
-The skip is expected and is not something missing on your machine: one test needs a
-second loopback address and macOS gives `lo0` only `127.0.0.1`, so it skips there and
-runs in CI, where a healthy run shows no skip at all. Without `redis-cli` on
+A healthy run ends `4 deselected`, and the number of skips before that belongs to the
+platform rather than to your machine: one on macOS and nine on Linux, as of this
+writing. No count of passes is quoted here because that one goes stale every time a test
+is added. The skips are features one platform has and the other does not, in both
+directions. macOS skips the test that needs a second loopback address, because `lo0`
+holds only `127.0.0.1` there; Linux skips the ones that need `chflags`, the immutable and
+append-only flags, a `stat` result carrying a flags field, an ACL that denies delete, and
+a device-level flush to fall back from -- every one of them a BSD facility this server
+uses where it exists and does without where it does not. `-rs` prints the reason for each
+skip, and a skip whose reason is not one of those is worth looking at. Without
+`redis-cli` on `PATH` you will see one more, for the same reason the prerequisite is
+named above. Without `redis-cli` on
 `PATH` you will see two skips rather than one, for the same reason the prerequisite is
 named above. `-rs` prints the reason for either. The four deselected are the
 crash-consistency tests below.
