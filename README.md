@@ -1154,10 +1154,11 @@ file without the flag deselects every test in it and pytest exits 5 saying `4 de
 and nothing about either the marker or the flag, which is the one way to run it that looks
 like a pass and is not.
 
-A healthy run ends `1 skipped, 4 deselected`, and no count of passes is quoted here
-because that one goes stale every time a test is added. The skip is expected and is not
-something missing on your machine: one test needs a second loopback address and macOS
-gives `lo0` only `127.0.0.1`, so it skips there and runs in CI. Without `redis-cli` on
+A healthy run ends `4 deselected`, with one skip on macOS and none on Linux, and no
+count of passes is quoted here because that one goes stale every time a test is added.
+The skip is expected and is not something missing on your machine: one test needs a
+second loopback address and macOS gives `lo0` only `127.0.0.1`, so it skips there and
+runs in CI, where a healthy run shows no skip at all. Without `redis-cli` on
 `PATH` you will see two skips rather than one, for the same reason the prerequisite is
 named above. `-rs` prints the reason for either. The four deselected are the
 crash-consistency tests below.

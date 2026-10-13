@@ -238,10 +238,19 @@ fi
 if [ -x "$VENV/bin/python" ] && [ "${SKIP_SUITE:-0}" != 1 ]; then
     if ( cd "$WORK/fresh" && sh "$SUITE" ) >"$WORK/suite.log" 2>&1; then
         tail -1 "$WORK/suite.log" | sed 's/^/      /'
-        if grep -qE "1 skipped, 4 deselected" "$WORK/suite.log"; then
-            ok "the suite ended the way the page says a healthy run ends"
+        # the deselected count always, and the skip count by platform, because the page says the
+        # one skip is a macOS loopback and that the test runs in CI. The first cut asserted the
+        # macOS ending everywhere and went red on the Linux runner -- which is this check finding
+        # a published claim that was false on the platform CI runs, and the page now says so
+        case "$(uname -s)" in
+            Darwin) WANT="1 skipped, 4 deselected" ;;
+            *)      WANT="4 deselected" ;;
+        esac
+        if grep -qE "$WANT" "$WORK/suite.log" &&
+                { [ "$(uname -s)" = Darwin ] || ! grep -qE "[0-9]+ skipped" "$WORK/suite.log"; }; then
+            ok "the suite ended the way the page says a healthy run ends on this platform"
         else
-            fail "the suite passed but did not end '1 skipped, 4 deselected' as the page promises"
+            fail "the suite passed but did not end '$WANT' as the page promises for $(uname -s)"
         fi
     else
         tail -3 "$WORK/suite.log" | sed 's/^/      /'
