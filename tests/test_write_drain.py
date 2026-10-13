@@ -179,8 +179,12 @@ def test_the_second_positional_parameter_is_the_limit_that_closes_a_connection_p
     # attribute directly, so a constructor that took the limit under another name or at
     # another position would hand it to a different setting, or to none, and all of them
     # would stay green. this one builds the server the way main() does
-    args = build_arg_parser().parse_args(["--write-buffer-limit", "4096"])
-    server = Server(args.port, args.write_buffer_limit)
+    # the pause off, because a 4,096-byte limit sits under the default high-water mark and both
+    # doors refuse that pairing now; what this test is for is which parameter the limit lands on
+    args = build_arg_parser().parse_args(
+        ["--write-buffer-limit", "4096", "--write-buffer-high-water", "0"])
+    server = Server(args.port, args.write_buffer_limit,
+                    write_buffer_high_water=args.write_buffer_high_water)
     real, peer = socket.socketpair()
     real.setblocking(False)
     try:

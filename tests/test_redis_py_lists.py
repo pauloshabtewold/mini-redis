@@ -73,11 +73,33 @@ def test_info_with_no_section_reports_the_full_set_of_fields(redis_client):
     assert info["redis_version"] == "0.1.0"
     assert info["role"] == "master"
     assert info["connected_clients"] == 1
+    assert info["blocked_clients"] == 0
     assert info["db0"] == {"keys": 1, "expires": 0}
     assert isinstance(info["used_memory"], int)
     assert set(info) == {
-        "redis_version", "connected_clients", "used_memory", "role", "db0",
+        "redis_version", "connected_clients", "blocked_clients", "used_memory",
+        "total_connections_received", "total_commands_processed", "role", "db0",
     }, info
+
+
+def test_the_two_counters_count_what_a_live_server_has_done(redis_client):
+    # against a real server over a real socket, because both counters are facts about the process
+    # and not about the store: a unit test dispatching into a bare Store has no server to ask.
+    # the redis-py client that reached here has already spent connections and commands of its
+    # own -- two CLIENT SETINFO at the handshake among them -- so what is asserted is the
+    # movement and not an absolute, and the movement is what redis-cli --stat renders
+    r = redis_client
+    before = r.info()
+    for i in range(5):
+        r.set("counted%d" % i, "v")
+    after = r.info()
+    # exactly 6: the five SETs and the second INFO, which is counted before it is answered. the
+    # first INFO is inside `before` for the same reason, so it is not in the difference
+    assert after["total_commands_processed"] - before["total_commands_processed"] == 6, (
+        before["total_commands_processed"], after["total_commands_processed"])
+    assert after["total_connections_received"] == before["total_connections_received"], (
+        "the pooled client opened no new connection for those commands")
+    assert after["total_connections_received"] >= 1
 
 
 def test_info_with_a_section_name_filters_to_it(redis_client):

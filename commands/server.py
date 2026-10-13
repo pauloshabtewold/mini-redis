@@ -295,6 +295,13 @@ def _info_sections(store, conn) -> list[tuple[bytes, list[bytes]]]:
     # directly rather than accepted. checking conn.server first would raise on exactly
     # the callers this guard exists for
     connected = 0 if (conn is None or conn.server is None) else conn.server.connected_clients
+    # the two cumulative counters, read through the same slot and the same two-level guard, and
+    # zero for the same reason: a connection no server accepted has no server to ask. they are
+    # here because redis-cli --stat reads exactly these two and blocked_clients below, and a field
+    # it asks for and does not find it renders as LLONG_MIN -- so three of its six columns read
+    # -9223372036854775808 while this report left them out
+    received = 0 if (conn is None or conn.server is None) else conn.server.total_connections_received
+    processed = 0 if (conn is None or conn.server is None) else conn.server.total_commands_processed
 
     keyspace_fields = []
     live = store.live_count()
@@ -305,8 +312,14 @@ def _info_sections(store, conn) -> list[tuple[bytes, list[bytes]]]:
 
     return [
         (b"Server", [b"redis_version:" + SERVER_VERSION]),
-        (b"Clients", [b"connected_clients:%d" % connected]),
+        # blocked_clients is a constant and not a counter: nothing in this server blocks a client.
+        # there is no BLPOP, no WAIT and no transaction, so the figure is 0 by construction rather
+        # than by measurement -- which is the standard every value in CONFIG GET's table is held
+        # to, a true statement about this process
+        (b"Clients", [b"connected_clients:%d" % connected, b"blocked_clients:0"]),
         (b"Memory", [b"used_memory:%d" % _used_memory_bytes()]),
+        (b"Stats", [b"total_connections_received:%d" % received,
+                    b"total_commands_processed:%d" % processed]),
         (b"Replication", [b"role:" + REPLICATION_ROLE]),
         (b"Keyspace", keyspace_fields),
     ]

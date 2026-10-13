@@ -208,6 +208,24 @@ def test_a_refused_command_leaves_the_connection_open_and_serving():
         assert _read_until_quiet(sock) == REFUSED
 
 
+def test_a_refused_command_still_counts_as_one_processed():
+    # the counter INFO publishes is of commands this server answered, and a refusal is answered.
+    # counting beside the dispatch instead would make a client being limited read as a client
+    # that had gone quiet, in redis-cli --stat, which is the one view there is of a live server.
+    # it is deliberately not the reference's own rule, where a rejected command never reaches
+    # the counter
+    with listening(rate_limit=1, rate_limit_window=WINDOW) as (server, connect, _listener):
+        sock = connect()
+        pump(server)
+        before = server.total_commands_processed
+        sock.sendall(PING * 3)
+        pump(server)
+        assert _read_until_quiet(sock) == b"+PONG\r\n" + REFUSED * 2
+        assert server.total_commands_processed - before == 3, (
+            "one permitted and two refused are three commands answered",
+            before, server.total_commands_processed)
+
+
 def test_a_refused_command_is_not_dispatched():
     # the reply says refused; this says the keyspace never saw it, which is the half a
     # reply assertion cannot reach
@@ -230,7 +248,8 @@ def test_a_batch_of_refusals_is_bounded_by_the_write_buffer_limit(make_refusing_
     # `continue` past that check, so a batch of refusals queued without bound: measured, 283,953
     # bytes past a 100-byte limit where the permitted path held to 105, and the in-loop flush
     # fired 9,855 times with the limiter off against once with it on
-    server, conn = make_refusing_connection(rate_limit=1, write_buffer_limit=100)
+    server, conn = make_refusing_connection(
+        rate_limit=1, write_buffer_limit=100, write_buffer_high_water=0)
     server._dispatch_batch(conn, [[b"PING"]] * 200)
     assert len(conn.write_buffer) <= 100 + len(REFUSED), (
         "a batch of refusals queued past the limit, so the refusal path is skipping the in-loop "
@@ -241,7 +260,8 @@ def test_a_batch_of_refusals_is_bounded_by_the_write_buffer_limit(make_refusing_
 def test_the_permitted_path_is_still_bounded_the_same_way(make_refusing_connection):
     # the control: without it the test above would pass against a limiter that refused nothing,
     # and against a dispatch loop whose size check had been deleted outright
-    server, conn = make_refusing_connection(rate_limit=0, write_buffer_limit=100)
+    server, conn = make_refusing_connection(
+        rate_limit=0, write_buffer_limit=100, write_buffer_high_water=0)
     server._dispatch_batch(conn, [[b"PING"]] * 200)
     assert len(conn.write_buffer) <= 100 + len(b"+PONG\r\n"), len(conn.write_buffer)
     assert conn.closed
@@ -250,7 +270,9 @@ def test_the_permitted_path_is_still_bounded_the_same_way(make_refusing_connecti
 @pytest.fixture
 def make_refusing_connection():
     # a connection whose send() always refuses, so the queue is observable rather than drained by
-    # the kernel. the limit is what closes it, which is the behaviour under test
+    # the kernel. the limit is what closes it, which is the behaviour under test -- and the callers
+    # that set a limit this small pass write_buffer_high_water=0 with it, because a limit at or
+    # below the mark is refused at both doors now: the pause could never fire under it
     import socket as socket_module
 
     from connection import Connection

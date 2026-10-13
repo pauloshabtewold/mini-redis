@@ -274,6 +274,20 @@ def _check_water_marks(high: int, low: int, high_label: str, low_label: str) -> 
             % (low_label, low, high_label, high, high_label))
 
 
+def _check_limit_above_high_water(
+    limit: int, high: int, limit_label: str, high_label: str
+) -> None:
+    # the second rule that spans two settings, stated once for the same two doors as the one above. a non-zero limit at or below a non-zero high-water mark leaves both water marks unreachable: _flush tests the limit before it decides read interest and returns on the close, and crossing the mark means being over the limit, so the pause can never fire and the low-water mark is never consulted. measured with the selector's own mask, a connection goes from read-registered straight to unregistered at a limit of 65,536 against the default 1 MiB mark, at a limit equal to it, and at a limit below the low-water mark, where the shipped defaults go read-registered to write-registered
+    # refused rather than warned about, for the reason the marks' own inconsistency is: a setting that cannot act is what that check exists to prevent, and the two cases are the same shape. it was accepted in silence before, which is a configuration where two flags an operator set do nothing at all
+    # guarded on both, because each 0 has its own meaning: 0 for the limit removes it, so there is no ceiling for a mark to sit under, and 0 for the mark switches the pause off, so there are no marks to be unreachable
+    if limit and high and limit <= high:
+        raise ValueError(
+            "%s (%d) must be above %s (%d); a limit at or below the mark closes a "
+            "connection before the pause can ever fire, so both water marks would do "
+            "nothing, and 0 for %s removes the limit instead"
+            % (limit_label, limit, high_label, high, limit_label))
+
+
 def _check_host(value: str, label: str) -> None:
     # stated once and used by the --host validator and by Server.__init__. an empty host is refused rather than read as a shorthand, because the one thing bind() does with it is listen on every interface, which is the exposure LISTEN_HOST is loopback to avoid, on a server with no authentication at all. it is not a spelling anyone means: it is what `--host "$HOST"` becomes when HOST is unset. 0.0.0.0 is not refused, since it names the same thing and whoever types it has chosen it
     if not value:
@@ -631,7 +645,10 @@ def build_arg_parser() -> argparse.ArgumentParser:
              "for it, and resume once the queue falls to --write-buffer-low-water; 0 "
              "disables the pause, so reading goes on however much is queued, and "
              f"--write-buffer-low-water is then unused. the default is"
-             f" {DEFAULT_WRITE_BUFFER_HIGH_WATER} ({DEFAULT_WRITE_BUFFER_HIGH_WATER // 1024} KiB)",
+             f" {DEFAULT_WRITE_BUFFER_HIGH_WATER} ({DEFAULT_WRITE_BUFFER_HIGH_WATER // 1024} KiB). a non-zero"
+             " --write-buffer-limit must be above BYTES: at or below it the limit closes a"
+             " connection before the pause can fire, so both marks would do nothing, and that"
+             " pairing is refused",
     )
     parser.add_argument(
         "--write-buffer-low-water",
@@ -764,6 +781,9 @@ class Server:
         _check_water_marks(
             write_buffer_high_water, write_buffer_low_water,
             "write_buffer_high_water", "write_buffer_low_water")
+        _check_limit_above_high_water(
+            write_buffer_limit, write_buffer_high_water,
+            "write_buffer_limit", "write_buffer_high_water")
         self.write_buffer_high_water = write_buffer_high_water
         self.write_buffer_low_water = write_buffer_low_water
         _check_not_negative(incomplete_command_timeout, "incomplete_command_timeout")
@@ -795,6 +815,9 @@ class Server:
         self._failures_in_a_row: dict[str, int] = {}
         # set when the shutdown drain begins and never cleared: it is what turns a read into a discard instead of a dispatch, and what lets end of input on a connection that still owes bytes wait for the drain instead of closing it, which is the reset _drain_for reads to avoid
         self._draining = False
+        # the two cumulative counters INFO publishes, which redis-cli --stat reads. plain ints on this object because nothing else in the process holds either fact: the connection set's length is how many there are now, and these are how many there have been
+        self._total_connections_received = 0
+        self._total_commands_processed = 0
         # refusals in the current episode, counting the one already reported, and when the last one came. _log_refusal keeps both: a refusal that follows the one before it by more than REFUSAL_EPISODE_GAP_SECONDS starts the count again
         self._cap_refusals = 0
         self._last_refusal_at: float | None = None
@@ -831,6 +854,22 @@ class Server:
         # method because the connection's own slot for this object grants attribute reads
         # and nothing else -- no calls -- so what it exposes has to already be shaped as one
         return len(self._connections)
+
+    @property
+    def total_connections_received(self) -> int:
+        # every socket accept() returned, the ones the cap then refused included, which is what
+        # "received" means in the reference's field of this name and what an operator watching
+        # redis-cli --stat wants: a cap turning a retrier away is traffic, and a count that hid it
+        # would read as an idle server. a property for the reason connected_clients is one
+        return self._total_connections_received
+
+    @property
+    def total_commands_processed(self) -> int:
+        # every command the dispatch loop answered, a rate-limit refusal included: a refusal is a
+        # request this server processed and answered, and counting only what reached a handler
+        # would make a limited client look idle in the one view that exists for watching a live
+        # server. that is not the reference's own rule, and docs/DESIGN.md says which is which
+        return self._total_commands_processed
 
     @property
     def armed_snapshot_interval(self) -> int:
@@ -905,6 +944,8 @@ class Server:
             if exc.errno in (errno.EMFILE, errno.ENFILE):
                 self._log_exhaustion(exc)
             return
+        # counted before the cap can refuse it, because a refused connection is still one received: it reached accept(), it cost a descriptor, and what an operator needs to see is the traffic the cap is turning away
+        self._total_connections_received += 1
         # one accept per readable event, so the level-triggered readiness re-reports a remaining backlog on the next select() return.
         # >= where every byte limit is >: a byte limit compares a quantity already held against a ceiling it may legally reach, and this asks whether there is room for one more, so a count equal to the cap is full. the count is the set's own length because a second counter would disagree with the set silently in both directions
         if self.max_connections and len(self._connections) >= self.max_connections:
@@ -1131,6 +1172,8 @@ class Server:
     def _dispatch_batch(self, conn: Connection, parsed_commands: list[list[bytes]]) -> None:
         # every command take_commands() returns is dispatched: level-triggered readiness re-reports unread socket bytes, not commands already taken out of the buffer, so a leftover here is never revisited and the client waits forever
         for argv in parsed_commands:
+            # at the top of the loop rather than beside the dispatch below, so a rate-limit refusal counts: this is the count of commands answered, which is what INFO publishes it as
+            self._total_commands_processed += 1
             # guarded, because the arguments are built before logger.debug is called and this is the hot loop: at the default level an unguarded call would pay for them once per dispatched command and write nothing. the name is cut and the arguments are counted, never shown -- a command name is a bulk element and may be as large as --max-value-size, and a key or a value does not belong in a log
             # the count's own plural is spelt rather than left to %d, because "1 arguments" is what a bare one wrote, and this comment sits above the guard rather than inside it because tests/test_logging.py cuts the guard and the one line it guards out of this function's source to measure what the call costs, and a line between them is a line it cannot cut
             if logger.isEnabledFor(logging.DEBUG):
@@ -1649,6 +1692,9 @@ def _parse_and_run(argv) -> None:
         _check_water_marks(
             args.write_buffer_high_water, args.write_buffer_low_water,
             "write buffer high water", "write buffer low water")
+        _check_limit_above_high_water(
+            args.write_buffer_limit, args.write_buffer_high_water,
+            "write buffer limit", "write buffer high water")
     except ValueError as exc:
         # caught around this call alone and not around the construction below, which would fold every other ValueError into a one-line message. a pair of flags that contradict each other is a usage error and exits 2, where a corrupt snapshot is not and exits 1
         parser.error(str(exc))

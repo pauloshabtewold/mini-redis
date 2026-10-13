@@ -160,6 +160,23 @@ def test_a_refused_connection_never_enters_the_connection_set():
         assert second.getsockname() in peers
 
 
+def test_a_refused_connection_still_counts_as_one_received():
+    # the two counts answer different questions and a refusal separates them: connected_clients is
+    # how many there are, total_connections_received is how many there have been, and a cap
+    # turning a retrier away is the traffic an operator most needs to see. counting the refusal
+    # after the cap instead would make a saturated server read as an idle one in redis-cli --stat
+    with _capped(2) as (server, connect):
+        _first, _second = connect(), connect()
+        pump(server, times=6)
+        before = (server.connected_clients, server.total_connections_received)
+        refused = connect()
+        pump(server, times=4)
+        after = (server.connected_clients, server.total_connections_received)
+        assert before == (2, 2), before
+        assert after == (2, 3), after
+        assert _until_closed(refused) == b""
+
+
 def test_a_refused_connection_does_not_change_connected_clients():
     with _capped(2) as (server, connect):
         first, _second = connect(), connect()

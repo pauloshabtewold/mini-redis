@@ -105,7 +105,9 @@ def _main_with_run_stubbed(monkeypatch, tmp_path, *flags):
 # --log-level is not among them: it never reaches Server, and test_logging.py reads what main()
 # does with it
 _FLAGS_THAT_REACH_THE_SERVER = [
-    (("--write-buffer-limit", "12345"), "write_buffer_limit", 12345),
+    # above the default high-water mark, which a limit now has to be: this case is about the
+    # flag reaching the attribute and not about the figure, so the figure moved rather than the case
+    (("--write-buffer-limit", "2097152"), "write_buffer_limit", 2097152),
     (("--max-value-size", "1000"), "max_value_size", 1000),
     (("--max-multibulk", "100"), "max_multibulk", 100),
     (("--expiry-sweep-interval", "250"), "expiry_sweep_interval", 250),
@@ -266,6 +268,57 @@ def test_an_empty_host_is_refused_at_both_doors(monkeypatch, tmp_path, capsys):
     server = Server(0, host="0.0.0.0")
     try:
         assert server.host == "0.0.0.0"
+    finally:
+        server._loop.close()
+
+
+def test_a_limit_at_or_below_the_high_water_mark_is_refused_at_both_doors(
+        monkeypatch, tmp_path, capsys):
+    # the second rule spanning two settings, and the pairing it refuses is the one that used to
+    # start in silence: a non-zero limit at or below a non-zero high-water mark leaves both water
+    # marks unreachable, because _flush tests the limit before it decides read interest and
+    # returns on the close. equality is refused with the inversion, since a queue over the mark
+    # is over the limit too
+    monkeypatch.setattr(logging, "basicConfig", lambda **kwargs: None)
+    monkeypatch.setattr(
+        Server, "run", lambda self: pytest.fail("main() ran a server over a contradictory pair"))
+    for limit, high in ((65536, 1048576), (1048576, 1048576), (1024, 1025)):
+        with pytest.raises(SystemExit) as exit_info:
+            main(["--write-buffer-limit", str(limit), "--write-buffer-high-water", str(high),
+                  "--write-buffer-low-water", "0",
+                  "--port", "0", "--snapshot-interval", "0",
+                  "--snapshot-path", str(tmp_path / "dump.mrdb")])
+        assert exit_info.value.code == 2, exit_info.value.code
+        message = capsys.readouterr().err
+        assert "write buffer limit" in message and "write buffer high water" in message, message
+        assert "write_buffer" not in message and "_check" not in message, message
+        # its own ending, and not the shared "0 disables the check": an operator who typed a small
+        # limit on purpose has to be told that 0 is what removes it, not that 0 is what it meant
+        assert "both water marks would do nothing" in message, message
+
+        with pytest.raises(ValueError) as refusal:
+            Server(0, write_buffer_limit=limit, write_buffer_high_water=high,
+                   write_buffer_low_water=0)
+        assert "write_buffer_limit" in str(refusal.value), refusal.value
+        assert "write_buffer_high_water" in str(refusal.value), refusal.value
+
+    # the three pairings that must still be accepted, each for its own reason: no limit at all, no
+    # pause at all, and a limit one byte above the mark, which is the smallest band that works
+    for settings in ({"write_buffer_limit": 0, "write_buffer_high_water": 1048576},
+                     {"write_buffer_limit": 1024, "write_buffer_high_water": 0},
+                     {"write_buffer_limit": 1026, "write_buffer_high_water": 1025,
+                      "write_buffer_low_water": 1024}):
+        server = Server(0, **settings)
+        try:
+            for name, value in settings.items():
+                assert getattr(server, name) == value, (name, settings)
+        finally:
+            server._loop.close()
+    server = _main_with_run_stubbed(
+        monkeypatch, tmp_path, "--write-buffer-limit", "1026",
+        "--write-buffer-high-water", "1025", "--write-buffer-low-water", "1024")
+    try:
+        assert server.write_buffer_limit == 1026
     finally:
         server._loop.close()
 

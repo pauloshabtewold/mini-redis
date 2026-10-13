@@ -326,13 +326,31 @@ def test_info_with_no_arguments_reports_every_section(store, conn):
     assert info["redis_version"] == "0.1.0"
     assert info["role"] == "master"
     assert info["connected_clients"] == 0, "no server is attached to this connection"
+    assert info["blocked_clients"] == 0, "nothing in this server blocks a client, ever"
+    assert info["total_connections_received"] == 0, "no server is attached to this connection"
+    assert info["total_commands_processed"] == 0, "no server is attached to this connection"
     assert info["db0"] == {"keys": 1, "expires": 1}
     assert isinstance(info["used_memory"], int)
     # exactly this field set: no uptime, which would need time.monotonic(), and no
-    # persistence fields, which would anticipate a feature this one does not build
+    # persistence fields, which would anticipate a feature this one does not build. the three
+    # that are here beyond the original five are the three redis-cli --stat reads and renders as
+    # LLONG_MIN when they are missing, which is what three of its six columns printed before
     assert set(info) == {
-        "redis_version", "connected_clients", "used_memory", "role", "db0",
+        "redis_version", "connected_clients", "blocked_clients", "used_memory",
+        "total_connections_received", "total_commands_processed", "role", "db0",
     }, info
+
+
+def test_the_three_counters_stat_reads_are_zero_for_a_connection_no_server_accepted(store, conn):
+    # the same two-level guard connected_clients has, and for the same reason: conn is None for
+    # in-process dispatch and conn.server is None for a connection built rather than accepted.
+    # a counter that raised here would take INFO down on exactly the callers the guard is for
+    for probe in (conn, None):
+        response, _effects = commands.dispatch(store, probe, [b"INFO"])
+        info = parse_info(response.split(b"\r\n", 1)[1][:-2].decode("ascii"))
+        assert info["total_connections_received"] == 0, probe
+        assert info["total_commands_processed"] == 0, probe
+        assert info["blocked_clients"] == 0, probe
 
 
 def test_info_omits_the_db0_line_on_an_empty_keyspace(store, conn):

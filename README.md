@@ -481,7 +481,10 @@ high-water one is refused, at the CLI and by `Server.__init__`, unless the high-
 mark is 0. A high-water mark of 0 switches the pause off, so reading goes on however
 much is queued and the low-water mark is never reached; with the pause on, a low-water
 mark of 0 means resume only when the queue is empty. `--write-buffer-limit` is the
-ceiling behind them. It does not slow anything down: it closes. What it catches is a reply
+ceiling behind them, and it has to sit above the high-water mark: at or below it the limit
+closes a connection before the pause can ever fire, so both marks would do nothing, and
+that pairing is refused at the CLI and by `Server.__init__` the way an inverted pair of
+marks is. It does not slow anything down: it closes. What it catches is a reply
 larger than it is, or the replies to one read's worth of requests, which the pause cannot
 unqueue once they are parsed -- and whether the pause keeps a connection under it depends
 on how much one read's worth of requests produces, which is a property of the client and
