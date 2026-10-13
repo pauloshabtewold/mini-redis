@@ -72,6 +72,16 @@ TYPE_LIST = 1
 # snapshot's, and it ends in the snapshot extension, so whatever already ignores
 # snapshots ignores it too
 _TEMPORARY_SUFFIX = ".tmp.mrdb"
+# check_writable()'s probe gets a suffix of its own rather than a save's, so that
+# stale_temporaries() cannot mistake one for an interrupted save. They were the same shape
+# until the probe grew a write and a sync, which took its life from a median 0.10 ms to
+# 3.03 ms -- long enough that two servers starting together in one directory see each
+# other's: measured, one of them warned that a save had likely been interrupted in 90 of
+# 150 pairs, against 21 of 150 before, of a file that was gone 3 ms later. It still ends in
+# the snapshot extension, so whatever ignores snapshots ignores it too, and it is exactly as
+# long as a save's: one byte longer and the check would refuse the longest basename a save
+# can actually write, on a filesystem that counts a name's bytes
+_PROBE_SUFFIX = ".prb.mrdb"
 
 
 class SnapshotError(Exception):
@@ -83,6 +93,18 @@ class SnapshotError(Exception):
     missing file raises `FileNotFoundError` -- see `load()` -- because absent and
     corrupt are different answers to the caller and `Server.__init__` acts on them
     differently.
+    """
+
+
+class UnwritablePath(SnapshotError):
+    """`check_writable()` refused `path`: no save there could complete as things stand.
+
+    A `SnapshotError` subclass rather than a flag, so that every caller catching
+    `SnapshotError` is unaffected and the one caller that has to tell this apart from a file
+    that will not load -- `server.py`, which offers `--ignore-snapshot` for the second and
+    must not for the first, since such a server would start and fail at its first save -- asks
+    by type. It asked by substring until the path an operator typed turned out to be able to
+    contain the substring.
     """
 
 
@@ -101,8 +123,8 @@ def encode(store: Store) -> bytes:
 
 # the width every length prefix in the format is packed at -- struct.pack("<I", ...)
 # raises struct.error past this bound, naming no key and no size, which is silent
-# until the next periodic save dies with a traceback the log cannot connect back to
-# whichever key grew past it. reachable with --max-value-size 0, which turns that cap
+# until the next periodic save fails with one logged line that cannot be connected back
+# to whichever key grew past it. reachable with --max-value-size 0, which turns that cap
 # off entirely
 _UINT32_MAX = 0xFFFFFFFF
 
@@ -175,8 +197,12 @@ def _decode(blob: bytes) -> Store:
     (version,) = struct.unpack_from("<I", blob, 4)
     if version != SNAPSHOT_VERSION:
         # the direction is named, because "corrupt snapshot: unsupported snapshot version" sends
-        # an operator looking for bad hardware when what they have is a file a newer build wrote
-        written_by = "a newer build" if version > SNAPSHOT_VERSION else "an older build"
+        # an operator looking for bad hardware when what they have is a file some other build
+        # wrote. "an older build" is deliberately not among the answers: SNAPSHOT_VERSION has
+        # been 1 since the format was introduced, with the checksum, so a lower version is a
+        # version nothing ever wrote rather than an earlier build's
+        written_by = ("a newer build" if version > SNAPSHOT_VERSION
+                      else "a build this one knows nothing about")
         raise SnapshotError(
             "unsupported snapshot version: %d, where this build writes and reads %d, so this "
             "file was written by %s rather than corrupted"
@@ -317,6 +343,17 @@ def save(store: Store, path: str) -> None:
         # never reaches this line at all, and the file it strands is left for
         # stale_temporaries() to name at the next start
         if temp_path is not None:
+            # write(), flush() and fsync() take no path, so the OSError a full device raises has
+            # filename None and its str() names no file at all -- which is the failure this save
+            # is most likely to meet and the one where the operator most needs to know which
+            # file. the caller logs str(exc) and no traceback, so the path has to be on the
+            # exception itself; measured, "[Errno 28] No space left on device" with nothing else
+            # only one raised the way a syscall raises: an OSError built from a bare message
+            # has errno None, and giving that one a filename switches str() to the
+            # "[Errno None] None: 'path'" form and loses the message it was carrying
+            if (isinstance(original, OSError) and original.filename is None
+                    and original.errno is not None):
+                original.filename = temp_path
             try:
                 os.remove(temp_path)
             except OSError as cleanup_exc:
@@ -333,7 +370,7 @@ def save(store: Store, path: str) -> None:
     # step raised over a snapshot that was already on disk, the handler above then tried
     # to remove a name the rename had consumed, and the note it attached told the operator
     # a full-size copy had been stranded -- of a save that had in fact succeeded, once per
-    # interval, with a traceback under it
+    # interval, under a traceback the guard wrote at the time and no longer writes
     _sync_the_directory(directory)
 
 
@@ -421,9 +458,10 @@ def check_writable(path: str) -> None:
     the rename that finishes a save -- the one operation a trial below cannot perform
     without destroying the snapshot, so it is checked separately rather than by trying
     it. Everything else is checked by trying it: a file made in `path`'s own directory
-    with the same prefix and suffix `save()`'s temporary file uses, written to, synced,
-    then removed. A server started over a path this refuses answers every write and
-    loses all of them, with one logged failure per interval as the only sign, so the
+    with the same prefix `save()`'s temporary file uses and a suffix of the same length
+    that nothing mistakes for one, written to, synced, then removed. A server started over
+    a path this refuses answers every write and loses all of them, with one logged failure
+    and then a line per hundred repeats as the only sign, so the
     refusal belongs before it starts. This sees the directory, and the existing snapshot
     if there is one, as they are at the call -- a directory made read-only afterwards, an
     ACL changed afterwards, or a device that fills up afterwards, is met by the save
@@ -454,7 +492,7 @@ def check_writable(path: str) -> None:
     guess at the rest.
     """
     if not os.path.basename(path):
-        raise SnapshotError("cannot write snapshot %r: the path names no file" % (path,))
+        raise UnwritablePath("cannot write snapshot %r: the path names no file" % (path,))
     # lstat, not isdir: the save finishes with os.rename() over path, and rename does
     # not follow a symlink in its final component -- it replaces the link itself. A path
     # that is a symlink to a directory is therefore one a save writes without complaint,
@@ -470,10 +508,10 @@ def check_writable(path: str) -> None:
         # what names the real reason if the directory itself refuses
         path_mode = None
     if path_mode is not None and stat.S_ISDIR(path_mode):
-        raise SnapshotError("cannot write snapshot %s: a directory stands at that path" % path)
+        raise UnwritablePath("cannot write snapshot %s: a directory stands at that path" % path)
     directory = _directory_of(path)
     if not os.path.isdir(directory):
-        raise SnapshotError(
+        raise UnwritablePath(
             "cannot write snapshot %s: %s does not exist or is not a directory"
             % (path, directory))
     # a save's last step is a rename over path itself -- an existing snapshot's own
@@ -491,15 +529,16 @@ def check_writable(path: str) -> None:
         # below is what names the real reason if the directory itself refuses
         flags = 0
     if flags & (stat.UF_IMMUTABLE | stat.SF_IMMUTABLE | stat.UF_APPEND | stat.SF_APPEND):
-        raise SnapshotError(
+        raise UnwritablePath(
             "cannot write snapshot %s: the existing snapshot's flags would block a "
             "rename over it" % (path,))
     # everything left standing -- directory permissions, an ACL, a name the filesystem
-    # will not accept -- is answered by attempting exactly what a save attempts: the
-    # same temporary file, in the same place, removed the same way
+    # will not accept -- is answered by attempting what a save attempts: the same write to
+    # the same place, synced the same way and removed the same way, under a suffix of its
+    # own so that nothing mistakes it for a save's
     try:
         descriptor, probe_path = tempfile.mkstemp(
-            dir=directory, prefix=os.path.basename(path) + ".", suffix=_TEMPORARY_SUFFIX)
+            dir=directory, prefix=os.path.basename(path) + ".", suffix=_PROBE_SUFFIX)
     except OSError as exc:
         # the two errnos a directory answers when it simply will not take the file name
         # what they are, because "is not writable" is what an operator can act on, where
@@ -507,43 +546,49 @@ def check_writable(path: str) -> None:
         # other errno -- a name too long, bytes the filesystem will not encode -- is left
         # to say what it is, since that is a fact about the path they typed
         if exc.errno in (errno.EACCES, errno.EPERM):
-            raise SnapshotError(
+            raise UnwritablePath(
                 "cannot write snapshot %s: %s is not writable: %s"
                 % (path, directory, exc)) from exc
-        raise SnapshotError("cannot write snapshot %s: %s" % (path, exc)) from exc
+        raise UnwritablePath("cannot write snapshot %s: %s" % (path, exc)) from exc
     # a save's defining act is the write, and a device with no room takes the directory entry and refuses the bytes, so a probe that only creates and removes a file passes a path the first save fails on, measured: a volume df called 1,012 KiB available accepted the mkstemp and answered ENOSPC to one byte
     # synced as well as written, because a filesystem that defers allocation answers at the flush rather than at the write, and Linux is what the image runs
+    # the whole of it under one BaseException arm, for the reason save() gives for its own: a
+    # KeyboardInterrupt unwinds through here too, and the sync is where it lands -- measured, a
+    # Ctrl-C arriving during startup stranded the probe in 5 of 80 trials against 0 of 80
+    # before the write and the sync were added, every traceback ending in _sync_to_the_device.
+    # a SIGKILL inside the same window strands it still, and nothing in any process can help
+    # that; what it leaves is one byte under a name no save gives
     try:
-        os.write(descriptor, b"\0")
-        _sync_to_the_device(descriptor)
-    except OSError as exc:
-        # best-effort, since the refusal below is what the operator acts on and a probe left behind is named by stale_temporaries() at the next start
         try:
-            os.close(descriptor)
-        except OSError:
-            pass
+            os.write(descriptor, b"\0")
+            _sync_to_the_device(descriptor)
+        except OSError as exc:
+            raise UnwritablePath(
+                "cannot write snapshot %s: %s took the file but not the bytes a save writes: %s"
+                % (path, directory, exc)) from exc
+        finally:
+            # in a finally because every arm below it needs the descriptor closed, including
+            # the interrupt that reaches the outer handler
+            try:
+                os.close(descriptor)
+            except OSError:
+                pass
+        try:
+            os.remove(probe_path)
+        except OSError as exc:
+            # the probe file itself is stranded by the same failure that refuses the start, so
+            # the refusal names it: it is the operator's to remove, and it is not reported at
+            # the next start, because a file under this suffix is not an interrupted save
+            raise UnwritablePath(
+                "cannot write snapshot %s: a file can be created in %s but not removed, so "
+                "%s is left there: %s" % (path, directory, os.path.basename(probe_path), exc)
+            ) from exc
+    except BaseException:
         try:
             os.remove(probe_path)
         except OSError:
             pass
-        raise SnapshotError(
-            "cannot write snapshot %s: %s took the file but not the bytes a save writes: %s"
-            % (path, directory, exc)) from exc
-    try:
-        os.close(descriptor)
-    except OSError:
-        pass
-    try:
-        os.remove(probe_path)
-    except OSError as exc:
-        # the probe file itself is stranded by the same failure that refuses the start,
-        # so the refusal names it: it is the operator's to remove, and at
-        # the next start it is reported among the files an interrupted save may have
-        # left, where its name alone cannot say which of the two it is
-        raise SnapshotError(
-            "cannot write snapshot %s: a file can be created in %s but not removed, so "
-            "%s is left there: %s" % (path, directory, os.path.basename(probe_path), exc)
-        ) from exc
+        raise
 
 
 def stale_temporaries(path: str) -> list[str]:

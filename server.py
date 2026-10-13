@@ -3,6 +3,7 @@
 import argparse
 import contextlib
 import errno
+import ipaddress
 import logging
 import os
 import signal
@@ -137,8 +138,9 @@ SWEEP_RELOOP_THRESHOLD = 0.25
 SWEEP_BUDGET_SECONDS = 0.001
 # how many repeats of one periodic task's failure pass in silence before a line says how
 # many there were. see _guard_task: a task that fails on every tick -- a save over a path
-# whose snapshot cannot be replaced, a full disk -- writes one traceback and then a short
-# line per this many, instead of a traceback per interval for as long as the server runs
+# whose snapshot cannot be replaced, a full disk -- writes one line naming the exception
+# and then a short line per this many, instead of one line per interval for as long as the
+# server runs
 FAILURE_REPEATS_PER_LINE = 100
 # the cap's counterpart to FAILURE_REPEATS_PER_LINE, ten times larger because the two rates differ: a periodic task fails at most once an interval, where a client retrying in a loop is refused as fast as it can connect, and a hundred of those would still write a line every few milliseconds. see Server._log_refusal
 REFUSALS_PER_LINE = 1000
@@ -380,6 +382,19 @@ def _write_buffer_low_water(value: str) -> int:
 LOG_LEVELS = ("DEBUG", "INFO", "WARNING", "ERROR")
 
 
+def _is_an_ipv6_literal(host: str) -> bool:
+    # the zone id a link-local address carries is cut first, since ipaddress does not parse it and fe80::1%en0 is still an IPv6 address for the purpose of saying why this listener refused it
+    try:
+        return isinstance(ipaddress.ip_address(host.partition("%")[0]), ipaddress.IPv6Address)
+    except ValueError:
+        return False
+
+
+def _notes_of(exc: BaseException) -> str:
+    # str() of an exception renders its args and, for an OSError, its filename -- never its notes, which only traceback rendering prints. persistence.save() puts one on the exception it re-raises to say it stranded a full-size temporary file, and _guard_task writes no traceback, so without this the single line reporting a failed save is the only report there will be of a copy of the keyspace left on disk, and it does not mention it
+    return "".join("; " + str(note) for note in getattr(exc, "__notes__", ()))
+
+
 def _log_level(value: str) -> str:
     # folded only when the folded form is a level, so argparse's own "invalid choice" quotes what
     # the operator typed. type=str.upper refused "verbose" as invalid choice: 'VERBOSE', naming a
@@ -588,8 +603,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
         default=DEFAULT_RATE_LIMIT,
         metavar="REQUESTS",
         help="answer an error, without dispatching, once a connection has been permitted "
-             "REQUESTS commands inside --rate-limit-window; 0 disables the limiter, which "
-             "is the default. permitted and not sent: a refusal records nothing, so the "
+             f"REQUESTS commands inside --rate-limit-window; the default is "
+             f"{DEFAULT_RATE_LIMIT}, which disables the limiter. permitted and not sent: a refusal records nothing, so the "
              "budget returns one window after the permits and a refused command never "
              "delays it. the budget is per connection, so a client gets a fresh one by "
              "reconnecting and nothing here bounds how often it may -- --max-connections "
@@ -645,8 +660,9 @@ def build_arg_parser() -> argparse.ArgumentParser:
         type=_host,
         default=LISTEN_HOST,
         metavar="HOST",
-        help="the IPv4 address to listen on, or a name that resolves to one. the default "
-             "is loopback, so a server is local-only unless asked otherwise: it has no "
+        help=f"the IPv4 address to listen on, or a name that resolves to one. the default "
+             f"is {LISTEN_HOST}, which is loopback, so a server is local-only unless asked "
+             "otherwise: it has no "
              "authentication, and whatever can reach the port can read and change every "
              "key. an empty value is refused, since it would listen on every interface; "
              "0.0.0.0 asks for that by name",
@@ -861,10 +877,14 @@ class Server:
                 listener.close()
             # an IPv6 literal gets EAI_NONAME from an AF_INET bind, byte-identical to a
             # misspelled hostname's, so it is named: ::1 is neither unknown nor unresolvable
-            # and the reason it is refused is that this listener is IPv4
-            if ":" in self.host:
+            # and the reason it is refused is that this listener is IPv4. keyed on the host
+            # really parsing as one and on this being a resolution failure, not on a colon and
+            # any OSError: --host 127.0.0.1:7000 is the likeliest mistake that holds a colon and
+            # was answered "127.0.0.1:7000 is an IPv6 address", and a real EMFILE at socket()
+            # told ::1 the same thing where 127.0.0.1 correctly read "Too many open files"
+            if isinstance(exc, socket.gaierror) and _is_an_ipv6_literal(self.host):
                 raise ListenFailed(
-                    "cannot listen on %s:%d: this server listens on IPv4 only, and %s is "
+                    "cannot listen on [%s]:%d: this server listens on IPv4 only, and %s is "
                     "an IPv6 address; pass an IPv4 address or a name that resolves to one"
                     % (self.host, self.port, self.host)) from exc
             raise ListenFailed(
@@ -993,7 +1013,7 @@ class Server:
         # the loop never reaches select() again and every client is served nothing, with
         # no further line to say so. the first failure is reported in full because it is
         # the diagnostic; the repeats after it carry no information the first did not,
-        # and a count says more than a thousand copies of one traceback
+        # and a count says more than a thousand copies of one line
         #
         # this bounds what this server writes. it does not make the write non-blocking,
         # and nothing here can: O_NONBLOCK lives on the open file description, which
@@ -1005,7 +1025,7 @@ class Server:
             failures = self._failures_in_a_row.get(what, 0) + 1
             self._failures_in_a_row[what] = failures
             if failures == 1:
-                # the error in the message with %r, and no exc_info: a traceback is rendered by
+                # the error in the message and no exc_info: a traceback is rendered by
                 # opening source files, and a descriptor table with no room left is one of the
                 # ways every task guarded here fails -- the shutdown save's temporary file, the
                 # periodic save's, the sweep's accept. Rendering one there fails the same way and
@@ -1013,7 +1033,8 @@ class Server:
                 # no account of what failed: measured, a full table lost the whole shutdown save
                 # and printed nothing else, under a drain line reading complete and exit 0.
                 # the class name and str(exc), not %r: OSError's str() carries the errno AND the path, "[Errno 2] No such file or directory: '/no/such/dir/dump.mrdb'", where %r gives "FileNotFoundError(2, 'No such file or directory')" and drops the one thing an operator needs. the class is named separately because str() of an exception raised with no argument is empty
-                logger.error("%s failed: %s: %s", what, type(exc).__name__, exc)
+                # and the notes, because str() drops those too: persistence.save() attaches one to say it stranded a full-size copy of the keyspace, which nothing else reports, and a line that omits it leaves a file per failed interval on disk with no mention anywhere -- measured, four 104,816-byte copies under an ACL that denied the removal
+                logger.error("%s failed: %s: %s%s", what, type(exc).__name__, exc, _notes_of(exc))
             elif failures % FAILURE_REPEATS_PER_LINE == 0:
                 # no traceback and no exc_info: this line exists to say the failure is
                 # still going, and the one that named it is already in the log above
@@ -1658,8 +1679,10 @@ def _parse_and_run(argv) -> None:
         # and every numeric refusal this parser writes already points at its own way out, where
         # the one refusal with a flag built for it said nothing. only for a load that was refused
         # -- a path no save could write is not what --ignore-snapshot is for, since it would start
-        # and then fail at the first save
-        if "snapshot" in str(exc) and "cannot write" not in str(exc):
+        # and then fail at the first save -- and asked by type, because the substrings this used
+        # to read are a message the operator's own path is interpolated into: a corrupt snapshot
+        # under a directory named "cannot write" lost the remedy
+        if not isinstance(exc, persistence.UnwritablePath):
             print(
                 "       --ignore-snapshot starts with an empty keyspace without reading that "
                 "file; with --snapshot-interval 0 beside it the file is left untouched, which "

@@ -19,6 +19,7 @@ not choose.
 import errno
 import faulthandler
 import fcntl
+import io
 import logging
 import os
 import subprocess
@@ -1645,3 +1646,93 @@ def test_check_writable_still_accepts_a_directory_with_room(tmp_path):
     assert not list(tmp_path.iterdir()), (
         "the probe was left behind on the accepting path",
         [p.name for p in tmp_path.iterdir()])
+
+
+def test_save_names_the_file_in_an_oserror_that_took_no_path(tmp_path, monkeypatch):
+    # the defect this exists for: write(), flush() and fsync() take no path, so the OSError a
+    # full device raises has filename None and its str() names no file at all -- which is
+    # exactly the failure the startup check exists to anticipate and the one the operator most
+    # needs a file name for. server.py's _guard_task logs str(exc) and no traceback, so a
+    # path-less exception means a save that lost the keyspace is reported as nothing but
+    # "[Errno 28] No space left on device". the write is substituted for the reason the probe's
+    # own tests substitute it: a unit test cannot fill a device
+    path = tmp_path / "dump.mrdb"
+    store = Store()
+    store.write(b"k", b"v", keep_ttl=False)
+
+    def no_room(descriptor):
+        raise OSError(errno.ENOSPC, "No space left on device")
+
+    # the sync rather than the write, because a BufferedWriter's write cannot be substituted --
+    # and the sync is the same shape of failure for this purpose: a filesystem that defers
+    # allocation answers there, with no path either
+    monkeypatch.setattr(persistence, "_sync_to_the_device", no_room)
+    with pytest.raises(OSError) as failed:
+        persistence.save(store, str(path))
+    monkeypatch.undo()
+    assert failed.value.errno == errno.ENOSPC, failed.value
+    assert ".tmp.mrdb" in str(failed.value), (
+        "the exception names no file, so the one line that reports a failed save says only "
+        "the errno and the operator cannot tell which path lost the keyspace", str(failed.value))
+    assert "No space left on device" in str(failed.value), str(failed.value)
+
+
+def test_save_leaves_an_oserror_raised_with_a_bare_message_alone(tmp_path, monkeypatch):
+    # the control for the test above, and the regression it caused once: an OSError built from a
+    # bare string has errno None, and giving that one a filename switches str() to the
+    # "[Errno None] None: 'path'" form, which loses the message the exception was carrying
+    path = tmp_path / "dump.mrdb"
+    store = Store()
+    store.write(b"k", b"v", keep_ttl=False)
+
+    def refuse(*args, **kwargs):
+        raise OSError("fdopen refused")
+
+    monkeypatch.setattr(os, "fdopen", refuse)
+    with pytest.raises(OSError, match="fdopen refused"):
+        persistence.save(store, str(path))
+
+
+def test_the_startup_probe_is_removed_when_an_interrupt_arrives_mid_probe(tmp_path, monkeypatch):
+    # the defect this exists for: the probe's failure arm caught OSError where save() catches
+    # BaseException and says why -- a KeyboardInterrupt unwinds through here too. the write and
+    # the sync took the probe's life from a median 0.10 ms to 3.03 ms, and measured against a
+    # real server, a Ctrl-C arriving during startup stranded the probe in 5 of 80 trials where
+    # the tree before the write stranded it in 0 of 80. nothing ever removes the stray, and
+    # every later start warns that a save may have been interrupted and that the file may hold
+    # its snapshot
+    def interrupted(descriptor):
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(persistence, "_sync_to_the_device", interrupted)
+    with pytest.raises(KeyboardInterrupt):
+        persistence.check_writable(str(tmp_path / "dump.mrdb"))
+    monkeypatch.undo()
+    assert not list(tmp_path.iterdir()), (
+        "the interrupt stranded the probe, which nothing removes and every later start "
+        "reports as a possibly-interrupted save",
+        [p.name for p in tmp_path.iterdir()])
+
+
+def test_the_startup_probe_is_not_named_as_a_file_an_interrupted_save_may_have_left(tmp_path):
+    # the probe and a save's temporary file were the same shape, and the probe's widened window
+    # made two servers starting together in one directory see each other's: measured, one of
+    # them warned that a save had likely been interrupted in 90 of 150 pairs against 21 of 150
+    # before, of a file that was gone three milliseconds later. so the probe carries a suffix of
+    # its own, and stale_temporaries() does not report it
+    path = tmp_path / "dump.mrdb"
+    probe = tmp_path / (path.name + ".abcdefgh" + persistence._PROBE_SUFFIX)
+    probe.write_bytes(b"\0")
+    assert persistence.stale_temporaries(str(path)) == [], (
+        "a probe is reported as a file an interrupted save may have left, so a server that "
+        "starts beside one warns that it may hold a snapshot, of a one-byte file",
+        persistence.stale_temporaries(str(path)))
+    # and the control: a real save's temporary file of the same length is still reported
+    temporary = tmp_path / (path.name + ".abcdefgh" + persistence._TEMPORARY_SUFFIX)
+    temporary.write_bytes(b"\0")
+    assert persistence.stale_temporaries(str(path)) == [temporary.name], (
+        persistence.stale_temporaries(str(path)))
+    assert len(persistence._PROBE_SUFFIX) == len(persistence._TEMPORARY_SUFFIX), (
+        "the probe's suffix has to be exactly as long as a save's: one byte longer and the "
+        "check refuses the longest basename a save can actually write, on a filesystem that "
+        "counts a name's bytes")

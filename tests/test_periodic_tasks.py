@@ -941,8 +941,11 @@ def test_a_snapshot_a_newer_build_wrote_is_not_called_corrupt(tmp_path):
     # when what they had was version skew. the checksum passed, so the bytes are exactly what some
     # build wrote and nothing about them is corrupt
     import struct, zlib
+    # the lower version does not say "an older build": SNAPSHOT_VERSION has been 1 since the
+    # format was introduced, with the checksum, so nothing ever wrote a lower one
     for version, expected in ((persistence.SNAPSHOT_VERSION + 1, "a newer build"),
-                              (persistence.SNAPSHOT_VERSION - 1, "an older build")):
+                              (persistence.SNAPSHOT_VERSION - 1,
+                               "a build this one knows nothing about")):
         body = persistence.MAGIC + struct.pack("<I", version) + struct.pack("<I", 0)
         path = tmp_path / ("v%d.mrdb" % version)
         path.write_bytes(body + struct.pack("<I", zlib.crc32(body)))
@@ -957,7 +960,9 @@ def test_a_snapshot_a_newer_build_wrote_is_not_called_corrupt(tmp_path):
         assert "corrupt" not in said.split("rather than corrupted")[0], (
             "a version this build does not know is not corruption", version, said)
         assert expected in said, ("the direction has to be named", version, expected, said)
-        assert str(persistence.SNAPSHOT_VERSION) in said, (
+        # "reads %d" and not a bare digit: the random pytest tmp path in this very message
+        # holds digits, so `str(SNAPSHOT_VERSION) in said` passed whatever the message said
+        assert "reads %d" % persistence.SNAPSHOT_VERSION in said, (
             "and what this build does read", version, said)
         assert "--ignore-snapshot" in said, ("and the way past it", version, said)
         assert path.read_bytes() == body + struct.pack("<I", zlib.crc32(body)), (
@@ -1402,3 +1407,61 @@ def test_run_unwinds_cleanly_when_a_periodic_task_raises_keyboardinterrupt():
         "both deadlines must still be disarmed on the way out")
     assert (signal.getsignal(signal.SIGINT), signal.getsignal(signal.SIGTERM)) == before, (
         "the signal handlers must still be restored when run() exits through this path")
+
+
+def test_the_first_failure_line_carries_the_notes_the_exception_arrived_with(tmp_path):
+    # the defect this exists for: persistence.save() attaches a note to say it stranded a
+    # full-size temporary file -- a whole copy of the keyspace, one per failed interval -- and
+    # its own comment says the note "rides along on the exception the caller already logs".
+    # str() never renders __notes__; only traceback formatting does, and this line writes no
+    # traceback. So the line reporting the failure was the only report there would be of a copy
+    # of the keyspace left on disk, and it did not mention it. Measured against a real server
+    # under an ACL that denied the removal: four 104,816-byte files, four log lines, no mention
+    server = Server(0, snapshot_interval=0, expiry_sweep_interval=0)
+
+    def step():
+        exc = OSError(13, "Permission denied")
+        exc.filename = str(tmp_path / "dump.mrdb.abcdefgh.tmp.mrdb")
+        exc.add_note(
+            "left the temporary file %s behind: removing it failed too: [Errno 13] "
+            "Permission denied" % (exc.filename,))
+        raise exc
+
+    records = []
+    handler = logging.Handler()
+    handler.emit = records.append
+    logging.getLogger("server").addHandler(handler)
+    try:
+        server._guard_task("snapshot save", step)
+    finally:
+        logging.getLogger("server").removeHandler(handler)
+        server._loop.close()
+    reports = [r for r in records if " failed: " in r.getMessage()]
+    assert len(reports) == 1, [r.getMessage() for r in records]
+    line = reports[0].getMessage()
+    assert "left the temporary file" in line, (
+        "the note is dropped, so the one line reporting a failed save is the only report of a "
+        "full-size copy of the keyspace left on disk and does not mention it", line)
+    assert "dump.mrdb.abcdefgh.tmp.mrdb" in line, line
+    assert not reports[0].exc_info, "the line still carries no traceback"
+
+
+def test_a_failure_with_no_notes_is_rendered_with_nothing_appended(tmp_path):
+    # the control: the common case has no notes, and the line must not grow a separator or an
+    # empty tail for it
+    server = Server(0, snapshot_interval=0, expiry_sweep_interval=0)
+
+    def step():
+        raise OSError(28, "No space left on device")
+
+    records = []
+    handler = logging.Handler()
+    handler.emit = records.append
+    logging.getLogger("server").addHandler(handler)
+    try:
+        server._guard_task("snapshot save", step)
+    finally:
+        logging.getLogger("server").removeHandler(handler)
+        server._loop.close()
+    line = [r for r in records if " failed: " in r.getMessage()][0].getMessage()
+    assert line == "snapshot save failed: OSError: [Errno 28] No space left on device", line
