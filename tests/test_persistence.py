@@ -12,6 +12,12 @@ write refused by `check_writable()`, entries that stop short of the trailer with
 correct checksum, a checksummed blob whose layout runs past its own end -- once through
 each of the two bounds errors the decoder translates -- and the two type bytes pinned
 against their literal values.
+Two of them are the format itself, written out as bytes: `encode` must produce exactly the
+blob this version is and `decode` must read it back, over a fixture carrying both kinds, a
+real absolute deadline, binary bytes, an empty list element and a bare CRLF. The type-byte
+test says why that is not covered by any round trip -- encode and decode are symmetric, so a
+change to both is invisible in process -- and it pinned two of eleven fields. These pin the
+rest: a flip of the expiry's byte order on both sides passes every other test in the suite.
 test_persistence_properties.py covers the refusal contract over inputs this module does
 not choose.
 """
@@ -36,7 +42,7 @@ import pytest
 
 import commands
 import persistence
-from store import KIND_LIST, Store
+from store import KIND_LIST, KIND_STRING, Store
 from tests.conftest import FROZEN, FrozenStore
 
 
@@ -297,6 +303,59 @@ def test_entries_that_end_before_the_trailer_are_refused():
     assert zlib.crc32(spliced[:-4]) == trailer
     with pytest.raises(persistence.SnapshotError, match="trailing bytes"):
         persistence.decode(spliced)
+
+
+# a snapshot of one string with no deadline, one string with a real absolute deadline and
+# binary bytes in its value, and a three-element list holding an empty element and a bare CRLF,
+# written out as the bytes this format version is. the type-byte test below pins two of the
+# format's eleven fields against literals and gives the reason -- encode and decode are
+# symmetric, so a change to both is invisible in process -- and this pins the other nine: every
+# length prefix's width and byte order, the field order inside an entry, the expiry's signedness
+# and endianness, the list's element count and per-element framing, the header, and the trailer's
+# position and algorithm. measured against the tree that produced it: flipping the expiry from
+# "<q" to ">q" on both sides of persistence.py passes all 1,179 other tests and decodes a 2096
+# deadline of 4,000,000,000,000 as 18,177,481,152,593,920, CRC verified and SNAPSHOT_VERSION
+# still reading 1, so every snapshot ever written is misread with nothing to say so
+_FORMAT_VERSION_1_BYTES = (
+    b"MRDB\x01\x00\x00\x00\x03\x00\x00\x00\x01\x00\x00\x00s\x00"
+    b"\xff\xff\xff\xff\xff\xff\xff\xff\x01\x00\x00\x00v\x01\x00"
+    b"\x00\x00t\x00{h\xe5\xcf\x8b\x01\x00\x00\x02\x00\x00\x00\x00"
+    b"\xff\x01\x00\x00\x00l\x01\xff\xff\xff\xff\xff\xff\xff\xff"
+    b"\x03\x00\x00\x00\x01\x00\x00\x00a\x00\x00\x00\x00\x02\x00"
+    b"\x00\x00\r\nU\xd8Z\t"
+)
+_FORMAT_VERSION_1_DEADLINE = 1700000000123
+
+
+def _format_version_1_store():
+    store = Store()
+    store.write(b"s", b"v", keep_ttl=False)
+    store.write(b"t", b"\x00\xff", keep_ttl=False)
+    store.expire_at(b"t", _FORMAT_VERSION_1_DEADLINE)
+    store.write(b"l", deque([b"a", b"", b"\r\n"]), keep_ttl=False)
+    return store
+
+
+def test_encode_produces_the_bytes_this_format_version_is():
+    blob = persistence.encode(_format_version_1_store())
+    assert blob == _FORMAT_VERSION_1_BYTES, (
+        "the snapshot format moved; every file an earlier build wrote reads differently now",
+        len(blob), len(_FORMAT_VERSION_1_BYTES))
+
+
+def test_decode_reads_the_bytes_this_format_version_is():
+    # the other direction, because a change applied to encode alone would fail the test above
+    # and leave a decoder that cannot read what is already on disk
+    items = {
+        key: (kind, value, deadline)
+        for key, kind, value, deadline in persistence.decode(_FORMAT_VERSION_1_BYTES).snapshot_items()
+    }
+    assert items[b"s"] == (KIND_STRING, b"v", -1), items[b"s"]
+    assert items[b"t"] == (
+        KIND_STRING, b"\x00\xff", _FORMAT_VERSION_1_DEADLINE), items[b"t"]
+    assert items[b"l"] == (
+        KIND_LIST, deque([b"a", b"", b"\r\n"]), -1), items[b"l"]
+    assert len(items) == 3, items
 
 
 def test_the_two_type_bytes_are_the_literal_values_this_format_version_fixes():
