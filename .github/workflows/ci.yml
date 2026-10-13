@@ -51,6 +51,12 @@ jobs:
         run: |
           pip install -e '.[build]'
           python -m build
+      # two things this step does not prove, written down because they look as though it does.
+      # pyproject.toml sets pythonpath = ["."], so the unpacked suite imports the tree beside it
+      # and not the installed distribution: a module missing from site-packages still passes its
+      # tests. And the editable install above creates mini_redis.egg-info/SOURCES.txt before
+      # `python -m build` runs, which setuptools reuses in place of its own sdist glob -- harmless
+      # on a fresh checkout, a false pass in a reused workspace
       - name: Install the sdist and run the suite it ships
         run: |
           python -m venv /tmp/sdist-venv

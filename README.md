@@ -202,8 +202,9 @@ remaining 32, 0.1965%, are the four bytes of the CRC trailer itself: recomputing
 trailer overwrites the flip, so the decoder is handed the original bytes and returns the
 original store — accepted, but as identical data rather than as different data, which is
 why the first two shares do not sum to 100%. With the CRC32 trailer verified instead of
-recomputed, every flip is refused, exhaustively, on every fixture: 94,960 positions,
-94,960 refusals.
+recomputed, every flip is refused, exhaustively, on every fixture swept: 94,960
+positions and 94,960 refusals, over eight fixtures. The suite holds three of the eight,
+33,392 positions, and sweeps those.
 
 The accepted share is not a property of "a fixture of this shape". It is the payload
 byte share, and it moves with the key set: a flip in a key is accepted as different data
@@ -227,8 +228,10 @@ that three-key fixture, each reachable by a single flip: `HELLOWORLD` came back 
 `HELLOWOVLD`; a key named `beta` came back as `beua`, so `GET beta` answered nil and a
 key nobody wrote existed; an expiry of 1700000000000 came back as 1699995805696.
 `tests/test_persistence_properties.py` pins the refusal side exactly — every flip a
-`SnapshotError`, and for the right reason — and now pins every figure in this paragraph
-as well, by running the same exhaustive sweep. `docs/DESIGN.md` has the other half of the
+`SnapshotError`, and for the right reason — and pins each of the three outcome figures
+above by running the same exhaustive sweep over the two fixtures it holds. The one
+figure it does not reach is the total across every fixture swept, which is the sum over
+eight of them; the suite holds three. `docs/DESIGN.md` has the other half of the
 picture, the count and version fields, where every flip is caught, though not all of them
 by a length prefix.
 
@@ -413,9 +416,12 @@ assumes.
 `redis-cli` works for ordinary commands and for `--pipe`, `-x`, `-r`, `--no-raw`,
 `--stat` and `--latency`, and the modes that walk the keyspace do not work at all, because
 `SCAN` is not implemented: `--scan`, `--bigkeys` and `--memkeys` each print
-`SCAN error: ERR unknown command 'SCAN'` and stop. Two of them print it *before* their own
-"Scanning the entire keyspace" banner, so the banner reads as though the scan is starting
-when it has already failed. `--eval` needs `EVAL` and `--rdb` needs `SYNC`, neither of
+`SCAN error: ERR unknown command 'SCAN'` and stop. Two of them print a
+"Scanning the entire keyspace" banner as well, and which comes first depends on where
+the output goes rather than on the client: the error is on standard error and the banner
+on standard output, so at a terminal the banner comes first and the error after it, while
+a run whose two streams are redirected into one pipe shows them the other way round,
+because the banner is then block-buffered and flushed at exit. `--eval` needs `EVAL` and `--rdb` needs `SYNC`, neither of
 which exists here. Three more print a failure and then work anyway: `-a` and `--user`
 send `AUTH`, and `-3` and `--json` send `HELLO 3`, so you see one line of complaint and
 then correct output. The interactive prompt works, and quietly has no argument hints:
@@ -784,8 +790,13 @@ then decodes the payload back into a second copy, with all three alive at the pe
 through `resource.getrusage(resource.RUSAGE_SELF).ru_maxrss`, which macOS reports in
 bytes -- `RUSAGE_CHILDREN` is what this sentence used to name and it answers for
 waited-for children, so in the one process described here it returns 0. None of the
-three is a floor: a louder machine reads higher, which is why the load is part of each
-figure rather than a caveat on it. The fixture
+three is a bound, and they do not move the same way: a louder machine reads higher for
+the two durations, which is why the load is part of each figure rather than a caveat on
+it, but peak resident memory moves in both directions, because `ru_maxrss` is a
+high-water mark the allocator and the pressure on it both decide. A harness built from
+this sentence alone, at a higher load than the band above, read 88.53 MiB in 4 of 15
+runs -- 17.7 MiB below the lower bound here -- so a re-measurement is not expected to
+come back inside that band on either side. The fixture
 is stated because the payload is a function of it, and the figures come from measuring
 the tree that ships. These figures are published here, and `docs/DESIGN.md` cites
 them without repeating them.
@@ -998,11 +1009,14 @@ into a bound on memory.
 once its connection has been permitted REQUESTS commands inside the last
 `--rate-limit-window SECONDS` (default `1`, whole seconds). Permitted, and not
 sent: a refusal records nothing, so a connection can send more than REQUESTS
-commands in a window: with a limit of 5 and a 2 s window, a client whose 8 sends spanned
-3.1 s was permitted 7 of them. Spread is what buys that, not the refusals — the same 8
-sends inside one 2 s window were permitted 5 and refused 3, and no window span in any
-run held more than 5 permits. A client library's own handshake spends the budget too, and
-`redis-py`'s spends two of it: it opens with two `CLIENT SETINFO` commands, which this
+commands in a window: with a limit of 5 and a 2 s window, a client whose 8 sends
+were arranged five together and then three a second apart was permitted 7 of them, over
+a span of 3.1 s. The arrangement is what buys that and not the span: the same 8 sends
+spread evenly over the same 3.1 s were permitted all 8, and inside one 2 s window they
+were permitted 5 and refused 3. No window span in any run held more than 5 permits. A client library's own handshake spends the budget too, and
+`redis-py` built with `protocol=2` -- the default constructor cannot connect here at all,
+for the RESP3 reason above -- spends two of it: it opens with two `CLIENT SETINFO`
+commands, which this
 server answers `unknown command`, and a refusal of that kind spends the permit exactly as
 a dispatched command does. So `--rate-limit N` leaves a `redis-py` client N minus 2 for
 its own work, and at `--rate-limit 1` or `2` it cannot run a single user command.
@@ -1174,11 +1188,15 @@ environment of its own is the right place for it.
 
 ```bash
 docker build -t mini-redis .
-docker run -d --name mini-redis -p 127.0.0.1:7000:6379 -v mini-redis-data:/data mini-redis
-until docker logs --since "$(docker inspect -f '{{.State.StartedAt}}' mini-redis)" \
-        mini-redis 2>&1 | grep -q 'listening on'; do
+docker run -d --name mini-redis -p 127.0.0.1:7000:6379 -v mini-redis-data:/data mini-redis || exit 1
+started=$(docker inspect -f '{{.State.StartedAt}}' mini-redis)
+deadline=$(( $(date +%s) + 30 ))
+until [ "$(docker inspect -f '{{.State.Running}}' mini-redis)" = true ] &&
+      docker logs --since "$started" mini-redis 2>&1 | grep -q 'listening on'; do
   [ "$(docker inspect -f '{{.State.Running}}' mini-redis)" = true ] ||
     { docker logs mini-redis; exit 1; }
+  [ "$(date +%s)" -lt "$deadline" ] ||
+    { echo 'gave up waiting for listening on'; docker logs mini-redis; exit 1; }
   sleep 0.1
 done
 redis-cli -p 7000 PING
@@ -1199,14 +1217,41 @@ one arrived after the loop had already finished. Scoped to this run it is 5 of 5
 and answering, on the same container. That matters here because the whole point of the
 volume is that you can stop and start over it.
 
-The `Running` check is there because the loop is otherwise unbounded on a start that was
-refused, and the refusals are easy to hit -- a `/data` the container's user cannot write
-is one. Without the check the loop spins forever and prints nothing, while the reason is
-already sitting in `docker logs`; with it, it gives up at once and shows you, for example
-`error: cannot write snapshot /data/dump.mrdb: /data is not writable`. If you swap the
-named volume for a bind mount of a host directory, `-v ./data:/data`, that is the failure
-you will get, because the container runs as uid 10001: either `chown 10001:10001` the
-directory, pass `--user`, or stay on a named volume as above. The server prints
+Three other lines are load-bearing, and each is here because the version without it
+failed. `|| exit 1` on the `docker run`, because re-running this block verbatim is the
+natural second use of it -- the block stops the container and never removes it -- and the
+second `docker run` is then a name conflict, which without this is not fatal: the loop
+below went on to match the stopped container's own last `listening on`, report ready, and
+hand the `PING` a refused connection, 3 of 3. The `Running` test ahead of the `grep`
+rather than after it, because as the body of the loop it runs only when the `grep` fails,
+so a match on a container that is not running short-circuits the one check that would
+have caught it. And the deadline, because `Running` alone does not bound the loop: with
+`--log-driver none`, which is set daemon-wide and not chosen per container, `docker logs`
+cannot read at all and the published loop spun past 8.8 s with the server up and
+answering `PONG`.
+
+The refusals that stop a start are easy to hit -- a `/data` the container's user cannot
+write is one, and it gives up at once and shows you
+`error: cannot write snapshot /data/dump.mrdb: /data is not writable`. A bind mount of a
+host directory, `-v ./data:/data`, is the obvious substitution for the named volume, and
+whether it works depends on the platform rather than on the uid: on Docker Desktop a
+bind source the VM shares is mapped to the host user, so uid 10001 writes it and the
+snapshot lands on the host at 0600 -- measured from a clone in a home directory, with
+the keyspace surviving a stop and start over it. A source the VM does **not** share is
+silently replaced by a root-owned directory inside the VM, where the container's writes
+never reach the host at all, and on Linux the host's own ownership applies, which is
+where the uid matters. If you hit the refusal there, `--user 0:0` works and gives up the
+non-root user this image is built around; `--user $(id -u):$(id -g)` is refused, and
+`chown 10001:10001` needs root and cannot help on Docker Desktop, where the directory
+being written is not the one you own. A **fresh** named volume is the one that always
+works: a volume takes its ownership from the image's `/data` only when it is empty at
+first mount, so one another image populated first is refused.
+
+One container at a time per volume. The snapshot path is fixed at `/data/dump.mrdb` by
+the `CMD`, so two containers over one volume is the hazard the persistence section
+describes with no directory left to vary -- measured, both answered `OK`, both exited 0
+under a clean drain line, and the first container's acknowledged write was gone after a
+restart. The remedy there is a volume of its own, not a path of its own. The server prints
 `listening on` once the listener is bound, which `run()` does after installing its own
 stop handlers, for `SIGTERM` always and for `SIGINT` unless the process inherited that
 signal ignored, and so after the snapshot has loaded. That is
@@ -1226,7 +1271,7 @@ as above unless you mean otherwise.
 The `CMD` is in exec form on purpose. The server is then PID 1 and receives the
 `SIGTERM` that `docker stop` sends, which is what makes it save and drain on the way
 out. In shell form PID 1 is the shell, which does not forward the signal: `docker stop`
-took 10.23 s, the container exited 137 and no snapshot was written, against 0.23 s, exit
+took 10.23 s, the container exited 137 and no snapshot was written, against two tenths of a second, exit
 0 and a snapshot written with the exec form. `docker stop` waits ten seconds by default
 before it sends `SIGKILL`, so a keyspace whose save takes longer than that needs
 `docker stop -t`.
