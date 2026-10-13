@@ -326,10 +326,15 @@ of thing: it holds `None` and nothing reads or sets it. `rate_limit_state` was i
 group and is not any longer, since the limiter builds its window there.
 
 Every command handler returns its reply together with an effects list, the commands a
-follower would need replayed. A write that takes effect fills it in and everything else
-returns it empty. `server.py` reads the list and throws it away, together with the
-store's own queue of expiry deletions, which it empties after each command only so that
-the queue cannot grow. Nothing consumes either. The shape stayed because the alternative
+follower would need replayed. A command a follower would have to replay fills it in and
+everything else returns it empty, which is not the same as "a write that changed
+something": `FLUSHALL` propagates against an already-empty keyspace, because the
+follower's own may not be empty, and a `SET ... PXAT` in the past propagates the `DEL` it
+amounts to. `server.py` reads the list and throws it away, together with the store's own
+queue of expiry deletions, which it empties after each dispatched command and again in
+the expiry sweep's own `finally`, once per tick -- two drain sites, and at the default
+`--expiry-sweep-interval` the sweep's is the one that fires for a key nobody looks up --
+only so that the queue cannot grow. Nothing consumes either. The shape stayed because the alternative
 was editing every handler a second time on the day something did, and because a key that
 expires on a `GET` has to produce a `DEL` with no write command in the request to carry
 it; `docs/DESIGN.md` has the reasoning.
@@ -422,14 +427,17 @@ assumes.
 
 `redis-cli` works for ordinary commands and for `--pipe`, `-x`, `-r`, `--no-raw`,
 `--stat` and `--latency`, and the modes that walk the keyspace do not work at all, because
-`SCAN` is not implemented: `--scan`, `--bigkeys` and `--memkeys` each print
-`SCAN error: ERR unknown command 'SCAN'` and stop. Two of them print a
-"Scanning the entire keyspace" banner as well, and which comes first depends on where
+`SCAN` is not implemented: `--scan`, `--bigkeys`, `--memkeys` and `--hotkeys` each print
+`SCAN error: ERR unknown command 'SCAN'` and stop. Three of them print a
+"Scanning the entire keyspace" banner as well -- `--hotkeys`'s own says it is looking for
+hot keys rather than for the biggest ones -- and which comes first depends on where
 the output goes rather than on the client: the error is on standard error and the banner
 on standard output, so at a terminal the banner comes first and the error after it, while
 a run whose two streams are redirected into one pipe shows them the other way round,
-because the banner is then block-buffered and flushed at exit. `--eval` needs `EVAL` and `--rdb` needs `SYNC`, neither of
-which exists here. Three more print a failure and then work anyway: `-a` and `--user`
+because the banner is then block-buffered and flushed at exit. `--eval` needs `EVAL`, and `--rdb` sends two
+`REPLCONF`s before it ever reaches `SYNC`, so it prints three unknown-command lines and
+not one; `--functions-rdb` gives up on the third `REPLCONF` and never asks for `SYNC` at
+all. None of those three commands exists here. Three more print a failure and then work anyway: `-a` and `--user`
 send `AUTH`, and `-3` and `--json` send `HELLO 3`, so you see one line of complaint and
 then correct output. The interactive prompt works, and quietly has no argument hints:
 `redis-cli` asks for them with `COMMAND DOCS` and then bare `COMMAND`, both answer
@@ -575,7 +583,10 @@ peak before a close, not the hold — and over all connections by
 `--max-connections`. Read that bound as the product it is: the 32 MiB above,
 times the default `--max-connections 1024`, puts the aggregate at 32 GiB — far
 past the memory of any machine this is likely to run on, and the cap is what bounds the
-count of connections, not what makes the total small. Ninety-six paused connections
+count of connections, not what makes the total small. At `--max-connections 0` neither
+that product nor the teardown's own bound has a reading at all, and what bounds the count
+is the descriptor table: measured, 3,001 connections accepted and torn down, against a
+soft `RLIMIT_NOFILE` of 1,048,576 here. Ninety-six paused connections
 drove 2.9 GB into swap on an 8 GiB machine, with every one still open and a fresh client
 still answered in six milliseconds. That a client is held and never closed is also a
 divergence from the reference, which keeps reading such a client and closes it at the
@@ -726,16 +737,33 @@ parks the next write, and closing that needs either a descriptor this process do
 or a second thread. A snapshot this server creates is `0600`, but a save replaces an
 existing entry rather than creating one, and it carries that entry's mode over — through
 `stat`, so through a symlink. So the file's permissions are whatever was at the path
-before, and a world-readable entry there leaves the keyspace world-readable. This server
+before, and a world-readable entry there leaves the keyspace world-readable. It carries
+in the other direction too, and that direction is worse: `chmod 000` on the snapshot
+leaves a keyspace its own server cannot read. The save path never reads the file, so every
+save goes on succeeding and carries the `0000` mode onto the next one, nothing is logged
+at any level, and the stop exits 0 — and then the next start is refused with
+`[Errno 13] Permission denied` and a remedy line that names `--ignore-snapshot`, which
+would discard the keyspace the file still holds. `chmod` is what fixes it. This server
 has no authentication and the snapshot is the keyspace on disk, so if that matters, own
 the path. A save writes a
 temporary file beside the snapshot, named after it, and renames it into place; a file
 left under that name, as a process killed mid-save leaves one, is never read or removed,
 and every start over the same path names it in a warning, so long as the directory can
-be listed. `--snapshot-interval` (seconds, default `60`) and `--expiry-sweep-interval`
+be listed. The startup check's own probe file is the exception, and deliberately: it ends
+in `.prb.mrdb` rather than a save's suffix, so that two servers starting in one directory
+do not report each other's as an interrupted save, and nothing names or removes it. A
+`SIGKILL` inside that check's window therefore strands one byte under a name no later
+start will ever mention — 12 of 12 when aimed at that window. `--snapshot-interval` (seconds, default `60`) and `--expiry-sweep-interval`
 (milliseconds, default `100`, the same span as the run loop's own `select()` timeout of
-`0.1` seconds) both follow the same rule as the caps above: `0` turns the periodic task
-off, and a negative value is refused at the CLI and again in `Server.__init__`. So is a
+`0.1` seconds — so on an idle loop nothing under about 100 ms is reachable: measured,
+`1`, `10` and `100` all give one sweep every 101.0 ms, and only `1000` reads differently,
+at 1009.3) both follow the same rule as the caps above: `0` turns the periodic task
+off, and a negative value is refused at the CLI and again in `Server.__init__`. Turning
+the sweep off has a cost on disk as well as in memory, because a snapshot saves what is
+resident and not what is live: measured, 10,000 keys expired five seconds earlier left a
+snapshot of 10,001 items and 270,038 bytes at `--expiry-sweep-interval 0` against 1 item
+and 38 bytes at the default, and a restart loaded all 10,000 back — invisible, since
+`DBSIZE` filters them, and permanent, since nothing will ever reclaim them. So is a
 value above `2**63 - 1`, the largest number anything in this project is allowed to hold:
 it is refused at both doors. That ceiling is a convention and not the arithmetic's own
 limit, which is far higher -- the sum that schedules an interval does not fail until the
@@ -999,7 +1027,13 @@ above measured, with the pause unable to fire. `docs/DESIGN.md` has the reasonin
 `--max-connections COUNT` (default `1024`) closes, without a reply, a connection that
 arrives while COUNT clients are already connected; `0` means no limit, and nothing is
 refused. The count is the connection set's own length, and a refused connection never
-enters it, so `INFO`'s `connected_clients` reports only admitted clients. A refusal is a
+enters it, so `INFO`'s `connected_clients` reports only admitted clients — while
+`total_connections_received` beside it counts the refusals too, which is the traffic the
+cap is turning away. One step does not honour the cap, on purpose: the accept-backlog
+sweeps a stop makes accept whatever the kernel completed after the stop, however many
+that is, because the point of them is to count what those clients sent before closing
+them. Measured, at a cap of 8 with 8 held, 60 post-stop arrivals were all accepted,
+asked and closed, and their 31,506 bytes counted. A refusal is a
 close with nothing written, because an error reply would be a `send()` from the accept
 callback, on a socket nothing tracks, on the one thread there is, for a client that by
 construction is not being kept. The server says why on its own side instead, and bounds
@@ -1188,11 +1222,9 @@ append-only flags, a `stat` result carrying a flags field, an ACL that denies de
 a device-level flush to fall back from -- every one of them a BSD facility this server
 uses where it exists and does without where it does not. `-rs` prints the reason for each
 skip, and a skip whose reason is not one of those is worth looking at. Without
-`redis-cli` on `PATH` you will see one more, for the same reason the prerequisite is
-named above. Without `redis-cli` on
-`PATH` you will see two skips rather than one, for the same reason the prerequisite is
-named above. `-rs` prints the reason for either. The four deselected are the
-crash-consistency tests below.
+`redis-cli` on `PATH` two more skip, the two tests that drive it, so a macOS run reads
+`1177 passed, 3 skipped, 4 deselected` -- measured -- for the same reason the
+prerequisite is named above. The four deselected are the crash-consistency tests below.
 
 Two other installs, neither needed to run the server or the suite. `pip install -e
 '.[profile]'` adds `py-spy`, which is only of use if you are profiling — and it needs root
@@ -1264,12 +1296,16 @@ answering `PONG`.
 
 The refusals that stop a start are easy to hit -- a `/data` the container's user cannot
 write is one, and it gives up at once and shows you
-`error: cannot write snapshot /data/dump.mrdb: /data is not writable`. A bind mount of a
+`error: cannot write snapshot /data/dump.mrdb: /data is not writable`, with the errno and
+the name of the probe file it could not create after it. A bind mount of a
 host directory, `-v ./data:/data`, is the obvious substitution for the named volume, and
 whether it works depends on the platform rather than on the uid: on Docker Desktop a
 bind source the VM shares is mapped to the host user, so uid 10001 writes it and the
 snapshot lands on the host at 0600 -- measured from a clone in a home directory, with
-the keyspace surviving a stop and start over it. A source the VM does **not** share is
+the keyspace surviving a stop and start over it. Colima behaves the same way and shares
+less: `colima ssh -- findmnt -t virtiofs` named one path, the user's home directory, and
+a bind source under it was writable by uid 10001 with the snapshot landing at 0600 owned
+by the host user, while a source outside it got the root-owned replacement below. A source the VM does **not** share is
 silently replaced by a root-owned directory inside the VM, where the container's writes
 never reach the host at all, and on Linux the host's own ownership applies, which is
 where the uid matters. If you hit the refusal there, `--user 0:0` works and gives up the
@@ -1291,6 +1327,14 @@ what makes it the right line to wait for before sending a command, and the same 
 test suite's own launcher reads; it is a later point than the one `main()`'s handler
 marks, which the paragraphs below measure. A stop that arrives during startup prints it
 too and then exits, so the line says the port is open, not that the server will stay up.
+Exit 137 has two causes here and this section has been describing one. A container the
+stop timeout kills exits 137; so does one the kernel's OOM killer takes, and `--memory`
+set too small for the snapshot is how you meet that: measured, `--memory 128m` over the
+400k-key volume exited 137 with `OOMKilled` true and an **empty** log, not one line.
+`docker inspect -f '{{.State.OOMKilled}}'` is what tells the two apart. The server also
+reads no environment variable at all, so `-e PORT=1234` and the like are accepted by
+`docker run` and ignored; the `CMD` above is where its flags come from.
+
 The image exposes port 6379, which the `-p` above publishes on loopback as 7000. It runs
 the server as a non-root user whose uid is fixed so that a volume written by one build
 is writable by the next, and keeps its snapshot at `/data/dump.mrdb`, inside a volume,
@@ -1306,7 +1350,13 @@ out. In shell form PID 1 is the shell, which does not forward the signal: `docke
 took 10.23 s, the container exited 137 and no snapshot was written, against two tenths of a second, exit
 0 and a snapshot written with the exec form. `docker stop` waits ten seconds by default
 before it sends `SIGKILL`, so a keyspace whose save takes longer than that needs
-`docker stop -t`.
+`docker stop -t`. That is a larger keyspace than it sounds: a clean stop of the 400k-key
+volume this section measures everything else on takes 1.050 to 1.083 s in the container
+and 0.366 to 0.491 s on the host, so ten seconds is roughly four million keys here, and
+nobody following this page needs the flag. What a stop that does run out of time leaves
+is not only the lost save: measured, a 12,849,152-byte partial copy stayed in the volume
+beside the snapshot, and every later start writes a warning naming it, for as long as the
+volume lives.
 
 The exec form is not a complete answer. The handler that `SIGTERM` needs exists only
 once `main()` has installed it, and the interpreter's own startup and `server.py`'s
