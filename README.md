@@ -89,7 +89,9 @@ median came back 21.8% and 30.7% in two consecutive pairs on one host. The sprea
 the reference and not this server: its own `PING_MBULK` moved between 0.909M and 1.538M
 requests per second across those two pairs. So read the median as a range and not as a
 figure, and read the 8% ship threshold as the one claim here that reproduces: it was
-cleared in every row of every run, at a worst case of 17.2%. The paragraph after the
+cleared in every row of every run, and the worst case over the fourteen invocations of
+this re-measurement was 17.2% -- the 8.18% above belongs to the earlier set of
+repetitions and is the worst case anything here has recorded. The paragraph after the
 second table holds the figures to set these beside. A row does not hold still the way the median does: in later
 repetitions a row's share was as much as 17.4 points above and 16.4 below its figure in
 the table at `-P 1`, with six of the ten rows more than 6.4 points off in a single run,
@@ -113,8 +115,11 @@ the server's own per-command dispatch work, 39 ns against 697 ns for one `PING` 
 `_dispatch_batch` measured on the same harness, and 1 to 2% of an observed pipelined
 round trip. A `-P 16` comparison with and without it fell inside the noise. A harness
 that wraps the call in a lambda and never subtracts the lambda's own 15 to 22 ns reads
-far higher, 70.7 to 93.1 ns on CPython 3.14.8, which is a property of the instrument and
-not of the check.
+far higher -- 70.7 to 93.1 ns on CPython 3.14.8 when that was taken, and 53.6 to 62.8 ns
+at load 2.2 and 62.6 to 73.5 at load 12.2 when it was taken again, so the overstatement
+moves with the machine and the band is not a figure. What does hold exactly is the
+substance: subtracting the lambda's own cost from the lambda harness's reading gives
+40.5 ns against a direct 40.3. It is a property of the instrument and not of the check.
 
 The list is pinned because the tool's default run stops at
 `SADD`, the first command in its sequence this server does not implement (see
@@ -399,9 +404,11 @@ of some tens of thousands of small commands. It packs the whole batch and writes
 before it reads any reply, which is the client the pause described under the water marks
 below leaves hanging. What decides it is the total size of the replies against the
 high-water mark and not the number of commands, so no count is the threshold: 300,000
-`SET`s, whose replies are five bytes each, completed in 2.27 s, while 600,000 hung and
-300,000 `PING`s hung in two attempts of four and completed in about a second in the
-other two. `--write-buffer-high-water 0` is what lets any of them complete. `redis-benchmark`'s
+`SET`s, whose replies are five bytes each, completed in 1.87 to 2.79 s across loads of 2.5
+to 6.8, while 600,000 hung in 2 of 2 runs given 45 seconds. 300,000 `PING`s do not hang:
+16 of 16 completed across two harnesses, in about two seconds, with a tail of three runs
+that took 11.66, 18.59 and 22.39 s -- which a patience of a few seconds reads as a hang,
+and which is what the sentence here used to say. `--write-buffer-high-water 0` is what lets any of them complete. `redis-benchmark`'s
 default run completes nine tests — `PING_INLINE` and `PING_MBULK` both, then `SET`,
 `GET`, `INCR`, `LPUSH`, `RPUSH`, `LPOP` and `RPOP` — and exits at `SADD`, the first
 command in its sequence this server does not implement at all. Two of the nine are `PING`,
@@ -498,7 +505,9 @@ batch from 28 to 40 replies, the most a still-open paused connection held was 33
 99.1% of it, and the running maximum was still rising at the last observation. Take the 32 MiB as
 the bound and the 99.1% as how close a sample gets. The transient peak before the limit closes a
 connection is bounded by the limit plus one reply, 34,603,020 bytes at 1 MiB replies,
-and was measured to within 37,692 bytes of that. A rate-limit refusal counts as a
+and was measured to within 37,692 bytes of that once; a later set of ten came no closer
+than 596,540 bytes, since reaching it needs the kernel to take under 38 KiB of a 33 MiB
+send and no client shape here arranged that. A rate-limit refusal counts as a
 reply: the refusal path queues its error and reaches the same check. Neither bound was
 exceeded in the 152, and the pause fired exactly once in every one. What the pause does for a client that is behind
 depends on the size of its replies, and the paragraph on the pause below has both
@@ -549,7 +558,9 @@ closed, in 2 of 2 runs of 25 seconds, having been sent about 60 MB — and with
 `--write-buffer-high-water 0`, the same client was closed in 2 of 2 runs inside a second.
 For replies of a megabyte the product is far over the limit, and the pause postpones the
 close rather than preventing it: 4.4 to 5.3 s at the defaults against 2.7 to 2.8 s with
-the pause off, over three runs each, with the bands not overlapping. So the pause is what
+the pause off, over three runs each, with the bands not overlapping -- and both bands move
+with the machine, reading 3.6 to 5.4 against 2.27 to 2.34 at load 2.4, where they still do
+not overlap, which is the part of this that holds. So the pause is what
 keeps the limit from firing for the first client and what delays it for the second, and
 `--write-buffer-limit 0` is what prevents it in both cases; a lock-step client that reads
 each whole reply before sending again is safe at the defaults whatever its replies weigh.
@@ -635,7 +646,9 @@ instrumented from inside the process, median 5.0949, and `SIGTERM` to exit 5.028
 and the 0.1 ms the largest is over it is within what the two sweeps cost, which that
 bound does not cover. A client that reads its replies ends the drain as soon as no reply
 is owed, not after five seconds: `_drain_for` lasted 0.1 to 0.3 ms over 17 runs and
-`SIGTERM` to exit 21 to 79 ms, median 46, over 20 ms in 15 of the 17. Whatever its
+`SIGTERM` to exit 21 to 79 ms, median 46, over 20 ms in 15 of the 17, at load 2.9 to 7.0 --
+and 9.3 to 10.6 ms over 6 runs at load 2.0, so 21 ms is the floor of that set and not of
+this step. Whatever its
 kernel still held is uncounted: non-zero in 8 of those 17 runs, 110,822 to 515,628 bytes
 across the eight, median 380,328, equal to the client socket's `SO_NWRITE` read after
 the server had exited in 7 of the 8 and off by exactly 8,192 bytes in the other, and all
@@ -848,7 +861,9 @@ kernel completed into the listener's backlog after the stop, only to count what 
 holds and close it, and they sit outside that bound, with no deadline of their own. The
 kernel's accept backlog does not bound them either: a sweep ends the first time its
 `accept()` finds the backlog empty, so it goes on while another connection is waiting at
-every poll, and one sweep accepted 722 connections where `SOMAXCONN` is 128 here, which
+every poll, and one sweep accepted 722 connections where `SOMAXCONN` is 128 here -- once,
+and ten later floods reached 128 and no more, a full backlog and nothing arriving during
+the sweep itself -- which
 means clients arrived while it ran. A sweep costs more while clients are still
 connecting, as the floods below show, and these figures were taken at load average 2.9
 to 7.0. Timed inside the sweep, 58 sweeps on a live server took 0.005 ms to 383.302 ms,
@@ -1046,11 +1061,16 @@ would arrive with a full budget. That holds while the queue of replies stays und
 it. What that takes is more refusals than the two kernels
 will absorb, and how many that is belongs to the client and not to the limit: the limit
 is judged after the send, and on loopback a handful of refusals leave every time, so ten
-do not close the connection -- measured at `--write-buffer-limit 100` against a client
-reading nothing, it took 21,691 to 21,772 refusals at this host's default 408 KiB
-receive buffer, 64,000 at a thousand requests per `sendall`, and 168,204 with that
-buffer raised to 4 MiB. Ten refusals are 260 bytes, and a `PING` answered before them
-makes 267. The budget is
+do not close the connection. How many it takes is the two kernels' own capacity divided by
+the size of a refusal, and nothing else: measured at `--write-buffer-limit 100
+--write-buffer-high-water 0` against a client reading nothing, it took 21,356 to 21,358
+refusals over five runs at loads of 5.2 and 2.2, where this host's defaults are a 408,300-byte
+receive buffer on the client and a 146,988-byte send buffer on the server, and
+(408,300 + 146,988 - 7) / 26 is 21,357. A thousand requests per `sendall` changes nothing --
+20,795 to 21,357 over six runs, indistinguishable from one per `sendall`, because the in-loop
+check flushes before it judges -- and raising the receive buffer to 4 MiB moves it exactly as
+the same arithmetic says, to 167,088 to 167,090 over five runs against a predicted 167,088.
+Ten refusals are 260 bytes, and a `PING` answered before them makes 267. The budget is
 per connection and not per address, and that is the cost: a client that closes and
 reconnects starts again with a full one. I documented that rather than engineering it
 away, since counting per address needs a table shared between connections and this loop
@@ -1151,7 +1171,8 @@ restart recovers. They are deselected for what they do rather than for what they
 each starts servers of its own and waits out a real snapshot interval, so a default run
 neither kills a process nor sits on a wall clock. They are not the slow part of the
 suite -- all four together are about 6 s, where a default run's own slowest two tests
-are about 10 s and 8 s. So `pyproject.toml` deselects them, and
+are both about 10 s -- 10.30 and 10.04 at load 2.1, 11.08 and 10.06 at load 7.5, the
+second of the two being a test that waits out a drain timeout and so barely moves. So `pyproject.toml` deselects them, and
 `python -m pytest -m manual tests/test_crash_consistency.py` selects them. Naming that
 file without the flag deselects every test in it and pytest exits 5 saying `4 deselected`
 and nothing about either the marker or the flag, which is the one way to run it that looks
@@ -1295,20 +1316,27 @@ container serves on to the end of the stop timeout and dies on `SIGKILL` with no
 and every write it answers `OK` in that time is gone after a restart. Measured on a
 400k-key volume, a `SET` was acknowledged and then lost: `docker stop` took 10.28 s, the
 container exited 137 with no drain line, and after the restart the `GET` answered nil
-and `DBSIZE` was back to 400,000. The window ends when `main()`'s one handler is armed,
-and that point does not grow with the keyspace: from the daemon's `StartedAt` to a
-marker the container printed once the handler was in place it was 209.0 to 607.4 ms over
-14 fresh starts on an empty volume, median 237.2, quartiles 222.8 and 339.7, and the
-median on a 400k-key volume was 262.2 ms, 25.0 ms more. The start is read from the
+and `DBSIZE` was back to 400,000. It is not the size of the keyspace that opens the
+window. The same loss came back 3 of 3 on an **empty** volume -- `SET` answered `OK`,
+exit 137, no drain line, and `GET` nil with `DBSIZE` 0 after the restart -- because what
+the window is made of is the interpreter's own startup. The window ends when `main()`'s
+one handler is armed, and that point does not grow with the keyspace: from the daemon's
+`StartedAt` to a marker the container printed once the handler was in place it was 169.5
+to 188.6 ms over 12 fresh starts on an empty volume, median 177.0, against 174.0 to
+190.1 ms over 10 on a 400k-key one, median 179.25 -- the same figure, 2.3 ms apart,
+inside the spread of either. The start is read from the
 daemon's clock and the marker from the container's own, so each figure carries any
 offset between them. `run()`'s two handlers are armed at a later point, after the
-snapshot load, and that one does grow: median 242.7 ms on the empty volume and
-1,257.8 ms on the 400k-key one, 5.2 times later. A stop that lands between the two is
+snapshot load, and that one does grow: median 184.05 ms on the empty volume and
+559.25 ms on the 400k-key one, three times later. A stop that lands between the two is
 recorded by `main()`'s handler and honoured by `run()`, so only the first point decides
-whether a stop is lost. The starts were taken at load average 6.1 to 7.4 and 14 is a
-small sample, so 607.4 ms is the largest seen and not a ceiling, and a quieter machine
-should read lower. Waiting for `listening on` before the first command or the first
-`docker stop`, as the `until` line above does, avoids it.
+whether a stop is lost. Those were taken at load average 2.9 to 3.0, and they move with
+it: a second set at load 5.4 to 7.1 put the 400k median at 605.8 ms over 10 starts and
+`main()`'s at 202.8 over 14, so read each as a band on a quiet machine and not as a
+ceiling. The 400k volume is 400,000 entries of a 16-byte key and a 100-byte value, a
+53,200,016-byte snapshot, because what the second point waits for is the load and a
+snapshot's size is what decides it. Waiting for `listening on` before the first command
+or the first `docker stop`, as the `until` line above does, avoids it.
 
 ## What's interesting here
 
