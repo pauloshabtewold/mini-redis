@@ -645,6 +645,31 @@ def test_the_guarded_debug_call_at_info_is_measured_and_printed():
 
 
 
+def test_the_log_level_help_says_replies_decide_the_drain_lines_level():
+    # the level is decided by the two reply counts alone, which server.py's own comment beside
+    # logger.log states and test_write_drain.py pins against the behaviour -- a whole receive
+    # queue thrown away with no reply owed is INFO and says complete. The help text used to
+    # attribute the level to loss in general, and to promise that WARNING showed the line
+    # whenever anything had been lost, which is false in exactly the case the figure on that line
+    # exists for: measured, a stop that discarded 691,012 bytes of requests already answered OK
+    # printed complete at INFO and nothing at all at WARNING. Nothing read the help against the
+    # code, so this does. The phrases it must not carry are below, not quoted here, because
+    # verify-claims.sh sweeps this file for them too
+    text = None
+    for action in build_arg_parser()._actions:
+        if "--log-level" in getattr(action, "option_strings", ()):
+            text = action.help
+    assert text, "the parser no longer defines --log-level"
+    assert "reply" in text or "replies" in text, (
+        "the drain line's level is about replies and the help has to say so", text)
+    # built rather than written out, for the reason the comment above gives: these are struck
+    # phrases and a literal here is a copy the gate would find
+    for misleading in ("when it " + "lost something", "only when " + "something was lost"):
+        assert misleading not in text, (
+            "this attributes the level to loss in general, which the request figure refutes",
+            misleading, text)
+
+
 def test_an_unknown_log_level_is_quoted_as_the_operator_typed_it(tmp_path):
     # type=str.upper folded the value before argparse compared it, so a lower-case unknown level
     # was refused as invalid choice: 'VERBOSE' -- naming a spelling the operator never used, which

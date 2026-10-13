@@ -697,10 +697,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help="how much to log, in any case. INFO reports each connection opened and "
              "closed; DEBUG adds a line per dispatched command naming the command and "
              "its argument count, never a key or a value. the shutdown drain writes one "
-             "line per stop, INFO when it lost nothing and WARNING when it lost "
-             "something, so WARNING hides the confirmation of a clean stop along with "
-             "the per-connection lines and shows that line only when something was "
-             f"lost; ERROR hides it either way. the default is {DEFAULT_LOG_LEVEL}",
+             "line per stop, INFO when no reply was lost and WARNING when one was -- "
+             "replies alone decide that, so a stop that threw away requests nobody will "
+             "answer is INFO, with the count of their bytes on the same line. WARNING "
+             "therefore hides a clean stop's confirmation, the per-connection lines and "
+             "the only report there is of discarded requests; ERROR hides the stop line "
+             f"either way. the default is {DEFAULT_LOG_LEVEL}",
     )
     return parser
 

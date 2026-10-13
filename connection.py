@@ -41,8 +41,12 @@ class Role(enum.StrEnum):
     test classifies the link as an ordinary client, which then rate-limits
     the process's own replication stream with no error anywhere.
 
-    StrEnum so the value renders directly into an INFO `role:` field and
-    into log lines with no conversion.
+    StrEnum so a value can be rendered without conversion, which nothing
+    does today: INFO's one `role:` field is the replication role, a
+    constant, and `commands/server.py` says beside it that the two
+    vocabularies are disjoint. No log line here names a connection's role
+    either. The enum is what makes a typo an AttributeError at the line
+    that has it; the str is for a reader that does not exist yet.
     """
 
     CLIENT = "client"

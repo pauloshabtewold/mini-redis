@@ -243,8 +243,10 @@ if [ -x "$VENV/bin/python" ] && [ "${SKIP_SUITE:-0}" != 1 ]; then
         # universal, where macOS skips one and Linux skips nine -- the BSD flag, ACL and
         # device-flush facilities one platform has and the other does not. Asserting the macOS
         # ending went red on the runner, and asserting no skip at all on Linux went red again.
-        # So the count is reported and not asserted, and what IS asserted is that every skip
-        # carries a reason, which is the claim the page can actually make
+        # So the count is reported and the deselected count is what is asserted, which is the
+        # one ending the page can promise on every platform. Nothing here reads a skip's reason:
+        # that would want -rs and a list of the reasons each platform is allowed, which is a
+        # second copy of what the page already says and would go stale against it
         if grep -qE "4 deselected" "$WORK/suite.log"; then
             SKIPS=$(sed -nE 's/.*[^0-9]([0-9]+) skipped.*/\1/p' "$WORK/suite.log" | head -1)
             printf 'note  %s skip(s) on %s, which the page says belongs to the platform\n' \

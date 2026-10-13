@@ -28,9 +28,10 @@ class Kind(enum.StrEnum):
     driven by the effect list, because a read that finds an expired key
     must emit a DEL and the sweep emits DELs with no command in sight.
 
-    StrEnum so the value renders into introspection output and log lines
-    with no conversion. An enum rather than a plain string so a typo is
-    an AttributeError at the line that has it.
+    An enum rather than a plain string so a typo is an AttributeError at
+    the line that has it, and a StrEnum so a value could be rendered
+    without conversion -- which, like the tag itself, nothing outside the
+    tests does: no reply carries a kind and no log line names one.
     """
 
     READ = "read"
