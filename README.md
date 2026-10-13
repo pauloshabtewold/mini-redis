@@ -81,10 +81,10 @@ What a re-measurement was for here was the figure this section says to read, the
 share of native, and the honest answer is that it does not hold to a point either. At
 `-P 16` the eight small-reply commands ran at 19.6% to 27.2% of native, median 23.5%,
 and the two `LRANGE` tests at 49.9% and 60.9%; at `-P 1` the median share was 63.0%.
-Taken again later on CPython 3.13.9, the interpreter the first table was measured on,
-four paired runs at `-P 1` gave medians of 58.9%, 63.3%, 59.0% and 58.9% -- deviations of
--4.1, +0.3, -4.0 and -3.1 points, so 63.0% is the top of the spread and not a value a
-re-measurement recovers -- and on 3.14.8, 57.6%. At `-P 16` on 3.13.9 the eight-small
+Taken again later on CPython 3.13.9, a different 3.13 from the 3.13.1 the first table names,
+four paired runs at `-P 1` gave medians of 59.9%, 63.3%, 59.0% and 58.9% -- deviations of
+-3.1, +0.3, -4.0 and -4.1 points against it, so 63.0% sits inside the spread rather than
+at the top of it, and is not a value a re-measurement recovers -- and on 3.14.8, 57.6%. At `-P 16` on 3.13.9 the eight-small
 median came back 21.8% and 30.7% in two consecutive pairs on one host. The spread tracks
 the reference and not this server: its own `PING_MBULK` moved between 0.909M and 1.538M
 requests per second across those two pairs. So read the median as a range and not as a
@@ -778,7 +778,7 @@ one thread, so the pause is priced and published rather than hidden. A snapshot 
 133 per entry and a four-byte trailer, and it came back identical in 45 of 45 runs. The
 three costs beside it are measurements and are published as the bands they came back in,
 over 30 runs on CPython 3.13.9 at load average 3.6 to 4.2: 64.2 to 78.1 ms to serialize,
-median 66.2; 83.2 to 93.8 ms to deserialize, median 85.7; and 106.3 to 115.5 MiB of peak
+median 66.2; 83.1 to 93.8 ms to deserialize, median 85.7; and 106.3 to 115.5 MiB of peak
 resident memory, median 112.5, in a process that builds the keyspace, serializes it and
 then decodes the payload back into a second copy, with all three alive at the peak. Read
 through `resource.getrusage(resource.RUSAGE_SELF).ru_maxrss`, which macOS reports in
@@ -1026,9 +1026,14 @@ stays open and is still read, and its next command is judged on its own, because
 close would look to the client like a protocol error and the reconnect that followed
 would arrive with a full budget. That holds while the queue of replies stays under
 `--write-buffer-limit`: a refusal is a reply like any other and the limit applies to
-it. What that takes is more refusals than the kernel will absorb, and not many: the
-limit is judged after the send, and on loopback ten refusals' 267 bytes leave every
-time, so ten do not close the connection and about fifty thousand do. The budget is
+it. What that takes is more refusals than the two kernels
+will absorb, and how many that is belongs to the client and not to the limit: the limit
+is judged after the send, and on loopback a handful of refusals leave every time, so ten
+do not close the connection -- measured at `--write-buffer-limit 100` against a client
+reading nothing, it took 21,691 to 21,772 refusals at this host's default 408 KiB
+receive buffer, 64,000 at a thousand requests per `sendall`, and 168,204 with that
+buffer raised to 4 MiB. Ten refusals are 260 bytes, and a `PING` answered before them
+makes 267. The budget is
 per connection and not per address, and that is the cost: a client that closes and
 reconnects starts again with a full one. I documented that rather than engineering it
 away, since counting per address needs a table shared between connections and this loop

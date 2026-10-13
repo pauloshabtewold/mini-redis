@@ -497,7 +497,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
              f"has taken what it will; the default is {DEFAULT_WRITE_BUFFER_LIMIT} ({DEFAULT_WRITE_BUFFER_LIMIT // (1024 * 1024)} MiB). 0 means no limit, and nothing is closed for it. "
              "this is a hard limit and it closes a connection for holding too much, "
              "not for failing to read: a client that reads slower than this server "
-             "produces can reach it too, because --write-buffer-high-water stops reading "
+             "produces can reach it too, because --write-buffer-high-water below stops reading "
              "such a connection but the resume then answers a whole read's worth of the "
              "requests that piled up. whether that batch exceeds BYTES depends on the "
              "size of the replies, so the pause prevents the close for small replies and "
