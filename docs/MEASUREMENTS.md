@@ -43,10 +43,15 @@ section says in its own words. The invocation, the host, the interpreter and the
 servers ran under are published with the tables; run that command against this server and
 against a private `redis-server` of the same version, each on its own port, and compare. Do not
 use a reference server you did not start: an installed daemon's own configuration decides its
-side of every row. The share figures underneath the tables were taken by driving both servers in
-one paired run so that the load is the same for both legs, which is the only part of this
-measurement that is reproducible as a number rather than as a shape. The ship threshold quoted
-there is the lowest share in its own set and not a floor.
+side of every row. Run the long form and not `-q`: the quiet form prints a rate and p50, so the
+table's p99 columns cannot come from it, and the page published the quiet form for its own p99
+figures until 2026-10-14.
+
+Everything the section says underneath the tables comes from paired runs -- both servers driven
+in one run, alternating which goes first, so the load is the same for both legs -- and those
+captures are kept. Read the shares, the median and the lowest row against the load they carry:
+load is the one thing these figures are sensitive to, and it moves them further than any of the
+bands here. The ship threshold is the lowest share in its own set and not a floor.
 
 ### The bit-flip sweep
 
@@ -72,7 +77,10 @@ A band of medians over fresh container starts at a stated load average, measured
 daemon's own start timestamp to a marker the server prints once its first signal handler is
 armed. Take it at two load averages: it moves with load by more than the band. The second figure
 in that section is the same measurement over a volume already holding the
-large keyspace that section names, which is what makes the window grow.
+large keyspace that section names, which is what makes the window grow. A third figure, the same
+handler on an empty volume, was struck on 2026-10-14: nothing in the log derived it, and
+re-taking it needs a container daemon this host is under instructions to leave stopped, so it was
+removed rather than left standing on nothing.
 
 What this section does **not** promise is that a stop at a given delay is honoured, and the
 attempt to make that exact failed for a reason worth knowing before you try it: the kill time
@@ -141,14 +149,23 @@ The capacity figure is **a largest seen**: one sweep, kept because it demonstrat
 is not bounded by the listen backlog. A later set of floods never came close to it, so a re-take
 should expect the backlog's own size, not that number. The timing band is a band over sweeps
 instrumented inside the counting function itself -- there is no flag that exposes it -- taken with
-several processes connecting continuously at `--shutdown-drain-timeout 0`.
+several processes connecting continuously at `--shutdown-drain-timeout 0`. The range is all the
+page gives, and deliberately: this figure used to carry a median too, struck on 2026-10-14,
+because a median over sweeps is a statement about how often clients arrive and the record behind
+it never said. The two ends of the range are what carry the claim, which is about the absence of a
+bound rather than about a typical sweep.
 
 ### The drain's own timings
 
-A band over runs with one client that never reads, at the shipped timeout. Time the drain and the
-process's exit separately: the gap between them is the save, the two backlog sweeps and the
-teardown flush, and the published pair only means something if they are attributed separately.
-The maximum sits just over the bound the mechanism gives, which is the interesting part of it.
+A band over runs with one client that never reads, at the shipped timeout, re-taken on
+2026-10-14 with its records kept. Two different measurements, which is why the page gives two
+bands: the drain's own duration is reachable only from inside the process, by wrapping the method
+and timing it, while the signal to the process's exit is black box. The gap between them is the
+save, the two backlog sweeps and the teardown flush. Stall the client with more owed than the
+water marks would ever let through, which means turning the limit and the high-water mark off for
+the run, or the pause ends the stall before the drain begins and the drain is timed against
+nothing. The maximum sits just over the bound the mechanism gives, which is the interesting part
+of it.
 
 ### The teardown flush after the drain's line
 
@@ -160,9 +177,11 @@ reported.
 
 ### The save a stop writes over a large keyspace
 
-A band over runs: build the keyspace, stop the server, time the save on the way out. The byte
-count beside it is arithmetic from the key and value shape, so it is checkable without running
-anything.
+A band over runs, re-taken on 2026-10-14 with its records kept: build the keyspace at the key and
+value sizes the page names, then time one save. The byte count beside it is arithmetic from those
+two sizes and the format's own header and trailer, so it is checkable without running anything --
+and it is worth checking first, because a fixture of another shape gives a byte count that does
+not match and is then measuring a different keyspace. It came back identical in every run.
 
 ### The kernel's socket-buffer answers
 
@@ -187,7 +206,10 @@ dozens of trials, on both the tree with the repair and the tree without it, coun
 files left behind. The false-warning figure comes from starting two servers in one directory over
 many pairs. The out-of-room arm needs a small filesystem image filled until a one-byte write is
 refused -- a device that reports space available and refuses the write is the condition the probe
-exists for, and no amount of load will produce it.
+exists for, and no amount of load will produce it. How much space that device still reported is
+not published here any more, struck on 2026-10-14 with nothing in the log behind it; the figure
+survives in the comment above the probe, where it is the observation that argues for writing a
+byte rather than a claim a reader would act on.
 
 ### The deliberate-differences list
 
@@ -199,16 +221,20 @@ command enabled, which is not its default.
 ## Figures I cannot hand you a first reading for
 
 The working log behind this project kept the derivation for most of what it published and, for
-these, did not. The method above is still the method, but a re-take is a first reproduction rather
-than a comparison against a record, and if yours disagrees, mine is the one without evidence
-behind it:
+six figures, did not. That was found while writing this file on 2026-10-13 and dealt with on
+2026-10-14: three were re-taken with their records kept -- the drain's own band, the band from the
+signal to the process's exit, and the duration of the save a stop writes over a large keyspace,
+all three now carrying the load they were taken at -- and three were struck, each for a reason the
+entry above gives: the accept-backlog median, the container's empty-volume startup figure, and the
+space the out-of-room device still reported.
 
-- the cells of the two benchmark tables, and the ship threshold quoted under them
-- the startup-window figure for the second of the container's two handlers on an empty volume
-- the drain's own timing band and the band from the signal to the process's exit
-- the duration of the save a stop writes over a large keyspace
-- the median of the accept-backlog sweep timings
-- the space the out-of-room filesystem still reported as available
+What is left is the one that cannot be fixed by either route:
+
+- **the cells of the two benchmark tables.** Each is a single run of a tool whose own output moves
+  by a fifth between runs, so no re-take verifies a cell; the table is the `v1` reading and its
+  captures were not kept. What stands behind the section is the reproduction published underneath
+  it, whose captures are kept, and the page says which is which. A re-take of the table is a new
+  table, not a check on this one.
 
 ## Where a later reading exists that the page does not carry
 

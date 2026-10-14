@@ -61,9 +61,12 @@ CPython 3.13.1 at `--snapshot-interval 0 --log-level WARNING`. The reference ran
 `--save "" --appendonly no`. 100,000 requests per test over 50 connections:
 
 ```bash
-redis-benchmark -h 127.0.0.1 -p <port> -n 100000 -c 50 -P 1 -q \
+redis-benchmark -h 127.0.0.1 -p <port> -n 100000 -c 50 -P 1 \
   -t ping_mbulk,set,get,incr,lpush,rpush,lpop,rpop,lrange_100,lrange_600
 ```
+
+Not `-q`: the quiet form prints a rate and p50 and no p99 at all, so the two p99 columns
+below cannot come from it. The long form prints both.
 
 | test | this server | redis-server 7.2.7 | % of native | p99 (ms) | ref p99 (ms) |
 | --- | ---: | ---: | ---: | ---: | ---: |
@@ -100,11 +103,20 @@ two `LRANGE` tests at 46.9% and 59.7% — that is what a single-threaded Python 
 costs per command.
 
 **Each cell is one run, and one run is worth less than it looks.** Re-running moved
-individual rates by as much as twenty per cent and some p99 figures by half again. What
-survived every repetition is the shape rather than the cell: the median share held within a
-few points, and the 8% ship threshold I fixed before measuring was cleared in every row of
-every run, worst case 8.18%. Read a row as an order of magnitude, not a number to compare
-against your own hardware. I did not profile: `py-spy` needs root on macOS, nothing here
+individual rates by as much as twenty per cent and some p99 figures by half again. Read a row
+as an order of magnitude, not a number to compare against your own hardware.
+
+The table above is the `v1` reading and I did not keep its captures, so what stands behind it
+is the reproduction rather than the table: three paired runs at each depth, alternating which
+server went first, every capture kept. At `-P 1` the median share came back 57.25% to 57.93%
+against the table's own 64.1%, and at `-P 16` 19.2% to 21.61%; the eight small-reply commands
+ran 15.8% to 28.5% of native pipelined and the two `LRANGE` tests 51.0% to 61.7%; the lowest
+share in any row of any run was 15.78%, so the 8% ship threshold I fixed before measuring was
+cleared everywhere with margin. All of it was taken at a load average of 3.89 to 5.83, which
+is most of why the shares sit below the table: the one thing these figures are sensitive to is
+what else the machine is doing. On p99 the reference is the denominator that moves —
+0.279 to 0.527 ms against this server's 1.295 to 1.559 ms on the small commands at `-P 1`,
+a ratio of 2.8 to 5.4 times. I did not profile: `py-spy` needs root on macOS, nothing here
 runs as root, and the profiling session existed only for a result that missed.
 
 ## Three findings
@@ -313,9 +325,8 @@ the kernel delivers no signal to a PID 1 that has only its default disposition. 
 stop timeout, dies on `SIGKILL` with no save, and a write it answered `OK` is gone after a
 restart — reproduced on both a 400k-key volume and an empty one. The window is interpreter
 startup and does not grow with the keyspace: a median 177 ms from the daemon's `StartedAt`
-to the handler being armed, against 184 ms for the handler `run()` installs after the
-snapshot load on an empty volume and 559 ms on a 400k-key one. Waiting for `listening on`
-avoids it.
+to the handler being armed, where the handler `run()` installs after the snapshot load
+reaches 559 ms on a 400k-key volume. Waiting for `listening on` avoids it.
 
 One container at a time per volume: the snapshot path is fixed by the `CMD`, so two
 containers over one volume both answer `OK`, both exit 0, and the first one's acknowledged
@@ -329,8 +340,8 @@ the OOM killer when `--memory` is too small for the snapshot, which leaves an em
 ---
 
 [Design notes](docs/DESIGN.md) cover why each module is shaped the way it is and every
-deliberate difference from real Redis. [How the figures were taken](docs/MEASUREMENTS.md) is the
-method behind every figure in both files -- what to run, what the reading depends on, and what a
-second one should be expected to agree with, including the handful it names as published without a
-first reading I can hand anyone. The observations themselves, and the log of every defect that
-escaped a gate, are kept outside this repository.
+deliberate difference from real Redis. [How the figures were taken](docs/MEASUREMENTS.md)
+is the method behind every figure in both files -- what to run, what the reading depends on,
+and what a second one should be expected to agree with, including what it names as published
+without a first reading I can hand anyone. The observations themselves, and the log of every
+defect that escaped a gate, are kept outside this repository.

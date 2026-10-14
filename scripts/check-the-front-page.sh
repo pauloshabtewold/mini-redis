@@ -26,7 +26,8 @@
 #   3. The three `redis-cli` commands of the published transcript, compared against the transcript's
 #      own replies rather than against what this script thinks they should be.
 #   4. The suite, by the page's own invocation, and the ending the page promises.
-#   5. The source-distribution block, and the suite the distribution ships.
+#   5. The source-distribution block, the suite the distribution ships, and every file the
+#      page links to being inside the tarball, since README.md is the long description.
 #   6. The container block, verbatim, then a stop and a start over the same volume with the
 #      keyspace checked -- only when CONTAINER=1, because a local run must not touch the owner's
 #      daemon, and because the recipe creates an image, a container and a volume. CI sets it.
@@ -42,6 +43,8 @@
 # The working-tree arm is demonstrated by reproducing the regression that made it necessary:
 # the `--ignore-snapshot` row deleted from README.md and left uncommitted, which this fails
 # on and which the same check against the clone alone had passed.
+# The link arm is demonstrated by taking docs/MEASUREMENTS.md out of MANIFEST.in, which
+# leaves the page's own link dead in the distribution and is reported by name.
 #
 # Usage:  sh scripts/check-the-front-page.sh [--keep]
 #         CONTAINER=1 sh scripts/check-the-front-page.sh      # adds step 6
@@ -341,6 +344,37 @@ if [ -x "$VENV/bin/python" ] && [ "${SKIP_SDIST:-0}" != 1 ]; then
                 mkdir -p "$WORK/unpacked"
                 tar -xzf "$TARBALL" -C "$WORK/unpacked"
                 UNPACKED=$(ls -d "$WORK/unpacked"/*/ | head -1)
+                # every file the page links to, inside the distribution. README.md ships as the
+                # long description, so a link it carries is rendered wherever the package is
+                # published, and MANIFEST.in is the only thing putting a linked file in the
+                # tarball -- a directive nothing had ever re-read. An anchor is skipped and so is
+                # anything with a scheme; what is left is a path a reader would click
+                python3 - "$UNPACKED" "$WORK/fresh/README.md" >"$WORK/links.log" 2>&1 <<'LINKPY'
+import pathlib, re, sys
+unpacked, page = pathlib.Path(sys.argv[1]), pathlib.Path(sys.argv[2])
+links = []
+for target in re.findall(r"\]\(([^)]+)\)", page.read_text()):
+    if target.startswith("#") or "://" in target or target.startswith("mailto:"):
+        continue
+    links.append(target.split("#", 1)[0])
+if not links:
+    print("fail  the page links to no file at all, so this check has nothing to follow")
+    raise SystemExit(2)
+missing = [t for t in links if not (unpacked / t).exists()]
+for t in sorted(set(links)):
+    print("note  %s %s" % ("MISSING" if t in missing else "shipped", t))
+raise SystemExit(1 if missing else 0)
+LINKPY
+                LINKS=$?
+                sed 's/^/      /' "$WORK/links.log"
+                if [ "$LINKS" -eq 0 ]; then
+                    ok "every file the page links to is in the distribution"
+                elif [ "$LINKS" -eq 1 ]; then
+                    fail "the distribution is missing a file the page links to, so the published"
+                    fail "long description carries a dead link; MANIFEST.in is what ships it"
+                else
+                    printf 'fail  the link check could not run\n'; exit 2
+                fi
                 if ( cd "$UNPACKED" && "$WORK/sdistvenv/bin/python" -m pytest -q ) \
                         >"$WORK/sdistsuite.log" 2>&1; then
                     tail -1 "$WORK/sdistsuite.log" | sed 's/^/      /'

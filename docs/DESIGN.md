@@ -113,8 +113,8 @@ verified before any length prefix is trusted.
 a write-and-sync took its own life from a median 0.10 ms to 3.03 ms — long enough that two
 servers starting together in one directory see each other's file, which is why the probe's
 name ends in a suffix of its own rather than a save's: before that split, one of them warned
-that a save had likely been interrupted in 90 of 150 pairs. The device it catches is the one
-`df` still called 1,012 KiB available and that answered the first save `ENOSPC`.
+that a save had likely been interrupted in 90 of 150 pairs. The device it catches is one
+`df` still reported space on and that answered the first save `ENOSPC`.
 
 **The save `fsync`s the temporary file and then the directory.** The bytes and the directory
 entry that names them are two separate durability guarantees, and a power cut between them
@@ -227,7 +227,7 @@ waiting at the stop rather than up to a whole timeout later. One sweep accepted 
 connections where `SOMAXCONN` is 128, and three clients arriving after a stop held 201,000
 bytes that a count without the sweeps reported as zero. The sweeps have no deadline of their
 own and are bounded by arrivals rather than by the backlog's size: over 58 sweeps on a live
-server they ran 0.005 ms to 383.302 ms, median 0.900.
+server they ran 0.005 ms to 383.302 ms.
 
 **One descriptor is held in reserve** behind the listener and released immediately before the
 shutdown save — not before the first sweep. At a full descriptor table the save cannot open
@@ -255,14 +255,16 @@ was accepted 438,528 bytes at a time. Emptying the queue also turns the close th
 into a FIN where it was a reset.
 
 **What the timeout bounds, and what it does not.** It bounds the wait for clients and
-nothing else. Measured against a client that never reads, `_drain_for` itself ran 5.0042 to
-5.1001 s at the shipped five-second timeout and `SIGTERM` to exit 5.0287 to 5.3570 s — the
-difference being the save ahead of it, the two sweeps and the teardown's own flush, none of
-which the flag covers. That flush is the last thing to run: over eleven stops with 150
-connections each owed a 1,048,588-byte reply, 157,288,200 bytes queued, readers that began
-after the signal still received 40.6% to 91.3% of it. A 400,000-key keyspace — a
-53,200,016-byte snapshot — takes 0.366 to 0.491 s to save on the way out, which is the scale
-to hold against `docker stop`'s own ten seconds.
+nothing else. Measured against a client that never reads, over twelve runs at a load
+average of 3.61 to 5.31, `_drain_for` itself ran 5.0011 to 5.1024 s at the shipped
+five-second timeout and `SIGTERM` to exit 5.1457 to 5.2740 s — the difference being the
+save ahead of it, the two sweeps and the teardown's own flush, none of which the flag
+covers. That flush is the last thing to run: over eleven stops with 150 connections each
+owed a 1,048,588-byte reply, 157,288,200 bytes queued, readers that began after the signal
+still received 40.6% to 91.3% of it. A 400,000-key keyspace of 16-byte keys and 100-byte
+values — a 53,200,016-byte snapshot, the same size in twelve of twelve runs — takes 0.3080
+to 0.3286 s to save on the way out, which is the scale to hold against `docker stop`'s own
+ten seconds.
 
 **A half-close is not a dead peer during the drain.** End of input on a connection that still
 owes bytes does not close it: the client is finished asking and still reading, and reading
