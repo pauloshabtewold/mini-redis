@@ -156,6 +156,7 @@ figure here was measured on the tree that ships.
 | `--rate-limit` | `0` (off) | answers `-ERR rate limit exceeded` to a command once its connection has been permitted that many inside the window, without dispatching it and without closing |
 | `--rate-limit-window` | 1 s | the sliding span, on the monotonic clock. The one numeric flag with no reading of `0` |
 | `--snapshot-interval` | 60 s | saves to `--snapshot-path` (default `./dump.mrdb`) every interval and on a clean stop; `0` stops the periodic save only |
+| `--ignore-snapshot` | off | starts with an empty keyspace without reading `--snapshot-path`, whether or not it is readable, so a good snapshot is discarded as readily as a damaged one. With `--snapshot-interval 0` beside it no save runs at all and the file is left untouched, which is the escape hatch for a snapshot the server will not load |
 | `--expiry-sweep-interval` | 100 ms | the active sweep's own floor. Nothing under about 100 ms is reachable: the loop's `select()` timeout is 0.1 s |
 | `--shutdown-drain-timeout` | 5 s | bounds the wait for clients on the way out. `0` is the restrictive reading — no read pass — where `0` on the limits above is permissive |
 | `--host` | `127.0.0.1` | loopback, because there is no authentication. An empty host is refused; `0.0.0.0` asks for every interface by name |
