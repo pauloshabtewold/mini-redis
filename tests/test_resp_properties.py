@@ -20,11 +20,8 @@ from tests.int_ceiling import OVERSIZED_DIGIT_RUN
 SEED = 20260821
 ROUNDS = 4000
 
-# fragments chosen so that random concatenation lands on framing boundaries far more often
-# than random bytes would -- headers, terminators, half-terminators and their near-misses.
-# the quote and escape bytes are here because nothing else in the alphabet opens a quoted
-# field, and the zero-prefixed headers because nothing else lands on a length that is padded
-# rather than malformed: without either, those refusals are unreachable from this corpus
+# fragments chosen so random concatenation lands on framing boundaries far more often than random bytes
+# would; the quote, escape and zero-prefixed headers are here or those refusals are unreachable
 FRAGMENTS = [b"*", b"$", b"\r", b"\n", b"\r\n", b"0", b"1", b"2", b"9", b"-", b"+",
              b"a", b" ", b"\t", b"\x00", b"\xff", b"PING", b"12", b"$3", b"*2",
              b'"', b"'", b"\\", b"*0", b"$0"]
@@ -36,9 +33,8 @@ UNITS = [b"*1\r\n$4\r\nPING\r\n", b"PING\r\n", b"SET k v\n", b"*0\r\n", b"\r\n",
 WELL_FORMED = [b"*1\r\n$4\r\nPING\r\n", b"*2\r\n$3\r\nfoo\r\n$3\r\nbar\r\n", b"*1\r\n$0\r\n\r\n",
                b"PING\r\n", b"*0\r\n", b"*1\r\n$6\r\na\r\nb\r\n\r\n"]
 
-# headers whose declared sizes are far past anything a fragment run produces: the digit runs
-# either side of the interpreter's conversion ceiling, and sizes no buffer will ever hold.
-# Kept out of CORPUS because the prefix properties walk every cut of every wire
+# headers whose declared sizes are far past anything a fragment run produces, kept out of CORPUS because
+# the prefix properties walk every cut of every wire
 EXTREME = [b"*" + OVERSIZED_DIGIT_RUN + b"\r\n",
            b"*1\r\n$" + OVERSIZED_DIGIT_RUN + b"\r\n",
            b"*" + b"9" * 64 + b"\r\n",

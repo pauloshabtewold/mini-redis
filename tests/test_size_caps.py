@@ -13,11 +13,8 @@ from tests.test_server_lifecycle import listening, pump
 
 
 def _drive(wire, **caps):
-    # a real Connection over a socketpair, driven through take_commands() rather than
-    # resp.parse_command(): the live server reaches parse_multibulk_header and
-    # parse_bulk_element straight from connection.py, never through parse_command for a
-    # multibulk, so a cap threaded only into parse_command would leave this path
-    # uncapped while the natural unit test stayed green
+    # a real Connection driven through take_commands(), not resp.parse_command(): the live server reaches
+    # parse_multibulk_header and parse_bulk_element directly, so a cap only in parse_command misses this path
     a, b = socket.socketpair()
     a.setblocking(False)
     conn = Connection(a, ("stub", 0))
@@ -55,9 +52,8 @@ def test_a_negative_limit_is_refused_at_the_cli_for_all_three_limits(flag):
 
 
 def test_a_negative_limit_is_refused_by_the_constructor_for_all_three_limits():
-    # the CLI is not the only door: Server is constructed directly by tests and by
-    # anything embedding it. every limit is validated before self._loop is built, so a
-    # refused construction opens no selector and leaves nothing to close
+    # the CLI is not the only door: Server is built directly by tests and by anything embedding it. every
+    # limit is validated before self._loop, so a refused construction opens no selector
     for kwargs in (
         {"max_value_size": -1}, {"max_multibulk": -1}, {"write_buffer_limit": -1}
     ):
@@ -83,10 +79,8 @@ def test_zero_is_accepted_by_both_doors_and_disables_each_cap():
 
 
 def _main_with_run_stubbed(monkeypatch, tmp_path, *flags):
-    # main() up to and including constructing the server, and no further: run() is replaced
-    # by a recorder, so a refusal is what stops it or the test fails by name instead of by
-    # starting a server that never returns. logging is left alone, and the snapshot is a
-    # path under tmp_path that does not exist, with saving off
+    # main() up to constructing the server and no further: run() is a recorder, so a refusal fails by name
+    # rather than by starting a server that never returns. the snapshot path does not exist, saving off
     started = []
     monkeypatch.setattr(logging, "basicConfig", lambda **kwargs: None)
     monkeypatch.setattr(Server, "run", lambda self: started.append(self))
@@ -96,14 +90,8 @@ def _main_with_run_stubbed(monkeypatch, tmp_path, *flags):
     return started[0]
 
 
-# the mirror of the rule that every numeric flag is refused at both doors: a flag accepted at both
-# doors can still be read by nothing. the validator tests build a Server directly and the parser
-# tests check what is refused, so neither touches the one wire between them, the keyword list in
-# main(), and a flag dropped from it leaves the parser, the constructor and every test of either
-# green while the setting never leaves its default. each flag main() hands to the constructor is
-# listed here with a value that is not its default, beside the attribute that has to carry it.
-# --log-level is not among them: it never reaches Server, and test_logging.py reads what main()
-# does with it
+# the one wire neither the parser tests nor the constructor tests touch: the keyword list in main(). a flag
+# dropped from it leaves both green while the setting never leaves its default. --log-level reaches no Server
 _FLAGS_THAT_REACH_THE_SERVER = [
     # above the default high-water mark, which a limit now has to be: this case is about the
     # flag reaching the attribute and not about the figure, so the figure moved rather than the case
@@ -150,11 +138,8 @@ _FLAGS_THE_HELPER_ALWAYS_PASSES = ("port", "snapshot_interval", "snapshot_path")
 
 
 def test_the_flags_the_helper_always_passes_arrive_on_the_server_too(monkeypatch, tmp_path):
-    # --port, --snapshot-interval and --snapshot-path are given by _main_with_run_stubbed to
-    # every call, so the parametrised test above cannot vary them. each one differs from its
-    # default and each is handed over by main() like the rest. every element is compared on its
-    # own: a tuple comparison with != passes when any one of the three differs, so it would not
-    # notice the other two matching their defaults
+    # the three settings the helper gives every call, which the parametrised test cannot vary. each is
+    # compared on its own: a tuple != passes when any one differs and would miss the other two
     wanted = {"port": 0, "snapshot_interval": 0, "snapshot_path": str(tmp_path / "dump.mrdb")}
     assert tuple(wanted) == _FLAGS_THE_HELPER_ALWAYS_PASSES
     parsed = build_arg_parser().parse_args([])
@@ -171,11 +156,8 @@ def test_the_flags_the_helper_always_passes_arrive_on_the_server_too(monkeypatch
 
 
 def test_every_flag_the_parser_defines_has_a_case_that_follows_it_to_the_server():
-    # the two tests above are only as complete as the lists they read, and a flag added to the
-    # parser and to neither list would be read by nothing the suite can see and pass them both.
-    # the parser's own destinations, from a parse of no arguments, have to equal what is
-    # covered here plus --log-level, which reaches no Server parameter on purpose and is
-    # checked to still have none: the day Server takes a level, this exemption is stale
+    # the two tests above are only as complete as their lists: a flag in the parser and in neither list
+    # passes both while nothing reads it. --log-level is the exemption, checked to still reach no Server
     defined = set(vars(build_arg_parser().parse_args([])))
     covered = (
         {attribute for _flags, attribute, _wanted in _FLAGS_THAT_REACH_THE_SERVER}
@@ -201,12 +183,8 @@ _EVERY_NUMERIC_SETTING = [
 @pytest.mark.parametrize("value", [float("nan"), float("inf"), True, 2.5],
                          ids=["nan", "inf", "bool", "float"])
 def test_a_value_that_is_not_a_whole_number_is_refused_at_the_constructor(setting, value):
-    # the sixth review's finding 39, found through the rate limiter and never the rate limiter's.
-    # every check these settings pass through is an ordering, and `nan < 0` is False, so nan got
-    # past all of them -- as did inf, and True, because bool subclasses int. the costs are silent
-    # and specific: rate_limit=nan never refuses a command, rate_limit_window=1e-9 never fires,
-    # shutdown_drain_timeout=True is a one-second drain nobody asked for, and max_connections=nan
-    # admits everyone. one line in the rule every flag shares, and twelve flags' worth of hole
+    # every check these settings pass is an ordering and `nan < 0` is False, so nan, inf and True (bool
+    # subclasses int) got past all of them: rate_limit=nan refuses nobody, and the hole spans twelve flags
     with pytest.raises(ValueError) as refusal:
         Server(0, **{setting: value})
     assert "must be a whole number" in str(refusal.value), str(refusal.value)
@@ -230,11 +208,8 @@ def test_every_numeric_setting_is_covered_by_the_whole_number_case():
 
 
 def test_an_empty_host_is_refused_at_both_doors(monkeypatch, tmp_path, capsys):
-    # an empty host is what bind() reads as every interface, on a server with no authentication
-    # at all, which is the exposure the loopback default exists to prevent, and it is what
-    # `--host "$HOST"` becomes when HOST is unset. no one means it, so it is refused rather than
-    # honoured. the parser is one door and Server the other: a flag refused only at the CLI is
-    # refused only for the people who use the CLI
+    # an empty host is what bind() reads as every interface on a server with no authentication, and it is
+    # what `--host "$HOST"` becomes when HOST is unset. the parser is one door and Server the other
     monkeypatch.setattr(logging, "basicConfig", lambda **kwargs: None)
     monkeypatch.setattr(
         Server, "run", lambda self: pytest.fail("main() ran a server over an empty host"))
@@ -261,9 +236,8 @@ def test_an_empty_host_is_refused_at_both_doors(monkeypatch, tmp_path, capsys):
             server._loop.close()
     assert "host cannot be empty" in str(refusal.value), refusal.value
 
-    # what is refused is the empty string and not the wildcard: 0.0.0.0 says on purpose what
-    # the empty string says by accident, and an operator who types it has chosen it. nothing
-    # listens here, because the bind happens in run() and neither door reaches it
+    # what is refused is the empty string and not the wildcard: 0.0.0.0 says on purpose what the empty
+    # string says by accident. nothing listens here, because the bind happens in run()
     assert build_arg_parser().parse_args(["--host", "0.0.0.0"]).host == "0.0.0.0"
     server = Server(0, host="0.0.0.0")
     try:
@@ -274,11 +248,8 @@ def test_an_empty_host_is_refused_at_both_doors(monkeypatch, tmp_path, capsys):
 
 def test_a_limit_at_or_below_the_high_water_mark_is_refused_at_both_doors(
         monkeypatch, tmp_path, capsys):
-    # the second rule spanning two settings, and the pairing it refuses is the one that used to
-    # start in silence: a non-zero limit at or below a non-zero high-water mark leaves both water
-    # marks unreachable, because _flush tests the limit before it decides read interest and
-    # returns on the close. equality is refused with the inversion, since a queue over the mark
-    # is over the limit too
+    # a non-zero limit at or below a non-zero high-water mark leaves both marks unreachable, since _flush
+    # tests the limit before it decides read interest and returns on the close; equality is refused too
     monkeypatch.setattr(logging, "basicConfig", lambda **kwargs: None)
     monkeypatch.setattr(
         Server, "run", lambda self: pytest.fail("main() ran a server over a contradictory pair"))
@@ -325,11 +296,8 @@ def test_a_limit_at_or_below_the_high_water_mark_is_refused_at_both_doors(
 
 def test_a_low_water_mark_above_the_high_water_mark_is_refused_at_both_doors(
         monkeypatch, tmp_path, capsys):
-    # the one rule that spans two settings, so argparse cannot hold it: each flag is
-    # checked alone as it is parsed. main() refuses the pair as a usage error, exit 2, and
-    # Server refuses it for a caller that never went through main(). equal marks are
-    # refused as well as inverted ones, because a band of zero width is the flapping the
-    # two settings exist to avoid
+    # the one rule spanning two settings, so argparse cannot hold it: main() refuses the pair as a usage
+    # error, exit 2, and Server for a caller that skipped main(); equal marks are refused as well as inverted
     monkeypatch.setattr(logging, "basicConfig", lambda **kwargs: None)
     monkeypatch.setattr(
         Server, "run", lambda self: pytest.fail("main() ran a server over a contradictory pair"))
@@ -360,10 +328,8 @@ def test_a_low_water_mark_above_the_high_water_mark_is_refused_at_both_doors(
 
 
 def test_a_zero_high_water_mark_disables_the_pause_and_is_not_refused(monkeypatch, tmp_path):
-    # the pair rule is guarded by the high-water mark: 0 for it switches the pause off, a
-    # pause that is off has no band to be inconsistent with, and without the guard the one
-    # way to switch it off would be refused against the default low-water mark. the
-    # control inside the same test is the same connection with the pause on
+    # the pair rule is guarded by the high-water mark: 0 switches the pause off, and without the guard the
+    # one way to switch it off would be refused against the default low-water mark
     server = _main_with_run_stubbed(monkeypatch, tmp_path, "--write-buffer-high-water", "0")
     try:
         assert server.write_buffer_high_water == 0
@@ -394,12 +360,8 @@ def test_a_zero_high_water_mark_disables_the_pause_and_is_not_refused(monkeypatc
 
 
 def test_the_high_water_mark_and_the_command_timeout_default_to_the_documented_values():
-    # the pause's own threshold and the half-sent-command deadline are both published
-    # figures, and the tests that exercise them read each default out of the parser and
-    # size their queues and their clocks relative to whatever comes back, so they hold for
-    # any value it takes. that leaves the figures themselves pinned nowhere: a published
-    # number has to be asserted against its own literal somewhere, or the documentation is
-    # the only record of it and nothing fails when the two part company
+    # the tests that exercise these read each default out of the parser and size their queues relative to
+    # it, so the figures themselves are pinned nowhere else: a published number needs its own literal
     args = build_arg_parser().parse_args([])
     assert args.write_buffer_high_water == 1048576, args.write_buffer_high_water
     assert args.incomplete_command_timeout == 30, args.incomplete_command_timeout
@@ -411,28 +373,8 @@ def test_the_high_water_mark_and_the_command_timeout_default_to_the_documented_v
 
 
 def test_each_new_numeric_flag_is_refused_when_negative_at_both_doors(capsys):
-    # the parser is one door and Server is the other, and a flag refused at only one is
-    # refused only for the people who use it. 0 is accepted at both, as the value that
-    # switches the setting off, and the one duration among them is also refused past
-    # MAX_SCHEDULABLE_INTERVAL, the ceiling every duration flag shares. this flag would not
-    # fail without it: the stalled-command sweep only compares an elapsed time against the
-    # value, and comparing an int with a float cannot overflow however large the int is. the
-    # ceiling is there so that one rule covers every duration at both doors.
-    # the refusal's own wording is asserted at both doors and not only at the CLI, because
-    # the type alone does not say which rule fired: the pair rule standing behind the
-    # high-water mark reads any non-zero value as a mark that is set, so a negative one is
-    # refused for sitting below the low-water mark instead -- a ValueError either way, and
-    # the operator is told the marks are the wrong way round rather than that the number
-    # they typed is not allowed at all.
-    # each flag carries the ending its refusal has to finish on, spelled out here and not read
-    # from the module under test, which would pin nothing. the shared ending tells the operator
-    # that 0 disables the check, and for --write-buffer-low-water that is untrue: with the pause
-    # on its 0 means resume only when the queue is empty and switches nothing off, so it has an
-    # ending of its own at both doors. "cannot be negative" alone passes for either ending, and
-    # for a flag handed another's message, so the ending is asserted in full and the other
-    # flags' endings are asserted absent. there are two endings among the three, and the
-    # count is asserted so that a table collapsed to one leaves the absence check with
-    # something to compare against
+    # both doors, with the one duration also refused past MAX_SCHEDULABLE_INTERVAL, and each flag's own
+    # ending in full: "cannot be negative" alone passes for another flag's message, and two endings exist
     flags = (
         ("--write-buffer-high-water", "write buffer high water", "write_buffer_high_water",
          "0 disables the check, not -1"),
@@ -485,10 +427,8 @@ def test_a_declared_length_exactly_at_the_cap_is_accepted_through_a_connection()
 
 
 def test_an_over_cap_bulk_length_is_refused_before_the_body_is_buffered():
-    # the check sits ahead of body_end being computed, so the
-    # connection never commits to a buffer-growth hint for the oversized body --
-    # _parse_needed == 0 after the refusal is what proves it, and a criterion that
-    # only reads the error body passes over a check placed one line too late
+    # the check sits ahead of body_end, so the connection never commits to a buffer hint for the oversized
+    # body -- _parse_needed == 0 after the refusal is the proof, where reading the error alone passes
     header = b"*3\r\n$3\r\nSET\r\n$1\r\nk\r\n$68157440\r\n"    # 65 MiB declared, no body
     conn, message = _drive(header, max_value_size=67108864, max_multibulk=1048576)
     assert message == b"ERR Protocol error: invalid bulk length", message
@@ -550,10 +490,8 @@ def test_a_command_under_both_caps_dispatches_normally_through_a_live_server():
 
 
 def test_a_value_inside_the_inbound_cap_can_exceed_the_outbound_limit():
-    # the two limits sit on opposite sides and neither bounds the other: a value well
-    # under --max-value-size can still be large enough, repeated across one pipelined
-    # batch, to exceed --write-buffer-limit -- which then disconnects the very client
-    # that stored it rather than throttling its read
+    # the two limits sit on opposite sides and neither bounds the other: a value well under --max-value-size
+    # can still exceed --write-buffer-limit across one pipelined batch, which disconnects the client
     with listening() as (server, connect, _listener):
         server.max_value_size = 1024 * 1024
         server.write_buffer_limit = 64 * 1024
@@ -576,21 +514,8 @@ def test_a_value_inside_the_inbound_cap_can_exceed_the_outbound_limit():
 
 
 def test_every_flag_that_takes_a_value_states_its_default_in_help():
-    # --help is the whole in-product reference, and thirteen of these said nothing about what the
-    # flag does if you leave it off -- --snapshot-path among them, whose text was entirely about
-    # refusals, so a reader of --help alone could not learn that omitting it still writes a file or
-    # where. the defaults are interpolated from the module's own constants rather than restated, so
-    # a default that changes cannot leave a stale number here.
-    #
-    # it asserts the LITERAL clause, "the default is <what the parser uses>", built from the
-    # parser's own default rather than compared loosely. the version that asked whether
-    # `str(value)` appeared anywhere in the help text passed over eight mutated defaults one at a
-    # time: "1" is in "100 requests", "60" is in the same help's "rather than 60 0", "INFO" is in
-    # "INFO reports each connection", and asking only whether the word "default" appeared was
-    # satisfied by "a default server answers 59 0". Two flags were missing from the hand-written
-    # table it checked, and both turned out to be the two that stated no default at all:
-    # --rate-limit said "0 disables the limiter, which is the default" and --host said "the
-    # default is loopback", naming no address
+    # thirteen flags said nothing about their default, so the LITERAL clause is asserted: asking whether
+    # str(value) appeared anywhere passed over eight mutated defaults -- "1" is inside "100 requests"
     import argparse
     parser = build_arg_parser()
     wrong = []
@@ -617,9 +542,8 @@ def test_every_flag_that_takes_a_value_states_its_default_in_help():
 
 
 def test_the_unit_renderings_beside_a_default_are_the_right_unit():
-    # the byte figures carry a second rendering, "33554432 (32 MiB)", and nothing checked the
-    # parenthesis: it was written by hand and a mutation to "(64 MiB)" passed. derived here from
-    # the same constant, so the two halves of one clause cannot disagree
+    # the byte figures carry a second rendering, "33554432 (32 MiB)", and nothing checked the parenthesis:
+    # a mutation to "(64 MiB)" passed; derived here from the same constant so the halves cannot disagree
     parser = build_arg_parser()
     for option, divisor, unit in (
         ("--write-buffer-limit", 1024 * 1024, "MiB"),

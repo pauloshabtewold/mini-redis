@@ -43,13 +43,11 @@ from server import Server, build_arg_parser
 from tests.test_server_lifecycle import listening, pump
 
 REPO_ROOT = pathlib.Path(__file__).resolve().parent.parent
-# the module's own logger object, looked up the way the dispatch loop looks it up: as a global, with an attribute read on it
+# the module's own logger, looked up the way the dispatch loop does: a global plus an attribute read
 _server_logger = server_mod.logger
 
-# the shapes of every line this server writes at INFO and below, whole. the prefix is what
-# logging.basicConfig puts before a message by default: the level, then the logger's name,
-# which is `__main__` when server.py is run as a script and `server` when it is imported, so
-# it is matched as anything up to the next colon
+# every line this server writes at INFO and below, whole. the prefix is basicConfig's own, whose
+# logger name is __main__ as a script and server when imported, so it matches up to the next colon
 def _at(level):
     return level + r":[^:]+:"
 
@@ -60,12 +58,8 @@ _CLOSED = re.compile(_at("INFO") + r"closed connection (\d+) from " + _PEER + r"
 _DRAIN = re.compile(
     _at("INFO") + r"shutdown drain complete; connections closed while owed bytes: 0; "
     r"connections still owed bytes: 0; request bytes discarded undispatched: (\d+)")
-# the two reply counts are pinned at 0 because a clean stop is what these scenarios make, and
-# the request figure is captured rather than pinned: this module asserts which lines are written
-# and at which level, and the drain's own arithmetic is pinned where the drain is tested. Left
-# out of the pattern altogether the whole line would read as a stray, which is how a figure
-# added to it turns every "nothing else was written" assertion here red at once
-# "argument" or "arguments": a bare %d wrote "1 arguments", so the line is singular at one
+# the reply counts are pinned at 0 because these scenarios make a clean stop; the request figure is
+# captured, since the drain's arithmetic is pinned where the drain is tested
 _COMMAND = re.compile(_at("DEBUG") + r"connection (\d+): b'([^']*)' with (\d+) arguments?")
 _REFUSAL = re.compile(r"(\w+):[^:]+:refusing " + _PEER + r": .*--max-connections.*")
 _IGNORED = re.compile(
@@ -103,7 +97,8 @@ def _sorted_lines(lines):
 
 
 def _returns_within(proc, bound):
-    # the bound is the join: a wait() on this thread would simply never return for a server that never exits, and there would be no measurement, only a hung suite
+    # the bound is the join: a wait() would never return for a server that never exits, and there would
+    # be no measurement, only a hung suite
     outcome = {}
     waiter = threading.Thread(target=lambda: outcome.update(rc=proc.wait()), daemon=True)
     waiter.start()
@@ -206,7 +201,7 @@ def _round_trip(client, request, reply):
 
 
 def _until_closed(client):
-    # a clean close and a reset are two spellings of one refusal. a timeout is the failure: the server kept the connection
+    # a clean close and a reset are two spellings of one refusal; a timeout is the failure
     client.settimeout(10)
     try:
         while client.recv(4096):
@@ -230,7 +225,8 @@ class _Records(logging.Handler):
 
 @contextlib.contextmanager
 def _logging_at(level):
-    # the level goes where main() puts it, on the root, and the server's own logger is left to inherit it, which is how a real process gets its level. a guard that read the logger's own level, which is unset, would read as always open there, and a test that set the level on the logger itself could not see it. the runner's root is lowered too, because it would otherwise hide every record below WARNING and make "nothing was logged" pass for the wrong reason
+    # the level goes where main() puts it, on the root, and the server's logger inherits it, which is how
+    # a real process gets its level -- reading the logger's own would read as always open
     root = logging.getLogger()
     own = server_mod.logger
     before = (root.level, own.level)
@@ -258,7 +254,8 @@ def _server_log(level):
 
 @contextlib.contextmanager
 def _debug_calls():
-    # records the calls made to the server logger's debug(), and passes each through. a call that is made and filtered by level leaves no record, so a count of records cannot tell a call that was skipped from one that was made and discarded: this can
+    # records calls to the server logger's debug() and passes each through: a call filtered by level
+    # leaves no record, so a count of records cannot tell a skipped call from a discarded one
     log = server_mod.logger
     calls = []
     real = log.debug
@@ -275,7 +272,7 @@ def _debug_calls():
 
 
 def _run_probe(source, *args):
-    # a fresh interpreter at the repository root, so `import server` resolves to this tree's copy, and with no bytecode written beside it
+    # a fresh interpreter at the repository root, so `import server` resolves here, with no bytecode
     return subprocess.run(
         [sys.executable, "-B", "-c", source, *args], cwd=REPO_ROOT, capture_output=True, text=True, timeout=60)
 
@@ -308,7 +305,7 @@ def test_importing_server_configures_no_logging():
     assert done.returncode == 0, done.stderr
     state = json.loads(done.stdout)
     untouched = {"handlers": 0, "level": logging.WARNING}
-    # the control first: a fresh interpreter starts with nothing attached and the library default level, so what follows is a comparison against a known starting point
+    # the control first: a fresh interpreter starts with nothing attached and the library default level
     assert state["before"] == untouched, state
     assert state["after_import"] == untouched, "importing server configured logging for whoever imported it"
     assert state["after_construction"] == untouched, "building a Server configured logging"
@@ -340,7 +337,8 @@ print(json.dumps({"calls": len(calls), "handlers": len(root.handlers), "level": 
 
 def test_main_configures_logging_once_at_the_level_it_was_given_and_before_the_server_is_built(
         tmp_path, start, connect):
-    # run() is replaced by closing the selector the server was built with, so the process returns: what is under test is what main() leaves configured, and a server that serves would never hand back a root logger to look at. the level is spelled in lower case, so the configured level also shows that the spelling was normalised on its way in
+    # run() is replaced by closing the selector, so the process returns: what is under test is what
+    # main() leaves configured, and a server that serves would never hand a root logger back
     done = _run_probe(_MAIN_PROBE, str(tmp_path / "dump.mrdb"))
     assert done.returncode == 0, done.stderr
     state = json.loads(done.stdout)
@@ -348,7 +346,8 @@ def test_main_configures_logging_once_at_the_level_it_was_given_and_before_the_s
     assert state["handlers"] == 1, "a second handler writes every line twice"
     assert state["level"] == logging.DEBUG, state
 
-    # and it is configured before the Server is built, which is seen from outside: a server that ignores the snapshot warns about it while it is being constructed, and that warning has to obey the flag like every other line. configured later, it would reach stderr bare and at any level
+    # configured before the Server is built, which shows from outside: the ignore-snapshot warning is
+    # written during construction and has to obey the flag like every other line
     (tmp_path / "dump.mrdb").write_bytes(b"not a snapshot, and never read")
     loud = start("--ignore-snapshot")
     _rc, lines = loud.stop()
@@ -365,7 +364,7 @@ def test_log_level_is_accepted_in_any_case():
     for spelled in ("debug", "Info", "WARNING", "error", "wArNiNg"):
         args = build_arg_parser().parse_args(["--log-level", spelled])
         assert args.log_level == spelled.upper(), (spelled, args.log_level)
-    # the control: a level nobody asked for is the default, and the default is the one that reports connections and nothing finer
+    # the control: a level nobody asked for is the default, which reports connections and nothing finer
     assert build_arg_parser().parse_args([]).log_level == "INFO"
 
 
@@ -388,7 +387,8 @@ def test_one_info_line_is_written_for_each_connection_opened_and_one_for_each_cl
     for _ in range(3):
         client = connect(server.port)
         clients.append(client)
-        # a reply proves the accept callback has run, so the connections are accepted one at a time and the count each line carries is the count at that moment
+        # a reply proves the accept callback ran, so connections are accepted one at a time and each line's
+        # count is the count at that moment
         _round_trip(client, _resp(b"PING"), b"+PONG\r\n")
     server.wait_for(lambda lines: _count_of(_ACCEPTED)(lines) == 3, "three accepted lines")
 
@@ -400,7 +400,7 @@ def test_one_info_line_is_written_for_each_connection_opened_and_one_for_each_cl
     assert len(set(ids)) == 3, "two connections shared an id"
     id_of = dict(zip(ports, ids))
 
-    # closed one at a time, each waited for, so the live count a closed line carries is the count at its own close
+    # closed one at a time, each waited for, so a closed line's live count is the count at its own close
     expected_closes = []
     for index, live in ((1, 2), (0, 1), (2, 0)):
         clients[index].close()
@@ -412,7 +412,7 @@ def test_one_info_line_is_written_for_each_connection_opened_and_one_for_each_cl
         closed = [(int(m.group(1)), int(m.group(2)), int(m.group(3))) for m in found["closed"]]
         assert closed == expected_closes, closed
 
-    # a connection still open when the server is told to stop is closed by the shutdown, and that close is logged too, once: the shutdown does not take a path around the line
+    # a connection still open at the stop is closed by the shutdown, and that close is logged once too
     last = connect(server.port)
     _round_trip(last, _resp(b"PING"), b"+PONG\r\n")
     server.wait_for(lambda lines: _count_of(_ACCEPTED)(lines) == 4, "the fourth accepted line")
@@ -427,12 +427,13 @@ def test_one_info_line_is_written_for_each_connection_opened_and_one_for_each_cl
     assert closed_ids == accepted_ids, "a connection was not closed exactly once in the log"
     final = found["closed"][-1]
     assert (int(final.group(2)), int(final.group(3))) == (last.getsockname()[1], 0), final.group(0)
-    # the drain's one line names connections and no peer, which is why it is its own shape and not a closed line
+    # the drain's one line names connections and no peer, which is why it is its own shape
     assert len(found["drain"]) == 1
 
 
 def test_nothing_names_a_command_at_info(start, connect):
-    # from outside, at the default level: a real process, a pipelined session, and a stderr in which every line is one of the three INFO shapes and none names a command
+    # from outside, at the default level: a real process, a pipelined session, and a stderr whose every
+    # line is one of the three INFO shapes and none names a command
     server = start()
     client = connect(server.port)
     _round_trip(client, b"".join(_resp(*argv) for argv in _SESSION), _SESSION_REPLY)
@@ -446,7 +447,8 @@ def test_nothing_names_a_command_at_info(start, connect):
     named = [line for line in lines if _COMMAND_NAMES.search(line) or "argument" in line]
     assert named == [], named
 
-    # from inside: the lines above cannot show that the debug call was skipped, because the logger drops a debug record below its level whether or not the call is guarded, and the output is the same either way. what differs is that an unguarded call builds its arguments for every dispatched command and then throws them away, and that shows as a call to debug() that nothing logs
+    # from inside: the lines above cannot show the call was skipped, since the logger drops a debug
+    # record below its level either way. what differs is building the arguments per command
     expected_calls = len(_SESSION)
     for level, calls_wanted in ((logging.INFO, 0), (logging.DEBUG, expected_calls)):
         with _server_log(level) as records, _debug_calls() as calls, listening() as (loop_server, connect_local, _listener):
@@ -475,7 +477,7 @@ def test_debug_writes_one_line_per_dispatched_command_and_never_an_argument(star
     id_of = {int(m.group(2)): int(m.group(1)) for m in found["accepted"]}
     first_id, second_id = id_of[ports[0]], id_of[ports[1]]
 
-    # a pipeline of three in one write, then singles, then a command name longer than the name is allowed to run to in a log line
+    # a pipeline of three in one write, then singles, then a name longer than a log line may run to
     pipeline = b"".join(
         [_resp(b"PING"), _resp(b"SET", b"secretkey", b"secretvalue"), _resp(b"GET", b"secretkey")])
     _round_trip(first, pipeline, b"+PONG\r\n+OK\r\n$11\r\nsecretvalue\r\n")
@@ -492,7 +494,7 @@ def test_debug_writes_one_line_per_dispatched_command_and_never_an_argument(star
     found, stray = _sorted_lines(lines)
     assert stray == [], stray
     logged = [(int(m.group(1)), m.group(2), int(m.group(3))) for m in found["command"]]
-    # one line for each dispatched command, in the order they were dispatched, naming the command and counting what followed it
+    # one line per dispatched command, in order, naming the command and counting what followed it
     assert logged == [
         (first_id, "PING", 0), (second_id, "PING", 0),
         (first_id, "PING", 0), (first_id, "SET", 2), (first_id, "GET", 1),
@@ -513,7 +515,7 @@ class _Boom(Exception):
 
 @contextlib.contextmanager
 def _echo_raises(exc):
-    # nothing in the shipped registry can raise, so the boundary is entered by swapping one handler for one that does and putting the original back on the way out
+    # nothing in the shipped registry can raise, so the boundary is entered by swapping one handler
     original = registry.COMMANDS[b"ECHO"]
 
     def explode(store, conn, argv):
@@ -543,7 +545,7 @@ def test_the_exception_boundary_still_reports_at_error_with_the_traceback():
     assert boundary[0].levelno == logging.ERROR, logging.getLevelName(boundary[0].levelno)
     assert boundary[0].exc_info[0] is _Boom
     assert str(peer) in boundary[0].getMessage(), boundary[0].getMessage()
-    # every level is visible here, so a report lowered beneath ERROR would still be in the list, and the boundary is the only thing in it at WARNING or above
+    # every level is visible here, so a report lowered beneath ERROR would still be in the list
     assert [record for record in records if record.levelno >= logging.WARNING] == boundary
     # the ordinary close line follows the report: abandoning a connection closes it the way every close does
     closes = [record for record in records if _CLOSED.fullmatch("INFO:server:" + record.getMessage())]
@@ -552,7 +554,8 @@ def test_the_exception_boundary_still_reports_at_error_with_the_traceback():
 
 
 def _refuse(connect, port, refusals):
-    # one client holds the only slot and the others are refused one at a time, each waited for, so the lines come out in the order the refusals were made and each names the client that caused it
+    # one client holds the only slot and the rest are refused one at a time, each waited for, so the
+    # lines come out in the order the refusals were made
     held = connect(port)
     _round_trip(held, _resp(b"PING"), b"+PONG\r\n")
     ports = []
@@ -590,11 +593,13 @@ _PER_COMMAND_CALL = re.compile(
 
 
 def _dispatch_batch_without_the_per_command_call():
-    # the dispatcher's own source with that call cut out and nothing else changed, rebuilt as a function over server.py's own namespace. cutting and not rewriting is the point: a baseline written out by hand, like a copy of the guard, goes on passing whatever the dispatcher does, and this one is the dispatcher. nothing is run to build it: compile() turns the cut source into a code object, the function's own code is picked out of that, and it is bound to the module's globals
+    # the dispatcher's own source with that call cut out, rebuilt over server.py's namespace: a hand
+    # written baseline would go on passing whatever the dispatcher does, and this one is the dispatcher
     source = textwrap.dedent(inspect.getsource(Server._dispatch_batch))
     cut, cuts = _PER_COMMAND_CALL.subn("", source)
     if cuts != 1:
-        # a skip and not a failure: the dispatcher can be written another way -- the level asked once ahead of the loop and the flag tested inside it -- and behave identically, and this test measures what the call costs, not whether it is guarded, which test_nothing_names_a_command_at_info counts on a real server
+        # a skip and not a failure: the dispatcher can be written another way and behave identically, and
+        # what this measures is the call's cost, not whether it is guarded
         pytest.skip(
             "the per-command call is not spelt the way this measurement cuts it out of "
             "_dispatch_batch (%d matches, not 1), so there is nothing to subtract" % cuts)
@@ -606,7 +611,8 @@ def _dispatch_batch_without_the_per_command_call():
 
 
 def test_the_guarded_debug_call_at_info_is_measured_and_printed():
-    # printed and not asserted against a threshold: a bound on a timing is a flake. what is timed is Server._dispatch_batch itself at the default level, against the same function with the per-command call cut out of its source, so the figure is what that line costs where the dispatcher reaches it and not what a copy of it costs. at INFO the guard evaluates false and the call in its body is never reached. each function's time is the minimum of the alternating batches, and the difference of two minimums moves by several nanoseconds from one run to the next, so one run's figure is a point in a range and is quoted as a range across runs. PING is the cheapest command, so the share of a dispatch that the guard takes is the largest it can be
+    # printed and not asserted: a bound on a timing is a flake. the dispatcher is timed against itself
+    # with the call cut out, so the figure is what that line costs where the dispatcher reaches it
     batch_size = 1000
     repeats = 60
     batch = [[b"PING"]] * batch_size
@@ -615,7 +621,7 @@ def test_the_guarded_debug_call_at_info_is_measured_and_printed():
     without_the_call = _dispatch_batch_without_the_per_command_call()
 
     with _logging_at(logging.INFO), listening() as (server, connect, _listener):
-        # the precondition that makes the number mean what it says: false at INFO, and true one level down, so the same expression is not always false
+        # the precondition that makes the number mean what it says: false at INFO, true one level down
         assert not _server_logger.isEnabledFor(logging.DEBUG)
         client = connect()
         pump(server)
@@ -625,7 +631,8 @@ def test_the_guarded_debug_call_at_info_is_measured_and_printed():
             started = time.perf_counter_ns()
             dispatch(server, conn, batch)
             spent = time.perf_counter_ns() - started
-            # read outside the timed region, so a batch never meets a kernel buffer the last one filled. it is also what shows the copy with the call cut out still dispatches correctly: both functions answer the batch identically
+            # read outside the timed region, so a batch never meets a buffer the last one filled
+            # the cut copy still dispatches correctly, since both answer the batch identically
             assert _read_exactly(client, len(reply)) == reply, "the batch was not answered"
             return spent
 
@@ -646,15 +653,8 @@ def test_the_guarded_debug_call_at_info_is_measured_and_printed():
 
 
 def test_the_log_level_help_says_replies_decide_the_drain_lines_level():
-    # the level is decided by the two reply counts alone, which server.py's own comment beside
-    # logger.log states and test_write_drain.py pins against the behaviour -- a whole receive
-    # queue thrown away with no reply owed is INFO and says complete. The help text used to
-    # attribute the level to loss in general, and to promise that WARNING showed the line
-    # whenever anything had been lost, which is false in exactly the case the figure on that line
-    # exists for: measured, a stop that discarded 691,012 bytes of requests already answered OK
-    # printed complete at INFO and nothing at all at WARNING. Nothing read the help against the
-    # code, so this does. The phrases it must not carry are below, not quoted here, because
-    # verify-claims.sh sweeps this file for them too
+    # the level is decided by the two reply counts alone, which the code's own comment states and
+    # test_write_drain.py pins; the phrasings this help must not carry are built below, not quoted
     text = None
     for action in build_arg_parser()._actions:
         if "--log-level" in getattr(action, "option_strings", ()):
@@ -671,9 +671,8 @@ def test_the_log_level_help_says_replies_decide_the_drain_lines_level():
 
 
 def test_an_unknown_log_level_is_quoted_as_the_operator_typed_it(tmp_path):
-    # type=str.upper folded the value before argparse compared it, so a lower-case unknown level
-    # was refused as invalid choice: 'VERBOSE' -- naming a spelling the operator never used, which
-    # reads as the parser having mangled the input rather than rejected it
+    # type=str.upper folded the value before argparse compared it, so a lower-case unknown level was
+    # refused as 'VERBOSE' -- a spelling the operator never used
     for level in ("verbose", "Loud", "tRaCe"):
         done = subprocess.run(
             [sys.executable, "-B", str(REPO_ROOT / "server.py"), "--port", "0",

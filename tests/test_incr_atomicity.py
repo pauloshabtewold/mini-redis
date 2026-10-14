@@ -35,19 +35,16 @@ _GET_COUNTER = b"*2\r\n$3\r\nGET\r\n$7\r\ncounter\r\n"
 
 
 class _SenderProgress:
-    # a shared mutable object rather than a lock: the reader only ever needs the
-    # sender's latest snapshot, never a consistent pair of fields, and plain attribute
-    # assignment is already atomic under the GIL
+    # a shared mutable object rather than a lock: the reader only needs the sender's latest values,
+    # never a consistent pair, and plain attribute assignment is already atomic under the GIL
     def __init__(self):
         self.sent = 0
         self.last_send = time.monotonic()
 
 
 def _expected_replies(n):
-    # the byte-exact expected stream and the exact prefix-sum table it's built from, in
-    # one pass -- reply lengths are not uniform (":9\r\n" is 4 bytes, ":10\r\n" is 5), so
-    # "outstanding bytes so far" has to come from this table rather than from a reply
-    # count times an assumed size
+    # reply lengths are not uniform (":9\r\n" is 4 bytes, ":10\r\n" is 5), so "outstanding bytes so far"
+    # has to come from this prefix-sum table and not from a count times an assumed size
     chunks = [b":%d\r\n" % i for i in range(1, n + 1)]
     prefix = [0]
     total = 0
@@ -65,11 +62,8 @@ def _send_incr_burst(sock, n, progress):
 
 
 def _read_lagging(sock, prefix, target_outstanding, stall_seconds, deadline_seconds, progress):
-    # lags rather than paces: a reader that drains as fast as it sends never has more
-    # than a few KiB outstanding, and a server with no drain at all would pass right
-    # alongside it. reading also resumes on a stalled sender, not only on a full
-    # backlog -- pacing the backlog alone would deadlock once inbound flow control
-    # exists and stalls a sender this reader would otherwise wait on forever
+    # lags rather than paces: a reader draining as fast as it sends never holds more than a few KiB and
+    # a server with no drain would pass beside it; it resumes on a stalled sender too, or it deadlocks
     expected_total = prefix[-1]
     received = bytearray()
     peak_outstanding = 0
@@ -209,11 +203,8 @@ def test_many_connections_incrementing_one_counter_stay_exact(mini_redis_server)
 
 
 def _run_burst_against_a_fresh_server(n):
-    # not the mini_redis_server fixture: pytest refuses a fixture called outside a
-    # test, so this builds its own server from the same two helpers the fixture uses
-    # a scratch directory of its own, cleaned up below: this function also runs from
-    # __main__, where there is no tmp_path fixture, and a snapshot left at the default
-    # ./dump.mrdb would land in the repository's own working directory
+    # its own server from the two helpers the fixture uses, since pytest refuses a fixture outside a test
+    # a scratch directory too: from __main__ there is no tmp_path and ./dump.mrdb lands in the repository
     scratch = tempfile.mkdtemp()
     proc, port = launch_server(pathlib.Path(scratch) / "dump.mrdb")
     try:

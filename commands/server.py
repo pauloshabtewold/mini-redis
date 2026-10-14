@@ -6,7 +6,7 @@ import sys
 from commands.registry import Kind, Reply, SYNTAX_ERROR, command, wrong_arity
 import resp
 
-# kept as a constant rather than read from installed metadata, so the reply does not depend on the project being installed
+# a constant and not read from installed metadata, so the reply does not need the project installed
 SERVER_VERSION = b"0.1.0"
 
 # named so a follower has one place to change
@@ -34,9 +34,10 @@ def hello(store, conn, argv: list[bytes]) -> Reply:
     if len(argv) > 2:
         return wrong_arity(b"HELLO"), []
     if len(argv) == 2 and argv[1] != b"2":
-        # every argument other than b"2" answers NOPROTO, integer or not -- diverges from real Redis's own parse error, deliberately
+        # every argument but b"2" answers NOPROTO, integer or not: a deliberate divergence from
+        # real Redis's own parse error
         return resp.encode_error(b"NOPROTO unsupported protocol version"), []
-    # RESP2 has no map type, so this is a flat array of alternating field/value pairs -- what a real server returns on RESP2
+    # RESP2 has no map type, so this is the flat field/value array a real server returns on RESP2
     return resp.encode_array([
         resp.encode_bulk_string(b"server"),
         resp.encode_bulk_string(b"redis"),
@@ -45,11 +46,8 @@ def hello(store, conn, argv: list[bytes]) -> Reply:
         resp.encode_bulk_string(b"proto"),
         resp.encode_integer(2),
         resp.encode_bulk_string(b"id"),
-        # 0 when dispatch is driven with no socket at all, which is this project's own
-        # convention for in-process use -- the same guard INFO's connected_clients takes,
-        # for the same callers. Unguarded, the one command whose reply carries a
-        # connection fact is the one command that convention cannot call, and it fails
-        # with an AttributeError rather than a reply
+        # 0 when dispatch is driven with no socket, the in-process convention: unguarded, the one
+        # reply carrying a connection fact fails with an AttributeError instead
         resp.encode_integer(0 if conn is None else conn.id),
         resp.encode_bulk_string(b"mode"),
         resp.encode_bulk_string(b"standalone"),
@@ -63,20 +61,13 @@ def hello(store, conn, argv: list[bytes]) -> Reply:
 
 @command(b"DBSIZE", arity=1, kind=Kind.OTHER)
 def dbsize(store, conn, argv: list[bytes]) -> Reply:
-    # store.live_count() rather than the shared expiry-aware lookup: DBSIZE is one of the
-    # named exceptions to that rule, because routing a count through it would delete every
-    # expired key the count scanned past and queue a DEL for each -- a read answering a
-    # number and mutating the keyspace to do it, with propagation nobody asked for
+    # live_count() and not the shared lookup: routing a count through it would delete every expired
+    # key it scanned past and queue a DEL for each, mutating the keyspace to answer a number
     return resp.encode_integer(store.live_count()), []
 
 
-# KEYS's glob grammar, hand-ported from the reference's own matcher rather than fnmatch.
-# Measured side by side on the same patterns, the two disagree on which character negates
-# a class -- this grammar takes '^', fnmatch takes '!', and each treats the other as an
-# ordinary member of the class -- so a client asking for the complement of a set would get
-# back exactly the set it meant to exclude, with no error to notice it by. fnmatch also has
-# no backslash escape at all, and memoises translated patterns in a cache keyed by whatever
-# a client sends
+# the reference's own matcher and not fnmatch: this grammar negates a class with '^' where fnmatch
+# takes '!', so a complement would come back as exactly the set it meant to exclude
 _STAR = ord("*")
 _QUESTION = ord("?")
 _LBRACKET = ord("[")
@@ -142,30 +133,22 @@ def _glob_match(pattern: bytes, key: bytes, *, nocase: bool = False) -> bool:
         else:
             return False
     if klen:
-        # only when the key had bytes on entry. Unguarded, this consumes stars the
-        # reference's loop never reaches, and every run of nothing but `*` matches an
-        # empty key -- which `*` alone appears to get right only because the caller's
-        # short-circuit answers that one pattern before this function sees it
+        # only when the key had bytes on entry: unguarded, this consumes stars the reference's
+        # loop never reaches, and every run of `*` matches an empty key
         while p < plen and pattern[p] == _STAR:
             p += 1
     return p == plen
 
 
 def _signed(byte: int) -> int:
-    # the reference walks its pattern and its key through `char`, which is signed on
-    # every platform this is measured against, so 0xff reads as -1 there and a range's
-    # low-high ordering is decided on that reading: `[\x00-\xff]` is the inverted range
-    # -1..0 and matches almost nothing, where an unsigned reading makes it match
-    # everything. Only the class-range branch orders bytes rather than comparing them for
-    # equality, so it is the only place this is needed -- equality survives either reading
+    # the reference reads pattern and key bytes as signed `char`, so 0xff is -1 and `[\x00-\xff]`
+    # is the inverted range -1..0, matching almost nothing. only a class range orders bytes
     return byte - 256 if byte >= 128 else byte
 
 
 def _fold(byte: int, nocase: bool) -> int:
-    # C tolower() over the ASCII letters, which is the whole of what it changes for the
-    # bytes a comparison here can involve. Applied inside the comparison rather than to
-    # the pattern beforehand, because the two are not the same thing wherever the
-    # comparison is order-sensitive -- see the class-range branch below
+    # C tolower() over the ASCII letters, applied inside the comparison and not to the pattern
+    # beforehand: the two differ wherever the comparison is order-sensitive
     return byte + 32 if nocase and 65 <= byte <= 90 else byte
 
 
@@ -209,19 +192,13 @@ def _match_atom(
             p -= 1
             break
         elif p + 2 < plen and pattern[p + 1] == _DASH:
-            # signed, because the reference's comparison is -- see _signed. Both
-            # endpoints and the key byte take the same reading, so a range entirely
-            # below 0x80 or entirely above it behaves exactly as an unsigned one would;
-            # only a range straddling 0x80 can tell the two apart
+            # signed, as the reference's comparison is: both endpoints and the key byte take one
+            # reading, so only a range straddling 0x80 tells the two apart
             lo, hi = _signed(pattern[p]), _signed(pattern[p + 2])
             if lo > hi:
                 lo, hi = hi, lo
-            # folded AFTER the swap and never re-checked, which is the reference's own
-            # order and not an accident of it. `[Z-a]` is 90..97, needs no swap, and folds
-            # to 122..97 -- an inverted range that matches nothing, left inverted on
-            # purpose. Folding the pattern before the match instead would hand the swap
-            # `[z-a]` and it would correct that to 97..122, matching where the reference
-            # refuses
+            # folded after the swap and never re-checked, the reference's own order: `[Z-a]` is
+            # 90..97, folds to 122..97 and matches nothing, where a pre-folded pattern would match
             lo, hi = _fold(lo, nocase), _fold(hi, nocase)
             if lo <= _fold(_signed(key[k]), nocase) <= hi:
                 matched = True
@@ -235,12 +212,8 @@ def _match_atom(
 @command(b"KEYS", arity=2, kind=Kind.OTHER)
 def keys(store, conn, argv: list[bytes]) -> Reply:
     pattern = argv[1]
-    # the reference's own short-circuit, not an optimisation added on top of it:
-    # keysCommand tests for the exact one-byte `*` and never calls its matcher for that
-    # pattern. It is the only reason `KEYS *` lists an empty-string key on either server,
-    # because the matcher itself answers no to every pattern against an empty key but the
-    # empty one. Removing this line silently stops listing that key -- the defect a
-    # previous round found, repaired then in the matcher and repaired here instead
+    # the reference's own short-circuit: keysCommand never calls its matcher for the one-byte `*`,
+    # which is the only reason `KEYS *` lists an empty-string key on either server
     all_keys = pattern == b"*"
     # store.live_keys() rather than the shared lookup, for DBSIZE's own reason: a read
     # command must not delete what it was only asked to list
@@ -253,10 +226,8 @@ def keys(store, conn, argv: list[bytes]) -> Reply:
 @command(b"FLUSHALL", arity=1, kind=Kind.WRITE)
 def flushall(store, conn, argv: list[bytes]) -> Reply:
     store.flush()
-    # unconditional, unlike DEL's "changed nothing propagates nothing": a leader whose
-    # keyspace is already empty still owes its followers the instruction, because a
-    # follower's own keyspace may not be -- it holds whatever it has not yet been told to
-    # remove, and skipping the effect here would leave that behind forever
+    # unconditional, unlike DEL's "changed nothing propagates nothing": a follower's keyspace may
+    # not be empty where the leader's is, and skipping this would leave it that way forever
     return resp.encode_simple_string(b"OK"), [[b"FLUSHALL"]]
 
 
@@ -286,20 +257,11 @@ def _used_memory_bytes() -> int:
 
 
 def _info_sections(store, conn) -> list[tuple[bytes, list[bytes]]]:
-    # the fixed section order INFO reports in, each paired with the fields it carries.
-    # connected_clients is the one field anywhere in this reply that is a fact about
-    # sockets rather than about the store or the process, which is why it alone reads the
-    # connection's third slot -- and the guard here is two levels, not one: conn is None
-    # whenever dispatch is driven with no socket at all, which is this project's own
-    # convention for in-process use, and conn.server is None for a connection built
-    # directly rather than accepted. checking conn.server first would raise on exactly
-    # the callers this guard exists for
+    # the guard is two levels: conn is None when dispatch is driven with no socket, and conn.server
+    # is None for a connection built rather than accepted, so testing server first would raise
     connected = 0 if (conn is None or conn.server is None) else conn.server.connected_clients
-    # the two cumulative counters, read through the same slot and the same two-level guard, and
-    # zero for the same reason: a connection no server accepted has no server to ask. they are
-    # here because redis-cli --stat reads exactly these two and blocked_clients below, and a field
-    # it asks for and does not find it renders as LLONG_MIN -- so three of its six columns read
-    # -9223372036854775808 while this report left them out
+    # redis-cli --stat reads these two and blocked_clients, and renders a field it does not find as
+    # LLONG_MIN: three of its six columns read -9223372036854775808 while this report left them out
     received = 0 if (conn is None or conn.server is None) else conn.server.total_connections_received
     processed = 0 if (conn is None or conn.server is None) else conn.server.total_commands_processed
 
@@ -312,10 +274,8 @@ def _info_sections(store, conn) -> list[tuple[bytes, list[bytes]]]:
 
     return [
         (b"Server", [b"redis_version:" + SERVER_VERSION]),
-        # blocked_clients is a constant and not a counter: nothing in this server blocks a client.
-        # there is no BLPOP, no WAIT and no transaction, so the figure is 0 by construction rather
-        # than by measurement -- which is the standard every value in CONFIG GET's table is held
-        # to, a true statement about this process
+        # blocked_clients is a constant: no BLPOP, no WAIT, no transaction, so 0 by construction
+        # and a true statement about this process, the standard CONFIG GET's table is held to
         (b"Clients", [b"connected_clients:%d" % connected, b"blocked_clients:0"]),
         (b"Memory", [b"used_memory:%d" % _used_memory_bytes()]),
         (b"Stats", [b"total_connections_received:%d" % received,
@@ -326,32 +286,24 @@ def _info_sections(store, conn) -> list[tuple[bytes, list[bytes]]]:
 
 
 def _section_body(name: bytes, fields: list[bytes]) -> bytes:
-    # a header line, its fields, then a blank line -- even for a section with no fields of
-    # its own, which is how Keyspace renders on an empty database: the header stays and
-    # only the db0 line drops out
+    # a header, its fields, then a blank line even for a section with no fields: on an empty
+    # database Keyspace keeps its header and only the db0 line drops out
     return b"# " + name + b"\r\n" + b"".join(field + b"\r\n" for field in fields) + b"\r\n"
 
 
-# the reference's three whole-report selectors, which are not section names: `all` and
-# `everything` widen the report past its default sections there, and `default` names
-# exactly what a bare INFO already returns. Treating them as unrecognised section names
-# answers a client that spells the bare form out with an empty body, which is the one
-# shape of "less" that tells it nothing rather than telling it less. Every section here
-# is a default section, so all three select the same set
+# the reference's three whole-report selectors, not section names: read as names, a client that
+# spells the bare form out gets an empty body. every section here is a default section
 _INFO_WHOLE_REPORT = frozenset((b"ALL", b"EVERYTHING", b"DEFAULT"))
 
 
 @command(b"INFO", arity=-1, kind=Kind.OTHER)
 def info(store, conn, argv: list[bytes]) -> Reply:
-    # bare INFO reports every section; named arguments filter to only those, matched
-    # case-insensitively. An unrecognised name contributes nothing rather than erroring --
-    # a client asking a section this server does not have should get back less, not a
-    # connection-ending reply, and an all-unrecognised request is legitimately empty
+    # named arguments filter, case-insensitively, and an unrecognised one contributes nothing:
+    # asking for a section this server lacks should get back less, not a connection-ending reply
     wanted = {name.upper() for name in argv[1:]}
     if wanted & _INFO_WHOLE_REPORT:
-        # an empty filter is what the bare form already uses, so a selector alongside a
-        # section name widens rather than intersects -- which is the reference's own
-        # reading of `INFO default Server`
+        # an empty filter is the bare form, so a selector beside a section name widens rather
+        # than intersects, which is the reference's reading of `INFO default Server`
         wanted = set()
     body = b""
     for name, fields in _info_sections(store, conn):
@@ -361,18 +313,8 @@ def info(store, conn, argv: list[bytes]) -> Reply:
     return resp.encode_bulk_string(body), []
 
 
-# The configuration this server actually has, every value a true statement about this
-# process: nothing is appended to a log, nothing evicts, nothing bounds the keyspace, and
-# there is one keyspace rather than sixteen. Three of these happen to equal the
-# reference's own default because those defaults are "off" as well. `save` is the fifth
-# parameter and the one missing here, because its truth depends on whether this server's
-# save is scheduled -- _save_rule() below reads that off the server each time it is asked.
-#
-# A table rather than an echo of whatever was asked for. Echoing meant a name this server
-# has never heard of came back as a parameter that exists with an empty value, which is a
-# reply a client acts on -- `redis-py`'s config_get() sends `CONFIG GET *` and got back a
-# single parameter named `*`. Answering from a table makes an unknown name answer the
-# empty array the reference answers, and makes every value returned one this module chose
+# every value a true statement about this process, and a table rather than an echo: echoing made
+# an unknown name a parameter that exists, so `redis-py`'s `CONFIG GET *` got back `*` itself
 _CONFIG: dict[bytes, bytes] = {
     b"appendonly": b"no",
     b"databases": b"1",
@@ -386,22 +328,8 @@ _GLOB_METACHARACTERS = b"*?["
 
 
 def _save_rule(conn) -> bytes:
-    # the rule this server saves by, in the reference's own syntax. There each
-    # `<seconds> <changes>` rule fires once a whole-second clock is MORE than <seconds>
-    # past the last completed save and at least <changes> writes have landed, so a save
-    # every N seconds, changed or not, is `N-1 0` -- `save "1 0"` on redis-server 7.2.7
-    # saves every two seconds, not every one. At N = 1 that is `0 0`, a rule 7.2.7's own
-    # parser refuses, since a rule's seconds must be at least 1; it is answered anyway,
-    # because it is the one spelling that says what this server does and `1 0` would say
-    # every two seconds.
-    #
-    # `""` is the reference's spelling of snapshotting switched off, answered whenever no
-    # save is scheduled. The interval comes from Server.armed_snapshot_interval, which is
-    # non-zero only while run() has the save armed, so this reply agrees with the saves
-    # before a run, during it and after it has returned. conn is None whenever dispatch is
-    # driven with no socket, and conn.server is None on a connection built rather than
-    # accepted; checking conn.server first would raise on the first of those. Only a
-    # public attribute is read through the slot, as its contract in connection.py requires
+    # the reference's syntax: a rule fires once the clock is MORE than <seconds> past the last save,
+    # so every N seconds is `N-1 0` (7.2.7's `save "1 0"` saves every two), and `""` is off
     server = None if conn is None else conn.server
     interval = 0 if server is None else server.armed_snapshot_interval
     if not interval:
@@ -411,41 +339,33 @@ def _save_rule(conn) -> bytes:
 
 @command(b"CONFIG", arity=-2, kind=Kind.OTHER)
 def config(store, conn, argv: list[bytes]) -> Reply:
-    # one subcommand implemented. A benchmarking or profiling client probes CONFIG GET for
-    # a handful of parameters before doing anything else and treats an error reply as
-    # fatal, which is what this has to survive; real configurability is not on offer
+    # one subcommand: a benchmarking client probes CONFIG GET before anything else and treats an
+    # error reply as fatal, which is what this has to survive
     if argv[1].upper() != b"GET":
         return resp.encode_error(SYNTAX_ERROR), []
     patterns = argv[2:]
     if not patterns:
-        # the reference names the subcommand in this one message rather than the command,
-        # and it is the only arity error in this server that has a subcommand to name --
-        # so the name is spelt out here instead of coming from cmd.name like every other
+        # the reference names the subcommand here and not the command, the only arity error in this
+        # server with one to name, so it is spelt out rather than coming from cmd.name
         return wrong_arity(b"CONFIG|GET"), []
-    # built per call: save's value belongs to the server this connection was accepted by,
-    # and both branches below have to answer from the same table or `CONFIG GET save` and
-    # `CONFIG GET *` could disagree about it. appended last, where the fixed table used to
-    # carry it, so a pattern still answers the five names in the order it always has
+    # built per call, since save's value belongs to the accepting server, and both branches answer
+    # from this one table or `CONFIG GET save` and `CONFIG GET *` could disagree
     table = {**_CONFIG, b"save": _save_rule(conn)}
     pairs = []
     seen = set()
     for pattern in patterns:
         lowered = pattern.lower()
         if not any(byte in pattern for byte in _GLOB_METACHARACTERS):
-            # an exact name is looked up, not matched, and the reply carries the spelling
-            # the client used rather than the canonical one -- `CONFIG GET MAXMEMORY`
-            # answers `MAXMEMORY` on the reference, and the lookup itself ignores case
+            # an exact name is looked up and the reply carries the client's own spelling:
+            # `CONFIG GET MAXMEMORY` answers `MAXMEMORY` on the reference, and the lookup folds case
             if lowered in table and lowered not in seen:
                 seen.add(lowered)
                 pairs.append(resp.encode_bulk_string(pattern))
                 pairs.append(resp.encode_bulk_string(table[lowered]))
             continue
         for name, value in table.items():
-            # the matcher is told to ignore case rather than the pattern being lowered
-            # before it: the two differ wherever the comparison is order-sensitive, and a
-            # class range is, so a lowered pattern matches ranges the reference refuses.
-            # KEYS passes no flag and must not -- a key is arbitrary bytes and its case is
-            # the client's business
+            # the matcher folds case rather than the pattern being lowered first: a class range is
+            # order-sensitive, so a lowered pattern matches ranges the reference refuses
             if name not in seen and _glob_match(pattern, name, nocase=True):
                 seen.add(name)
                 pairs.append(resp.encode_bulk_string(name))

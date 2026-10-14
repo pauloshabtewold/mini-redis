@@ -26,11 +26,8 @@ class SlidingWindow:
         """True and the permit is spent; False and nothing is recorded."""
         cutoff = now - self.window
         readings = self._readings
-        # popped rather than filtered, and this is the whole of why: a check that counted
-        # the readings still inside the window would answer every question correctly and
-        # keep one reading per request for the life of the connection, which is a leak
-        # that behaves. <= and not <, for the reason an expiry deadline equal to now is
-        # already expired -- a reading exactly one window old has left the window
+        # popped and not filtered: counting the readings inside the window answers correctly and
+        # keeps one per request for the connection's life. <= because one window old has left it
         while readings and readings[0] <= cutoff:
             readings.popleft()
         # >= because the question is whether there is room for one more permit, which is

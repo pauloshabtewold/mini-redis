@@ -83,11 +83,8 @@ def test_info_with_no_section_reports_the_full_set_of_fields(redis_client):
 
 
 def test_the_two_counters_count_what_a_live_server_has_done(redis_client):
-    # against a real server over a real socket, because both counters are facts about the process
-    # and not about the store: a unit test dispatching into a bare Store has no server to ask.
-    # the redis-py client that reached here has already spent connections and commands of its
-    # own -- two CLIENT SETINFO at the handshake among them -- so what is asserted is the
-    # movement and not an absolute, and the movement is what redis-cli --stat renders
+    # against a real server, because both counters are facts about the process and not the store, and
+    # the client has already spent connections and commands, so the movement is what is asserted
     r = redis_client
     before = r.info()
     for i in range(5):
@@ -108,9 +105,8 @@ def test_info_with_a_section_name_filters_to_it(redis_client):
 
 
 def test_config_get_save_reports_the_servers_own_interval(redis_client):
-    # the fixture's server gets a snapshot path and the CLI's default interval, so it saves
-    # every 60 seconds -- `59 0` in the reference's syntax, and not `""`, which is that
-    # syntax's spelling of a server that never saves
+    # the fixture's server has a snapshot path and the CLI's default interval, so it saves every 60
+    # seconds -- `59 0` in the reference's syntax, and not the `""` of a server that never saves
     r = redis_client
     assert r.config_get("save") == {"save": "59 0"}
 
@@ -178,10 +174,8 @@ def test_flushall_on_an_already_empty_keyspace_still_answers_ok(redis_client):
 
 
 def test_lpop_with_a_count_is_a_wrong_arity_error(redis_client):
-    # redis-py's lpop(name, count) sends "LPOP name count" -- a count this server does
-    # not implement. arity is exactly 2, so the trailing count is rejected outright
-    # rather than accepted and silently ignored, and this pins that divergence instead
-    # of avoiding the call that would surface it
+    # redis-py's lpop(name, count) sends "LPOP name count", which this server does not implement:
+    # arity is exactly 2, so the trailing count is rejected rather than accepted and ignored
     r = redis_client
     r.rpush("l", "a", "b")
     try:

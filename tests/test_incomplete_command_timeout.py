@@ -37,13 +37,8 @@ class _Clock:
 
 @contextlib.contextmanager
 def _injected_clock(start=1_000.0):
-    # the server module's own `time` is rebound, not time.monotonic itself: patching the
-    # real function reaches every module in this process.
-    # a local copy rather than an import of the same helper in tests/test_periodic_tasks.py:
-    # that name is private there, so reaching across for it means a rename in that file
-    # breaks this one silently, and this module would be the one that looked broken. the
-    # three-name namespace is the contract -- monotonic, time and sleep -- and a drift in it
-    # is a loud AttributeError here rather than a quiet wrong answer
+    # rebinds the server module's own `time` and not time.monotonic itself, which would reach every module
+    # the monotonic/time/sleep namespace is the contract, so drift is a loud AttributeError here
     clock = _Clock(start)
     real = server_mod.time
     server_mod.time = types.SimpleNamespace(
@@ -62,15 +57,13 @@ PONG = b"+PONG\r\n"
 ECHO_ABCD = b"*2\r\n$4\r\nECHO\r\n$4\r\nabcd\r\n"
 ECHO_REPLY = b"$4\r\nabcd\r\n"
 
-# the start of an inline command, and the start of a multibulk. the second is the case a
-# check on the read buffer alone misses: the header and the first element are consumed, the
-# second element is still owed, and the read buffer is empty
+# the multibulk is the case a check on the read buffer alone misses: header and first element
+# consumed, second element still owed, read buffer empty
 HALF_INLINE = b"PIN"
 HALF_MULTIBULK = b"*2\r\n$4\r\nECHO\r\n"
 
-# marks in units of one reply, so that five replies queued on a socket that takes nothing are
-# over the high-water mark and the queue reaches the low-water mark exactly when one reply
-# is left
+# marks in units of one reply: five replies on a socket that takes nothing are over the high-water
+# mark, and the queue reaches the low-water mark exactly when one reply is left
 PAUSING = {
     "write_buffer_high_water": 3 * len(ECHO_REPLY),
     "write_buffer_low_water": len(ECHO_REPLY),
@@ -197,9 +190,8 @@ def build():
 
 
 def _mask(peer):
-    # the selector's own mask, the one record of what the loop dispatches a connection for.
-    # get_key raises for a connection the selector does not hold, so one that has dropped out
-    # of it is not mistaken for one that is merely quiet
+    # the selector's own mask. get_key raises for a connection the selector does not hold, so one that
+    # dropped out of it is not mistaken for one that is merely quiet
     return peer.rig.server._loop._selector.get_key(peer.conn).events
 
 
@@ -268,9 +260,8 @@ def test_a_connection_holding_nothing_is_never_closed_however_long_it_idles(buil
 
 
 def test_a_byte_at_a_time_trickle_is_closed_on_the_original_arm_time(build):
-    # the client the deadline is for: it sends a byte a second, never finishes the line, and
-    # holds a buffer for as long as it is allowed to. a deadline restarted by each byte would
-    # never fire
+    # the client the deadline is for: a byte a second, never finishing the line -- a deadline
+    # restarted by each byte would never fire
     rig = build()
     peer = rig.connect()
     peer.send(b"x")
@@ -317,9 +308,8 @@ def test_a_timeout_of_zero_disables_the_check(build):
     control = on.connect()
     for peer in (unlimited, control):
         peer.send(HALF_INLINE)
-    # one clock serves both servers. the control is the same command on the same clock under
-    # a limit, so that a connection left open here is the zero's doing and not a sweep that
-    # never ran
+    # one clock serves both servers, and the control is the same command under a limit, so a connection
+    # left open here is the zero's doing and not a sweep that never ran
     off.clock.t = START + 10 ** 6
     off.sweep()
     on.sweep()
@@ -331,11 +321,8 @@ def test_a_timeout_of_zero_disables_the_check(build):
 
 
 def test_a_paused_connection_keeps_no_deadline_for_the_command_it_cannot_finish(build):
-    # the server stopped reading this client, so the command it began cannot finish, and a
-    # deadline that kept running would close the client for the backpressure applied to it.
-    # the other side of that is that the sweep never sees a paused connection: this flag bounds
-    # a command that was begun and not finished, and says nothing about a client that has sent
-    # every request it means to and stopped reading, which holds no deadline at all
+    # the server stopped reading this client, so the command cannot finish and a running deadline would
+    # close it for the backpressure applied to it; a paused connection holds no deadline at all
     rig = build(**PAUSING)
     peer = rig.connect()
     _pause_on_a_half_sent_command(peer)
@@ -382,11 +369,8 @@ def test_the_deadline_is_rearmed_from_the_moment_reading_resumes(build):
 
 
 def test_a_batch_that_pauses_the_connection_leaves_the_deadline_suspended(build):
-    # the deadline is armed before the batch is dispatched, and dispatching can pause the
-    # connection, which clears it. the clear has to be the last write: a deadline armed after
-    # the dispatch would start running on a connection this server has just stopped reading.
-    # the control is the same bytes on the same stalled socket with the pause switched off,
-    # and it is the one holding a deadline
+    # the clear has to be the last write: a deadline armed after the dispatch would run on a connection
+    # this server has just stopped reading. the control is the same bytes with the pause off
     rig = build(**PAUSING)
     unpaused_rig = build(write_buffer_high_water=0)
     paused = rig.connect()
@@ -423,10 +407,8 @@ def test_a_resume_arms_no_deadline_for_a_connection_holding_no_command(build):
 
 
 def test_the_sweep_survives_closing_connections_out_of_the_set_it_is_walking(build):
-    # runs the sweep's body and not the tick: iterating the set itself raises RuntimeError
-    # the first time a close discards from it, and the tick's boundary would log that and
-    # leave the second stale connection open, which this test would then report as an
-    # assertion and not as the error that explains it
+    # runs the sweep's body and not the tick: iterating the set raises RuntimeError at the first close,
+    # and the tick's boundary would log that and leave the second stale connection open
     rig = build()
     stale = [rig.connect(), rig.connect()]
     stale[0].send(HALF_INLINE)
@@ -444,9 +426,8 @@ def test_the_sweep_survives_closing_connections_out_of_the_set_it_is_walking(bui
 
 
 def test_a_close_that_fails_does_not_end_the_sweep(build):
-    # runs the sweep's body and not the tick, for the same reason: through the tick a close
-    # that raised would be logged and the connections behind it left holding their commands,
-    # which is a different failure from the one that matters here, the sweep ending early
+    # runs the sweep's body and not the tick: through the tick a close that raised would be logged, a
+    # different failure from the one that matters here, the sweep ending early
     rig = build()
     peers = [rig.connect() for _ in range(3)]
     for peer in peers:
@@ -470,12 +451,8 @@ def test_a_close_that_fails_does_not_end_the_sweep(build):
 
 
 def test_a_pipeline_cut_mid_command_by_every_read_is_not_closed_while_commands_complete(build):
-    # a client streaming commands whose every read ends partway through one never presents a
-    # clean buffer. a deadline armed once, at the first read, and cleared only by a clean
-    # buffer, would close it at the limit however quickly each command completed. a read that
-    # completes a command means whatever tail is held is a new command, with a deadline of its
-    # own. the first chunk is a command and five bytes, every chunk after it is fourteen
-    # bytes, so every read ends five bytes into a command
+    # every read ends five bytes into a command -- first chunk a command plus five bytes, then fourteen
+    # each -- so a deadline armed once and cleared only by a clean buffer would close it at the limit
     limit = 5
     reads = 20
     rig = build(incomplete_command_timeout=limit)

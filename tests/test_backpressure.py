@@ -34,9 +34,8 @@ GET = b"*2\r\n$3\r\nGET\r\n$1\r\nk\r\n"
 PING = b"*1\r\n$4\r\nPING\r\n"
 PONG = b"+PONG\r\n"
 
-# 200 replies of 64 KiB is 12.8 MB, past what any socket buffer on a loopback pair holds and
-# well under the 32 MiB default limit, so a batch this size pauses a connection and does not
-# close it
+# 200 replies of 64 KiB is 12.8 MB, past any loopback socket buffer and well under the 32 MiB
+# default limit, so a batch this size pauses a connection and does not close it
 BURST = 200
 
 # a bound on every wait that depends on another party, so a stalled test fails instead of
@@ -316,14 +315,8 @@ def test_between_the_marks_nothing_changes_in_either_direction():
 
 
 def test_a_full_pause_and_resume_never_asks_the_selector_for_a_mask_of_nothing():
-    # the property is that the selector is never asked for an empty mask, which kqueue answers
-    # with an error and a dropped registration, and that a connection owing bytes is registered
-    # every time the loop looks. it is not that every call is a modify: a pause that begins
-    # from a connection registered for reading alone drops the one bit it had, leaving nothing,
-    # which the applier spells as an unregister and a register in the same flush. whether a run
-    # takes that route or modifies a registration that already has write interest depends on how
-    # much the kernel had room for at the first send that overflowed, so the calls are checked
-    # for what holds either way
+    # the selector is never asked for an empty mask -- kqueue answers that with an error and a dropped
+    # registration -- and a connection owing bytes is registered every pass, whichever route the pause took
     with serving() as (server, client, conn, _connect):
         store_value(server, client, VALUE)
         total = BURST * len(REPLY)
@@ -339,9 +332,8 @@ def test_a_full_pause_and_resume_never_asks_the_selector_for_a_mask_of_nothing()
                 queued = len(conn.write_buffer)
                 events = mask_while_owing(server, conn)
                 assert events != 0
-                # the oracle is the marks and nothing else: above the high mark the reading
-                # is off, at or under the low mark it is on, and in between it is whatever it
-                # last was. write interest is exactly whether anything is owed
+                # the oracle is the marks alone: off above the high mark, on at or under the low,
+                # unchanged in between, and write interest exactly whether anything is owed
                 high, low = server.write_buffer_high_water, server.write_buffer_low_water
                 if queued > high:
                     assert not events & READ, "%d bytes owed and still being read" % queued
@@ -372,11 +364,8 @@ def test_a_full_pause_and_resume_never_asks_the_selector_for_a_mask_of_nothing()
 
 
 def test_a_pause_from_a_registration_for_reading_alone_never_asks_for_a_mask_of_nothing():
-    # the common way a connection is paused, and the one the full cycle above reaches only when
-    # the kernel had little room at the first send that overflowed: one reply far larger than
-    # the mark, queued for a connection that is registered for reading and nothing else. the
-    # pause drops its only bit, which is a mask of nothing, and what the selector is shown
-    # instead is the connection leaving and coming back for writing within the one flush
+    # one reply far larger than the mark, queued to a connection registered for reading alone: the pause
+    # drops its only bit, so the applier unregisters and registers rather than ask for mask 0
     with serving() as (server, client, conn, _connect):
         server.write_buffer_limit = 0
         assert mask_of(server, conn) == READ, "the premise is a connection registered for reading alone"
@@ -394,11 +383,8 @@ def test_a_pause_from_a_registration_for_reading_alone_never_asks_for_a_mask_of_
 
 
 def test_a_paused_connection_that_empties_in_one_send_is_never_unregistered_on_the_way():
-    # with the low-water mark at 0 a paused connection resumes only when its queue is empty,
-    # so the send that empties it is always made by a paused connection, and the one flush
-    # that follows has to restore its reading before it drops its writing. in the other order
-    # the connection wants neither for the length of one call, which the selector can only
-    # express by forgetting it
+    # with the low-water mark at 0 the send that empties the queue is always made by a paused connection,
+    # so the flush must restore reading before dropping writing, or the mask is 0 for one call
     with serving(write_buffer_low_water=0) as (server, client, conn, _connect):
         store_value(server, client, VALUE)
         total = BURST * len(REPLY)
@@ -495,9 +481,8 @@ def test_a_high_water_mark_of_zero_never_pauses_a_connection():
 
 
 def test_one_reply_larger_than_the_write_buffer_limit_closes_the_connection():
-    # one reply, so there is no queue to blame: it is larger than the limit and larger than
-    # everything the kernel will take at once. an idle peer is the usual case and a reply
-    # under the limit is always sent whole, which is why the value has to be this big
+    # one reply, so there is no queue to blame: larger than the limit and larger than everything the
+    # kernel takes at once, since a reply under the limit is always sent whole to an idle peer
     size = 16 * 1024 * 1024
     with listening() as (server, connect, _listener):
         server.write_buffer_limit = 65536
@@ -524,13 +509,8 @@ def test_one_reply_larger_than_the_write_buffer_limit_closes_the_connection():
 
 
 def test_a_value_at_the_size_cap_is_stored_and_not_readable_back_past_the_write_buffer_limit(caplog):
-    # a value can be as large as --max-value-size and a reply can be no larger than
-    # --write-buffer-limit once the kernel has stopped taking it, and nothing relates the two.
-    # at 131072 against 65536 the client that sends GETs and never reads them stores the
-    # value and is then closed by the first reply that does not fit. the numbers are above
-    # loopback buffering on purpose: a send holds a reply this size whole whenever the peer
-    # has room, so an idle client is never closed by one, and only a client whose kernel has
-    # filled is
+    # nothing relates the two limits: a 131072-byte value under --max-value-size is stored and then closed
+    # by the first reply past the 65536-byte limit, both above loopback buffering so only a full kernel
     cap = 131072
     with serving(max_value_size=cap, write_buffer_limit=65536) as (server, client, conn, _connect):
         value = bytes(range(256)) * (cap // 256)
@@ -553,12 +533,7 @@ def test_a_value_at_the_size_cap_is_stored_and_not_readable_back_past_the_write_
 
 
 # --- many small elements are one reply -----------------------------------------------------
-#
-# the size cap holds each element of a list and each key, and nothing holds the number of them,
-# so one LRANGE or one KEYS reply can be as long as the keyspace has grown and is judged whole,
-# after the send, like any other. these two tests pin that for the shapes the string case above
-# does not reach. every element is a small fraction of the cap and of the limit, so none of them
-# can be what closes the connection: the sum is
+# nothing caps element or key count, so one LRANGE or KEYS reply is judged whole and only the sum closes
 
 # 4096 of 4 KiB is 16 MiB, past what a loopback pair takes from a peer that reads nothing, which
 # is the premise the limit is judged on. the cap and the limit are the string case's
@@ -618,9 +593,8 @@ def assert_each_is_small(items, what):
 
 
 def test_a_list_of_small_elements_is_stored_and_not_readable_back_past_the_write_buffer_limit(caplog):
-    # --max-value-size holds each element and nothing holds the list, so LRANGE 0 -1 is one
-    # reply as long as the list is. README says a list far under the cap can be stored and not
-    # read back at any finite limit, and 0 reads it back
+    # --max-value-size holds each element and nothing holds the list, so LRANGE 0 -1 is one reply as long
+    # as the list: such a list is unreadable at any finite limit, and 0 reads it back
     elements = small_elements(b"")
     assert_each_is_small(elements, "an element")
     with serving(max_value_size=SMALL_CAP, write_buffer_limit=SMALL_LIMIT) as (server, client, conn, connect):
@@ -662,9 +636,8 @@ def test_a_list_of_small_elements_is_stored_and_not_readable_back_past_the_write
 
 
 def test_a_keys_reply_of_small_keys_is_judged_whole_against_the_write_buffer_limit(caplog):
-    # the same sum, reached through the keyspace: no key is larger than a fraction of the cap
-    # and KEYS * lists every one of them as one array. its order is not part of the contract,
-    # so what is compared is the set, and the closed connection is checked by its length
+    # the same sum through the keyspace: KEYS * lists every small key as one array, compared as a set
+    # since its order is not part of the contract
     names = small_elements(b"key-")
     assert_each_is_small(names, "a key")
     head = b"*%d\r\n" % ELEMENT_COUNT
@@ -779,13 +752,8 @@ class SenderProgress:
 
 
 def test_the_water_marks_pause_and_resume_over_a_real_socket(tmp_path):
-    # a server in its own process, one client that sends from one thread and reads from
-    # another, and a reader that deliberately lags. the lag is what builds a backlog: a reader
-    # that kept pace would pass against a server with no pause at all. what makes the run
-    # prove the pair and not merely survive it is the limit, set to a sixth of the traffic:
-    # without the pause the server reads the whole pipeline, queues every reply past the
-    # kernel's share and closes the connection, and with it the server stops reading the
-    # sender, which stalls, which is the only moment this reader reads
+    # a real server, a sender thread and a reader that lags on purpose -- a reader keeping pace would pass
+    # against a server with no pause at all; the limit at a sixth of the traffic is what proves the pair
     high_water = build_arg_parser().parse_args([]).write_buffer_high_water
     limit = 4 * 1024 * 1024
     payloads = [(b"%08d" % i) * (PAYLOAD_SIZE // 8) for i in range(PAYLOAD_COUNT)]
@@ -795,9 +763,8 @@ def test_the_water_marks_pause_and_resume_over_a_real_socket(tmp_path):
     total = PAYLOAD_COUNT * reply_size
     assert len(expected) == total
     assert total > 5 * limit
-    # past anything the pause lets pile up and past what a socket buffer and the limit can
-    # hold between them, so this reader never reads because of its backlog alone: it reads
-    # when the sender is held up, or when the sender is done
+    # past anything the pause piles up and past socket buffer plus limit, so this reader never reads for
+    # its backlog alone: it reads when the sender is held up, or done
     lag_ceiling = 5 * limit
 
     progress = SenderProgress()

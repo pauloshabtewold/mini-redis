@@ -26,8 +26,8 @@ REPO_ROOT = pathlib.Path(__file__).resolve().parent.parent
 
 @contextlib.contextmanager
 def listening(**settings):
-    # settings are forwarded to the Server, so a test needing a non-default one gets it here rather than rebuilding this setup: eight modules import this helper and a second copy of it is what the fourth review's finding 54(c) was
-    # a real listener on an ephemeral port, driven a step at a time: exercises the accept, read and close wiring without a subprocess or a signal
+    # a real listener on an ephemeral port, driven a step at a time: exercises accept, read and close with
+    # no subprocess and no signal, and forwards settings so a test needing a non-default one gets it here
     server = Server(0, **settings)
     listener = server._open_listener()
     server._loop.register_listener(listener)
@@ -36,7 +36,7 @@ def listening(**settings):
     clients = []
 
     def connect():
-        # every client the test opens is tracked here, so a failing assertion mid-test cannot leak the descriptor
+        # every client the test opens is tracked here, so a failing assertion cannot leak the descriptor
         client = socket.create_connection(("127.0.0.1", port))
         clients.append(client)
         return client
@@ -79,9 +79,8 @@ def test_parsed_command_gets_its_reply_on_the_same_connection(server_and_client)
 
 
 def test_bulk_body_containing_crlf_survives_a_real_socket(server_and_client):
-    # the body is framing bytes, so a parser scanning for CRLF instead of honouring the declared
-    # length truncates it; ECHO carries the whole body back out, where a drained buffer alone
-    # would say nothing about what came out of it
+    # the body is framing bytes, so a parser scanning for CRLF instead of honouring the declared length
+    # truncates it; ECHO carries the whole body back out, where a drained buffer alone says nothing
     server, client = server_and_client
     body = b"*2\r\n$3\r\nfoo\r\n"
     client.sendall(b"*2\r\n$4\r\nECHO\r\n$%d\r\n" % len(body) + body + b"\r\n")
@@ -93,9 +92,8 @@ def test_bulk_body_containing_crlf_survives_a_real_socket(server_and_client):
 
 
 def test_command_split_across_writes_is_reassembled(server_and_client):
-    # one byte per write, so every element boundary lands mid-parse. the echoed argument is what
-    # proves an argv was reassembled: an empty buffer is also what a byte still in the kernel looks
-    # like, and what a parser inventing an argv out of nothing would leave behind
+    # one byte per write, so every element boundary lands mid-parse: the echoed argument is what proves an
+    # argv was reassembled, since an empty buffer is also what an invented argv would leave behind
     server, client = server_and_client
     for byte in b"*2\r\n$4\r\nECHO\r\n$2\r\nhi\r\n":
         client.sendall(bytes([byte]))
@@ -138,7 +136,8 @@ def test_protocol_error_closes_only_the_sending_connection():
 
 @pytest.mark.skipif(NO_CONVERSION_CEILING, reason=NO_CEILING_REASON)
 def test_oversized_length_header_does_not_take_the_server_down():
-    # a length header past what the interpreter converts is refused by the interpreter, not the parser, so an unguarded server dies on it and takes every connection down
+    # a length header past what the interpreter converts is refused by the interpreter and not the parser,
+    # so an unguarded server dies on it and takes every connection down
     with listening() as (server, connect, _listener):
         bystander = connect()
         attacker = connect()
@@ -162,11 +161,8 @@ def test_oversized_length_header_does_not_take_the_server_down():
 
 
 def test_protocol_error_survives_a_peer_that_cannot_be_written_to(caplog):
-    # the two conditions have to land in the same pass -- the parse fails AND the error
-    # reply cannot be sent -- which is what makes _flush close the connection before the
-    # caller does. A socketpair makes that deterministic: data already queued stays
-    # readable after the peer closes, while the next send() raises EPIPE. Over TCP the
-    # same pairing comes from a peer that resets after sending a malformed command.
+    # the parse must fail AND the error reply fail to send in one pass, which is what makes _flush close
+    # before the caller does; a socketpair makes that deterministic, where TCP needs a peer that resets
     server = Server(0)
     doomed_sock, gone_peer = socket.socketpair()
     gone_peer.sendall(b"*1\r\n+PING\r\n")
@@ -188,13 +184,8 @@ def test_protocol_error_survives_a_peer_that_cannot_be_written_to(caplog):
         with caplog.at_level(logging.ERROR):
             server._on_readable(doomed)
         assert server._connections == {bystander}, "only the sender should be dropped"
-        # and that it returns quietly. _close runs twice on this path by design -- _flush
-        # closes on the failed send and the caller closes again -- and the guard that
-        # makes the second call a no-op is invisible to every functional assertion here:
-        # without it the second unregister raises on a descriptor already at -1, _abandon
-        # catches it and finishes correctly, and the end state is identical. What differs
-        # is two ERROR tracebacks logged for a client sending garbage and hanging up,
-        # which is ordinary traffic, not an incident
+        # _close runs twice on this path by design -- _flush closes on the failed send and the caller closes
+        # again -- and without the no-op guard a vanished peer logs two ERROR tracebacks for ordinary traffic
         assert not [r for r in caplog.records if r.levelname == "ERROR"], (
             "an ordinary malformed-then-vanished peer must not log an error: %s"
             % [r.getMessage() for r in caplog.records])
@@ -231,10 +222,8 @@ def test_close_flushes_a_still_queued_reply_to_the_peer():
 
 @pytest.mark.parametrize("failure", [KeyError, ValueError, OSError], ids=lambda e: e.__name__)
 def test_a_failed_registration_costs_one_connection_not_the_server(monkeypatch, caplog, failure):
-    # _on_accept runs outside _guard, so an unguarded raise here unwinds run_once and takes every other client with it.
-    # all three of the named exceptions are exercised: the guard's own comment says the selector raises KeyError for a
-    # descriptor already registered and ValueError for a closed one, and the kqueue backend's control call raises
-    # OSError -- with only KeyError driven, narrowing the tuple to (KeyError,) passes the whole suite
+    # _on_accept runs outside _guard, so an unguarded raise here unwinds run_once and takes every other
+    # client with it; all three are driven, since with KeyError alone narrowing the tuple stays green
     with listening() as (server, connect, _listener):
         bystander = connect()
         pump(server)
@@ -274,7 +263,8 @@ def test_a_failed_registration_costs_one_connection_not_the_server(monkeypatch, 
 
 
 def _stop_the_loop_from_inside(server):
-    # run() sets _running itself, so a flag set before the call is overwritten; the only way out is from within the loop
+    # run() sets _running itself, so a flag set before the call is overwritten:
+    # the only way out is from within the loop
     real_run_once = server._loop.run_once
 
     def run_once_then_stop():
@@ -285,7 +275,8 @@ def _stop_the_loop_from_inside(server):
 
 
 def test_a_close_that_raises_during_shutdown_still_releases_the_listener(caplog):
-    # the shutdown sweep runs after the loop has exited, where _guard no longer applies, so one bad close must not strand the listener or the selector
+    # the shutdown sweep runs after the loop has exited, where _guard no longer applies, so one bad close
+    # must not strand the listener or the selector
     server = Server(0)
     sock, peer = socket.socketpair()
     sock.setblocking(False)
@@ -313,7 +304,8 @@ def test_a_close_that_raises_during_shutdown_still_releases_the_listener(caplog)
 
 
 def test_running_one_server_twice_names_the_reuse():
-    # the selector is closed on the way out, so without this the second run dies four frames down in selectors naming kqueue
+    # the selector is closed on the way out, so without this the second run dies four frames down in
+    # selectors, naming kqueue
     server = Server(0)
     _stop_the_loop_from_inside(server)
     server.run()
@@ -344,7 +336,8 @@ def test_write_interest_is_serviced_by_the_drain():
         assert server._loop._selector.get_key(conn).events == selectors.EVENT_READ
 
 
-# delivers a real SIGTERM from inside _open_listener(), the one point where the flag and the handlers are both live but the loop has not started, so a stop recorded there is only honoured if run() checks the flag rather than assuming it starts true
+# delivers a real SIGTERM from inside _open_listener(), the one point where the flag and the handlers are
+# both live but the loop has not started: a stop there is honoured only if run() checks the flag
 _ANNOUNCE_ON_BIND = """
 import socket, sys, threading
 sys.path.insert(0, %r)
@@ -408,7 +401,8 @@ def test_a_stop_signal_delivered_during_startup_is_not_lost():
 
 
 def test_accept_with_nothing_pending_adds_no_connection():
-    # the listener is non-blocking, so accept() with an empty backlog raises BlockingIOError, which is the OSError branch: a real readiness-then-gone race, no mock needed
+    # the listener is non-blocking, so accept() with an empty backlog raises BlockingIOError, which is the
+    # OSError branch: a real readiness-then-gone race, with no mock needed
     with listening() as (server, _connect, listener):
         # asserted before the call, not after: a blocking listener waits in accept() for a peer
         # that is never coming, which hangs the suite instead of failing it
@@ -418,9 +412,8 @@ def test_accept_with_nothing_pending_adds_no_connection():
 
 
 def test_the_listener_is_bound_to_loopback_only():
-    # the replication sync command is unauthenticated, so a wildcard bind offers it to the whole
-    # network -- and every other test here connects over 127.0.0.1 either way, so nothing else
-    # here can tell the two binds apart
+    # the replication sync command is unauthenticated, so a wildcard bind offers it to the whole network --
+    # and every other test here connects over 127.0.0.1 either way, so nothing else can tell them apart
     with listening() as (_server, _connect, listener):
         assert listener.getsockname()[0] == "127.0.0.1"
 
@@ -433,9 +426,8 @@ def test_the_listener_takes_the_port_back_from_a_lingering_close():
 
 
 def test_the_listener_asks_for_the_largest_backlog_the_kernel_allows(monkeypatch):
-    # a full accept queue drops SYNs rather than refusing them, so a burst of clients waits out its
-    # own retransmit timer instead of failing. the depth cannot be read back off the socket, which
-    # leaves the call itself as the only place to see it
+    # a full accept queue drops SYNs rather than refusing them, so a burst of clients waits out its own
+    # retransmit timer; the depth cannot be read back off the socket, so the call is the only witness
     server = Server(0)
     backlogs = []
     real_listen = socket.socket.listen
@@ -459,11 +451,8 @@ def test_the_default_port_is_the_one_every_client_assumes():
 
 
 def test_the_loop_is_built_with_a_bounded_select_timeout():
-    # the value the loop is constructed with rather than a measured wall clock, which goes red on a
-    # loaded machine for reasons that have nothing to do with the timeout: this bounds how long a
-    # stop signal waits to be noticed and is the granularity at which the periodic intervals --
-    # the expiry sweep and the snapshot save -- are checked, with the default sweep interval
-    # equal to it
+    # the value the loop was constructed with and not a measured wall clock, which goes red on a loaded
+    # machine: it bounds how long a stop waits to be noticed and is the granularity of both intervals
     server = Server(0)
     try:
         assert server._loop._timeout == 0.1
@@ -472,10 +461,8 @@ def test_the_loop_is_built_with_a_bounded_select_timeout():
 
 
 def test_the_bounded_timeout_reaches_the_select_call_itself():
-    # the test above reads the attribute the loop was built with, which is configuration, not
-    # behaviour: severing the two -- select(0) with _timeout still 0.1 -- passes it untouched.
-    # what that costs is measurable and total. an idle loop that never blocks spins: 10 passes
-    # per wall second becomes tens of thousands, and this server has one thread to spend
+    # the test above reads configuration, not behaviour: severing the two -- select(0) with _timeout still
+    # 0.1 -- passes it untouched, and an idle loop that never blocks spins 10 passes a second into thousands
     server = Server(0)
     seen = []
     real_select = server._loop._selector.select
@@ -542,13 +529,8 @@ def test_a_failed_bind_leaves_the_server_usable():
 
 
 def test_main_exits_one_with_a_single_line_and_no_traceback_on_a_failed_bind(tmp_path):
-    # every other startup refusal main() has -- a corrupt snapshot, an unwritable path --
-    # already exits 1 with one line; before ListenFailed existed a bind failure alone
-    # unwound as a full traceback out of main(), where this line is what tells the two
-    # apart from an operator's own mistake. the snapshot path is a file under tmp_path with
-    # saving off, and not the default ./dump.mrdb: that is resolved against the directory
-    # pytest runs in, which is the repository, and main() constructs the server before it
-    # tries the bind, which creates and removes a temporary file beside the snapshot path
+    # every other startup refusal exits 1 with one line, where a bind failure alone unwound as a full
+    # traceback; the snapshot sits under tmp_path with saving off, not the repository's own dump.mrdb
     squatter = socket.socket()
     squatter.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     squatter.bind(("127.0.0.1", 0))
@@ -571,7 +553,8 @@ def test_main_exits_one_with_a_single_line_and_no_traceback_on_a_failed_bind(tmp
         squatter.close()
 
 
-# a real descriptor table that is really full, because socket() itself fails with EMFILE and nothing scripted stands in for that faithfully. the limit is lowered in the child and not in the test, where it would take the rest of the suite's descriptors with it. exactly one descriptor is left free: Server's constructor takes it for the selector, which leaves none for the listener's socket() when run() reaches it, and nothing before that step needs one that stays open -- reading a snapshot that is not there and listing the directory beside it each take a descriptor and give it back
+# a really full descriptor table, because socket() itself fails with EMFILE and nothing scripted stands in
+# for it: the limit is lowered in the child, and the one free descriptor goes to the selector
 _NO_DESCRIPTOR_FOR_THE_LISTENER = """
 import errno, os, resource, sys
 sys.path.insert(0, %r)
@@ -592,7 +575,8 @@ server.main(sys.argv[1:])
 
 
 def test_main_exits_one_with_a_single_line_when_the_listener_cannot_be_constructed(tmp_path):
-    # the bind was the one step of startup answered with a line rather than a traceback, and the socket's construction, which fails with EMFILE on a table with no room, sat ahead of the try that answers it and left main() as a raw traceback -- the outcome ListenFailed exists to prevent, reached through the one step it did not cover. exit status 1 is the same either way, which is why it is the line and the absence of a traceback that are asserted. a subprocess with a deadline, as the test of the stop signal above uses, because the descriptor limit can only be lowered in a process of its own, and the snapshot is kept under tmp_path with saving off for the reason the bind test above gives
+    # the socket's construction fails with EMFILE on a full table and sat ahead of the try that answers a
+    # failed bind, so main() left a raw traceback: the line and the absent traceback are what is asserted
     probe = subprocess.run(
         [sys.executable, "-c", _NO_DESCRIPTOR_FOR_THE_LISTENER % str(REPO_ROOT),
          "--port", "0", "--snapshot-interval", "0", "--snapshot-path", str(tmp_path / "dump.mrdb")],
@@ -606,9 +590,8 @@ def test_main_exits_one_with_a_single_line_when_the_listener_cannot_be_construct
 
 
 def test_open_listener_raises_listen_failed_and_closes_the_socket_it_opened():
-    # the socket _open_listener() creates is closed on its own failure path rather than
-    # left for the caller: nothing else ever gets a reference to it, since the raise
-    # carries only the message and not the socket itself
+    # the socket _open_listener() creates is closed on its own failure path rather than left for the caller:
+    # nothing else ever gets a reference to it, since the raise carries only the message
     squatter = socket.socket()
     squatter.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     squatter.bind(("127.0.0.1", 0))
@@ -652,9 +635,8 @@ def _can_bind(address):
 
 
 def test_a_server_given_a_name_listens_on_the_address_it_resolves_to():
-    # the host reaches bind() as given, so a name works where an address does. "localhost"
-    # resolves to the loopback address the default is, which exposes nothing the default does
-    # not, and is not the string the default is spelt as
+    # the host reaches bind() as given, so a name works where an address does: localhost resolves to the
+    # loopback address the default is, exposes nothing more, and is not how the default is spelt
     server = Server(0, host="localhost")
     try:
         listener = server._open_listener()
@@ -669,11 +651,8 @@ def test_a_server_given_a_name_listens_on_the_address_it_resolves_to():
 
 
 def test_a_server_given_a_second_loopback_address_listens_there_and_nowhere_else():
-    # the strongest form of "the host is carried": an address that is not the default's, bound
-    # and connected to, with the default's refused at the same port. Linux gives every address in
-    # 127.0.0.0/8 to the loopback interface, so a second one is available and exposes nothing
-    # beyond this machine. macOS gives lo0 only 127.0.0.1, and there the neighbouring tests are
-    # what show the host being carried
+    # the strongest form of the host being carried: an address that is not the default's, bound and connected
+    # to, with the default's refused at the same port. macOS gives lo0 only 127.0.0.1, hence the skip
     if not _can_bind("127.0.0.2"):
         pytest.skip("this machine's loopback interface holds only 127.0.0.1")
     server = Server(0, host="127.0.0.2")
@@ -692,11 +671,8 @@ def test_a_server_given_a_second_loopback_address_listens_there_and_nowhere_else
 
 
 def test_a_server_binds_the_host_it_was_given_and_names_it_when_that_fails():
-    # an address no interface here holds cannot be bound, so a bind that reached the default
-    # instead would succeed and this would not raise; and the line that reports the failure
-    # names the address that failed. the one address in the range reserved for documentation
-    # (RFC 5737) is used because nothing is ever assigned it, and a machine that binds
-    # addresses it does not hold -- ip_nonlocal_bind on Linux -- has nothing to refuse it
+    # an address no interface holds cannot be bound, so a bind that reached the default would succeed and
+    # raise nothing; 192.0.2.1 is reserved for documentation (RFC 5737), so nothing is ever assigned it
     unowned = "192.0.2.1"
     if _can_bind(unowned):
         pytest.skip("this machine binds addresses it does not hold")
@@ -712,10 +688,8 @@ def test_a_server_binds_the_host_it_was_given_and_names_it_when_that_fails():
 
 def test_main_names_the_host_it_was_given_on_the_line_a_failed_bind_exits_with(
         monkeypatch, tmp_path):
-    # the failed-bind test above reads the line for the default host, which is the one value a
-    # host that main() never passed along would also produce. "localhost" is held at 127.0.0.1
-    # by a socket of the test's own, so the bind fails whichever of the two names it is given,
-    # and the only thing that can put "localhost" on the line is the host reaching the Server
+    # the failed-bind test above reads the line for the default host, which a host main() never passed along
+    # would also produce: only the host reaching the Server can put localhost on that line
     monkeypatch.setattr(logging, "basicConfig", lambda **kwargs: None)
     squatter = socket.socket()
     squatter.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
@@ -756,7 +730,8 @@ def test_a_close_that_raises_still_leaves_the_set_clean():
                 server._close(conn)
             assert conn not in server._connections
         finally:
-            # explode() stands in for Connection.close() and never reaches the socket, so the socket the accept took is closed here
+            # explode() stands in for Connection.close() and never reaches the socket, so the socket
+            # the accept took is closed here
             conn._sock.close()
         client.close()
 
@@ -807,9 +782,8 @@ def test_the_boundary_closes_one_connection_and_leaves_the_others(caplog):
     finally:
         registry.COMMANDS[b"ECHO"] = original
 
-    # the boundary logs at ERROR with the traceback. caplog rather than stderr: pytest attaches its
-    # own handler to the root logger, and the stderr handler main() configures for the real server
-    # is not the one that receives the record under the suite
+    # the boundary logs at ERROR with the traceback. caplog rather than stderr: pytest attaches its own
+    # handler to the root logger, so main()'s stderr handler is not the one that receives the record
     boundary = [r for r in caplog.records if r.levelname == "ERROR" and r.exc_info]
     assert boundary, caplog.records
     assert boundary[0].exc_info[0] is ZeroDivisionError, boundary[0].exc_info
@@ -896,10 +870,8 @@ def test_connection_ids_are_unique_across_descriptor_reuse():
 
 
 def test_a_connection_closed_by_the_read_pass_is_not_reached_by_the_write_pass():
-    # one select() return can carry read and write readiness for the same descriptor. this pins the
-    # outcome, not the mechanism: deleting event_loop's two `not conn.closed` guards does NOT fail
-    # this, because _flush and receive() each refuse a closed connection on their own. the loop's
-    # guards are a second line of defence, and that is worth knowing before anyone removes one
+    # one select() return can carry read and write readiness for one descriptor. this pins the outcome and
+    # not the mechanism: deleting event_loop's two `not conn.closed` guards does NOT fail it
     with listening() as (server, connect, _listener):
         client = connect()
         pump(server)
@@ -918,9 +890,8 @@ def test_a_connection_closed_by_the_read_pass_is_not_reached_by_the_write_pass()
 
 
 def test_a_recovery_that_also_fails_costs_one_connection_not_the_process():
-    # _guard's whole purpose is that one connection's failure is not every connection's. its own
-    # recovery calls _close, whose three statements can each raise, and a raise there reaches the
-    # top of the only thread this server has
+    # _guard exists so that one connection's failure is not every connection's, and its own recovery calls
+    # _close, whose three statements can each raise into the top of the only thread this server has
     server = Server(0)
     sock, peer = socket.socketpair()
     sock.setblocking(False)
@@ -947,9 +918,8 @@ def test_a_recovery_that_also_fails_costs_one_connection_not_the_process():
 
 
 def test_a_shutdown_close_raising_outside_the_selector_tuple_still_closes_every_socket():
-    # the sweep's nesting protects the port and the selector; nothing protected the descriptors,
-    # and a type outside the old (KeyError, ValueError, OSError) abandoned every connection after
-    # the first in iteration order
+    # the sweep's nesting protects the port and the selector but not the descriptors: a type outside the old
+    # (KeyError, ValueError, OSError) abandoned every connection after the first in iteration order
     server = Server(0)
     pairs = [socket.socketpair() for _ in range(4)]
     conns = []
@@ -977,9 +947,8 @@ def test_a_shutdown_close_raising_outside_the_selector_tuple_still_closes_every_
 
 
 def test_every_signal_handler_is_restored_even_if_an_earlier_restore_raises():
-    # a flat restore loop ends at the first raise, leaving every handler after it bound to a
-    # Server that is being discarded -- which is the leak the restore exists to prevent. the
-    # property is order-independent: whichever restore raises, the other is still attempted
+    # a flat restore loop ends at the first raise, leaving every handler after it bound to a Server being
+    # discarded -- the leak the restore exists to prevent -- and the property is order-independent
     def mark_int(_signum, _frame):
         pass
 
@@ -1045,10 +1014,8 @@ def test_a_descriptor_that_will_not_close_is_logged_rather_than_raised(caplog):
 
 
 def test_a_successful_bind_announces_the_address_it_actually_bound():
-    # a foreground server that says nothing on success cannot be told apart from one that died,
-    # and the documented way to check this one is alive -- a round trip on the default port --
-    # answers just as happily from another Redis that already owns it. --port 0 is the sharper
-    # case: only the kernel knows the port, so the process is the only thing that can report it
+    # a foreground server that says nothing on success cannot be told from one that died, and a round trip on
+    # the default port answers from another Redis too. at --port 0 only the process can report the port
     probe = subprocess.run(
         [sys.executable, "-c", _ANNOUNCE_ON_BIND % str(REPO_ROOT)],
         capture_output=True, text=True, timeout=15,
@@ -1066,11 +1033,8 @@ def test_a_successful_bind_announces_the_address_it_actually_bound():
 
 
 def test_the_effect_queue_is_drained_once_per_dispatched_command():
-    # a batch delivered in one readable event is what a per-batch drain and a per-command
-    # drain cannot be told apart on -- either placement empties the queue exactly once for
-    # that event. dispatch() is wrapped as well as take_effects(), the two counts are
-    # compared after every run_once(), and the run must contain at least one event that
-    # carried more than one command, or it could not have told the two placements apart
+    # a batch delivered in one readable event is what a per-batch and a per-command drain cannot be told
+    # apart on, so dispatch() is counted too and the run must carry an event with more than one command
     drains, dispatches, per_event = [], [], []
     original_take = store_module.Store.take_effects
     original_dispatch = commands.dispatch
@@ -1125,10 +1089,8 @@ def test_one_readable_event_dispatches_every_buffered_command():
 
 
 def test_one_batch_cannot_queue_past_the_write_buffer_limit(server_and_client):
-    # the limit is consulted inside the dispatch loop as well as after the batch, because
-    # one recv() can carry thousands of commands: checked only after the batch, a client
-    # that stops reading gets the whole batch queued first, and a 4 MiB limit was measured
-    # letting 104 MiB accumulate before it noticed
+    # the limit is consulted inside the dispatch loop as well as after the batch, because one recv() can
+    # carry thousands: checked only after it, a 4 MiB limit was measured letting 104 MiB accumulate
     server, client = server_and_client
     server.write_buffer_limit = 64 * 1024
     conn, = server._connections
@@ -1149,12 +1111,8 @@ def test_one_batch_cannot_queue_past_the_write_buffer_limit(server_and_client):
 
 
 def test_a_pipeline_whose_replies_keep_draining_is_never_closed_by_the_limit(server_and_client):
-    # the in-loop check flushes before it judges, so depth alone never trips the limit --
-    # two thousand replies the kernel keeps taking pass under a limit that four of them
-    # would exceed if they piled up. what this does NOT say is that a reading client is
-    # safe: this is a hard limit, and a client reading slower than the server produces is
-    # closed like any other, which redis-server 7.2.7 does too under an equivalent
-    # client-output-buffer-limit.
+    # the in-loop check flushes before it judges, so depth alone never trips the limit -- two thousand
+    # replies the kernel keeps taking pass under a limit that four of them would exceed if they piled up
     server, client = server_and_client
     server.write_buffer_limit = 4096
     conn, = server._connections
@@ -1181,13 +1139,8 @@ def test_a_pipeline_whose_replies_keep_draining_is_never_closed_by_the_limit(ser
 
 @pytest.mark.parametrize("retryable", [BlockingIOError, InterruptedError])
 def test_a_retryable_error_leaves_the_connection_open_rather_than_closing_it(caplog, retryable):
-    # _guard names these two before the general clause and returns instead of closing.
-    # No path in the shipped server reaches it -- receive() and flush() each absorb
-    # BlockingIOError below this point, and PEP 475 retries EINTR inside the interpreter
-    # -- so nothing here exercised the distinction, and collapsing the two clauses into
-    # one passed the whole suite. What the distinction says is that the boundary sorts
-    # "try again" from "this connection is finished", and a boundary that cannot tell
-    # them apart turns a momentary condition into a dropped client
+    # _guard names these two ahead of the general clause and returns instead of closing, and no shipped path
+    # reaches it, so collapsing the two clauses passed the whole suite: try again is not finished
     original = _raising_command(b"PING", retryable())
     try:
         with listening() as (server, connect, _listener):
@@ -1207,20 +1160,15 @@ def test_a_retryable_error_leaves_the_connection_open_rather_than_closing_it(cap
 
 @pytest.mark.parametrize("port", [-1, 65536, 99999])
 def test_the_constructor_refuses_a_port_outside_the_range_like_the_parser_does(port):
-    # the parser validates it; the constructor is the other door, and Server is built
-    # directly by tests and by anything embedding this. left unchecked, the value reaches
-    # bind() and answers with an OverflowError traceback -- the exact failure the parser's
-    # validator exists to prevent, reachable by walking around it
+    # the parser validates it; the constructor is the other door, since Server is built directly by tests and
+    # by anything embedding this. unchecked, the value reaches bind() as an OverflowError traceback
     with pytest.raises(ValueError):
         Server(port)
 
 
 def test_abandon_releases_the_selector_registration_as_well_as_the_socket():
-    # _close deregisters before it closes the socket; reaching _abandon's recovery means
-    # it raised before getting there, so the registration is still in the selector keyed
-    # by a descriptor about to be freed. the kernel hands that number to the next accept,
-    # registering it raises "already registered", and _on_accept turns that into a
-    # refused connection for an entirely unrelated, well-behaved client
+    # reaching _abandon's recovery means _close raised before deregistering, so the registration is still
+    # keyed by a descriptor about to be freed and the next accept's register raises already registered
     server = Server(0)
     sock, peer = socket.socketpair()
     sock.setblocking(False)
@@ -1248,9 +1196,8 @@ def test_abandon_releases_the_selector_registration_as_well_as_the_socket():
 
 
 def test_abandon_clears_the_server_slot_when_close_fails_before_reaching_it():
-    # _close clears conn.server only after self._loop.unregister(conn) succeeds.
-    # reaching _abandon's recovery means unregister raised first, so without this the
-    # slot is left pointing at a Server that no longer tracks this connection
+    # _close clears conn.server only after unregister succeeds, and reaching _abandon's recovery means it
+    # raised first, so without this the slot points at a Server that no longer tracks this connection
     server = Server(0)
     sock, peer = socket.socketpair()
     sock.setblocking(False)
@@ -1258,9 +1205,8 @@ def test_abandon_clears_the_server_slot_when_close_fails_before_reaching_it():
         conn = Connection(sock, ("stub", 0))
         server._loop.register(conn)
         server._connections.add(conn)
-        # set explicitly, the way _on_accept fills it on a real accept: a bare
-        # Connection built directly for this test carries None here otherwise, which
-        # would make the assertion below pass whether or not the fix is present
+        # set explicitly, the way _on_accept fills it on a real accept: a bare Connection carries None here
+        # otherwise, which would make the assertion below pass whether or not the fix is present
         conn.server = server
 
         def unregister_raising(_conn):
@@ -1280,10 +1226,8 @@ def test_abandon_clears_the_server_slot_when_close_fails_before_reaching_it():
 
 
 def test_a_half_sent_command_holds_its_parsed_elements_and_waits(server_and_client):
-    # two of a three-element command have arrived; both are already out of read_buffer
-    # and into _argv, which is what lets the third be recognised the moment it lands
-    # instead of the header being relocated first. the resume hints are both zero
-    # because the last parse that ran was a clean one, not a partial one
+    # two of a three-element command have arrived and both are already out of read_buffer and into _argv,
+    # which is what lets the third be recognised on arrival instead of the header being relocated first
     server, client = server_and_client
     conn = next(iter(server._connections))
     client.sendall(b"*3\r\n$3\r\nSET\r\n$1\r\nk\r\n")
@@ -1298,12 +1242,8 @@ def test_a_half_sent_command_holds_its_parsed_elements_and_waits(server_and_clie
 def test_an_abrupt_disconnect_mid_command_deregisters_untracks_and_clears_the_server_slot(
     server_and_client,
 ):
-    # SO_LINGER(1, 0) makes close() send an RST instead of an orderly FIN, the same
-    # abrupt hangup a crashed client leaves behind. fileno() is -1 once the socket is
-    # closed, so get_key(conn) can no longer find the registration by descriptor and
-    # raises ValueError rather than the KeyError a lookup-shaped assertion would expect
-    # -- deregistration is checked here as a scan of the selector's own map instead,
-    # which does not care what the descriptor used to be
+    # SO_LINGER(1, 0) makes close() send an RST instead of a FIN, the hangup a crashed client leaves behind.
+    # fileno() is -1 by then, so deregistration is checked by scanning the selector's map, not get_key
     server, client = server_and_client
     conn = next(iter(server._connections))
     client.sendall(b"*3\r\n$3\r\nSET\r\n$1\r\nk\r\n")
@@ -1324,12 +1264,8 @@ def test_an_abrupt_disconnect_mid_command_deregisters_untracks_and_clears_the_se
 
 
 def test_an_idle_partial_element_resumes_when_the_rest_arrives(server_and_client):
-    # the header is found but the element is 9 bytes short of complete -- 10 declared,
-    # 3 delivered, plus the trailing CRLF neither reached yet -- so _parse_needed holds
-    # 17, the element's whole length rather than what is missing from it, instead of the
-    # header being rescanned on every later readable event while the client sits idle.
-    # the rest arriving completes SET k abcdefghij, and the reply is what proves the
-    # idle state resumed rather than being discarded
+    # the element is 9 bytes short -- 10 declared, 3 delivered, and the CRLF -- so _parse_needed holds 17,
+    # the element's whole length, instead of the header being rescanned on every later readable event
     server, client = server_and_client
     conn = next(iter(server._connections))
     client.sendall(b"*3\r\n$3\r\nSET\r\n$1\r\nk\r\n$10\r\nabc")
@@ -1349,9 +1285,8 @@ def test_an_idle_partial_element_resumes_when_the_rest_arrives(server_and_client
 
 
 def test_launch_server_retries_a_port_another_process_already_holds(tmp_path, monkeypatch):
-    # free_port() only proves a port was free when it was chosen -- this squats on the
-    # number it hands out first, standing in for the race launch_server()'s own retry
-    # loop exists to survive
+    # free_port() only proves a port was free when it was chosen: this squats on the number it hands out,
+    # standing in for the race launch_server()'s own retry loop exists to survive
     squatter = socket.socket()
     squatter.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     squatter.bind(("127.0.0.1", 0))
@@ -1382,9 +1317,8 @@ def test_launch_server_retries_a_port_another_process_already_holds(tmp_path, mo
 def test_launch_server_gives_up_rather_than_returning_someone_elses_server(
     tmp_path, monkeypatch
 ):
-    # free_port() handing out only a port this process itself squats on stands in for
-    # every attempt losing the same race: launch_server() must raise rather than answer
-    # with a proc and a port it never actually bound
+    # free_port() handing out only a port this process squats on stands in for every attempt losing the
+    # same race: launch_server() must raise rather than answer with a port it never bound
     squatter = socket.socket()
     squatter.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     squatter.bind(("127.0.0.1", 0))
@@ -1425,20 +1359,15 @@ def _fake_server_root(tmp_path, body, listen=False):
 def test_launch_server_gives_up_on_a_server_that_prints_half_a_line_and_stalls(
     tmp_path, monkeypatch
 ):
-    # select() bounds the wait for readiness, not the read that follows it. A readline()
-    # entered on one available byte has no deadline of its own, so a line that never
-    # finishes held launch_server past every bound it advertises -- and the retry loop
-    # above it never got control back either
+    # select() bounds the wait for readiness, not the read after it: a readline() entered on one available
+    # byte has no deadline, so a line that never finishes held launch_server past every advertised bound
     root = _fake_server_root(tmp_path, "sys.stdout.write('listening on 127.0.0.1:')\n"
                                        "sys.stdout.flush()\n"
                                        "time.sleep(60)\n")
     monkeypatch.setattr(conftest, "REPO_ROOT", root)
 
-    # the call runs in a thread and the bound is the join, not a clock read afterwards.
-    # Timing it from outside only works if it returns at all: with the read unbounded it
-    # comes back when this fake's own sleep ends and closes the pipe, sixty seconds later,
-    # so the measurement was really of the fake's patience. A server that never exits --
-    # which is what a real one does -- would hang here with nothing to fail
+    # the call runs in a thread and the bound is the join: with the read unbounded it returns only when this
+    # fake's own sleep ends sixty seconds later, so the measurement was of the fake's patience
     outcome = []
 
     def call():
@@ -1459,11 +1388,8 @@ def test_launch_server_gives_up_on_a_server_that_prints_half_a_line_and_stalls(
 
 
 def test_launch_server_refuses_a_port_that_nothing_is_serving(tmp_path, monkeypatch):
-    # the bind line says the port belongs to this process; it does not say anything is
-    # listening on it. A caller handed a port nobody serves meets a refused connect
-    # somewhere deep inside its own body, with nothing saying the launch was what failed.
-    # No check can promise a server stays up, so what is pinned here is the pair that is
-    # knowable at the moment the port is handed back: this process's port, and serving
+    # the bind line says the port belongs to this process, not that anything is listening on it: what is
+    # pinned is the pair knowable when the port is handed back -- this process's port, and serving
     root = _fake_server_root(tmp_path, "print('listening on 127.0.0.1:' + port, flush=True)\n"
                                        "time.sleep(60)\n")
     monkeypatch.setattr(conftest, "REPO_ROOT", root)
@@ -1498,10 +1424,8 @@ def test_launch_server_rejects_a_bind_line_naming_a_different_port(tmp_path, mon
 def test_launch_server_sees_a_bind_line_that_shares_one_write_with_another(
     tmp_path, monkeypatch
 ):
-    # the other multi-line test sleeps between its two prints, so they arrive in separate
-    # reads and one line per pass is enough. Written in a single flushed call they land in
-    # one chunk, and a pass that inspects only the first line in a chunk drops the one
-    # that matters
+    # the other multi-line test sleeps between its prints, so one line per pass is enough; written in a
+    # single flushed call they land in one chunk, and a pass reading only the first line drops the other
     root = _fake_server_root(
         tmp_path,
         "sys.stdout.write('starting up\\nlistening on 127.0.0.1:' + port + '\\n')\n"
@@ -1518,9 +1442,8 @@ def test_launch_server_sees_a_bind_line_that_shares_one_write_with_another(
 def test_launch_server_notices_a_closed_pipe_rather_than_spinning_to_its_deadline(
     tmp_path, monkeypatch
 ):
-    # select() reports an EOF'd pipe as ready forever. Treating that as "nothing yet"
-    # costs the whole per-attempt deadline on every attempt, for an answer available at
-    # once -- no assertion catches it, only the clock
+    # select() reports an EOF'd pipe as ready forever, so treating that as nothing yet costs the whole
+    # per-attempt deadline for an answer available at once -- no assertion catches it, only the clock
     root = _fake_server_root(tmp_path, "raise SystemExit(1)\n")
     monkeypatch.setattr(conftest, "REPO_ROOT", root)
     started = time.monotonic()
@@ -1533,9 +1456,8 @@ def test_launch_server_notices_a_closed_pipe_rather_than_spinning_to_its_deadlin
 
 
 def test_main_lets_a_failure_inside_the_loop_out_as_itself(tmp_path, monkeypatch):
-    # the one-line answer is for a bind that failed, which is why it catches a named
-    # exception. Widened to Exception it would report a bug anywhere inside run() as a
-    # failure to start, and the traceback that says where it happened would be gone
+    # the one-line answer is for a bind that failed, so it catches a named exception: widened to Exception
+    # it would report a bug anywhere inside run() as a failure to start and lose the traceback
     def run_raising(self):
         raise RuntimeError("something inside the loop")
 

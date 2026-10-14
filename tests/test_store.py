@@ -127,12 +127,8 @@ def test_sample_and_expire_removes_only_the_expired_keys_and_queues_one_del_each
 
 
 def test_sample_and_expire_reads_the_clock_once_for_the_whole_draw_not_once_per_key(keyspace):
-    # now_ms() is read once and reused for every key in the sample, not re-read inside
-    # the per-key loop -- sample_and_expire's own comment promises this so a caller
-    # sweeping many keys does not spend its budget re-reading a clock that has not
-    # moved. a per-key read passes every other test in this module, since the extra
-    # reads land within the same millisecond as the shared one and expire exactly the
-    # same keys; only counting the calls tells the two apart
+    # now_ms() is read once and reused for every key in the draw, not re-read per key: a per-key read
+    # passes every other test here, since the extra reads land in the same millisecond
     for i in range(5):
         key = b"k%d" % i
         keyspace.write(key, b"v", keep_ttl=False)
@@ -173,11 +169,8 @@ def test_from_items_round_trips_both_kinds_and_their_deadlines(keyspace):
 
 
 def test_from_items_refuses_two_items_that_name_one_key():
-    # a snapshot_items() walk can never produce one, since it walks a keyspace whose keys
-    # are already unique, so this only arrives from bytes something else wrote. loading it
-    # would keep the second item's value and deadline and drop the first's with nothing
-    # said, which is the one shape of data loss a length-prefixed format cannot catch for
-    # itself. counted rather than watched per key, so what fails here is the count
+    # a snapshot_items() walk cannot produce one, so this only arrives from bytes something else wrote:
+    # loading it would keep the second item's value and drop the first's with nothing said
     items = [(b"k", KIND_STRING, b"first", 1_900_000_000_000),
              (b"k", KIND_STRING, b"second", -1)]
     with pytest.raises(ValueError, match="share one key"):
@@ -185,10 +178,8 @@ def test_from_items_refuses_two_items_that_name_one_key():
 
 
 def test_from_items_raises_duplicate_key_error_specifically_for_a_repeated_key():
-    # persistence._decode() catches this one by type, to tell a repeated key apart from
-    # the bare ValueError an unrecognised kind byte raises -- a caller that only matched
-    # on ValueError would report a corrupt kind byte as a repeated key, or the reverse,
-    # whichever from_items() happened to raise first
+    # persistence._decode() catches this by type, to tell a repeated key from the bare ValueError an
+    # unrecognised kind byte raises -- matching ValueError alone reports one as the other
     items = [(b"k", KIND_STRING, b"first", -1),
              (b"k", KIND_STRING, b"second", -1)]
     with pytest.raises(DuplicateKeyError):
@@ -281,10 +272,8 @@ def test_a_deadline_of_zero_is_dropped_rather_than_treated_as_absent(keyspace):
     assert keyspace._expiry == {}
     assert keyspace._expiry_keys == [] and keyspace._expiry_slots == {}
 
-    # 0 is a legal past deadline and falsy, so a truth test over the popped value
-    # would read it as absent rather than dropped -- driven through write()'s own
-    # pop site too, not only remove()'s, so a regression at either call site is
-    # caught rather than only the one this test happened to reach first
+    # 0 is a legal past deadline and falsy, so a truth test over the popped value reads it as absent
+    # rather than dropped -- driven through write()'s pop site as well as remove()'s
     keyspace.write(b"k2", b"v", keep_ttl=False)
     keyspace.expire_at(b"k2", 0)
     keyspace.write(b"k2", b"v2", keep_ttl=False)
@@ -301,9 +290,8 @@ def test_snapshot_items_includes_a_resident_expired_key_with_its_deadline(keyspa
 
 
 def test_snapshot_items_reports_a_deadline_of_zero_as_zero_not_as_no_deadline(keyspace):
-    # -1 is the "no deadline" marker and 0 is a legal deadline already past, and falsy: a
-    # `deadline or -1` reads it as absent, and the key comes back from a reload with no
-    # deadline at all -- live forever, where it went into the snapshot expired
+    # -1 is the "no deadline" marker and 0 a legal deadline already past, and falsy: a `deadline or -1`
+    # reads it as absent and the key reloads with no deadline at all, living for ever
     keyspace.write(b"k", b"v", keep_ttl=False)
     keyspace.expire_at(b"k", 0)
     assert list(keyspace.snapshot_items()) == [(b"k", KIND_STRING, b"v", 0)]
@@ -318,10 +306,8 @@ def test_sample_and_expire_on_a_keyspace_with_no_deadlines_reports_nothing(keysp
 
 
 def test_sample_and_expire_reclaims_a_key_whose_deadline_equals_now():
-    # the sweep's boundary has to be lookup()'s: a deadline equal to now has already
-    # passed. a sweep comparing with < leaves that key for a later pass while every read
-    # of the same instant already answers that it is gone. a frozen clock, because a
-    # live one can tick between expire_at() and the draw and let < pass for the wrong reason
+    # the sweep's boundary has to be lookup()'s: a deadline equal to now has passed, and a sweep
+    # comparing with < leaves the key. frozen, or a live clock can tick and let < pass wrongly
     frozen = FrozenStore()
     frozen.write(b"k", b"v", keep_ttl=False)
     frozen.expire_at(b"k", frozen.now_ms())
@@ -341,10 +327,8 @@ def test_sample_and_expire_never_draws_the_same_key_twice(keyspace):
     drawn = [effect[1] for effect in keyspace.take_effects()]
     assert len(drawn) == len(set(drawn)) == 20
 
-    # drawing all 20 keys the index holds: with replacement, 20 distinct results out of
-    # 20 draws has probability 20!/20**20 (~2.3e-8), so a regression to sampling with
-    # replacement fails this arm deterministically in practice, unlike the 200-key arm
-    # above
+    # drawing all 20 keys the index holds: with replacement, 20 distinct results out of 20 draws has
+    # probability 20!/20**20 (~2.3e-8), so sampling with replacement fails this arm in practice
     keyspace.flush()
     for i in range(20):
         key = b"e%d" % i
@@ -374,12 +358,8 @@ def _bytes_allocated_by(call):
 
 
 def test_a_sample_allocates_nothing_that_grows_with_the_expiry_index(keyspace):
-    # the sampling index exists so a draw costs the same at any size. drawing from a list
-    # rebuilt out of _expiry on every call is the obvious shape and passes every other
-    # test here -- the keys it picks are just as random -- while at a million keys it
-    # spends milliseconds building that list before looking at one. what a draw
-    # allocates is the witness rather than how long it takes, because an allocation does
-    # not change size on a loaded machine
+    # the sampling index exists so a draw costs the same at any size; a list rebuilt out of _expiry
+    # passes every other test here and spends milliseconds at a million keys, so allocation is the witness
     now = keyspace.now_ms()
     for i in range(100_000):
         key = b"k%d" % i
@@ -419,9 +399,8 @@ def test_expire_at_on_a_missing_key_raises_keyerror_naming_it(keyspace):
 
 
 def test_write_with_keep_ttl_omitted_raises_typeerror(keyspace):
-    # the only call site in this whole feature that exercises the missing keyword: every
-    # other caller passes keep_ttl explicitly, so a silently added default is reached by
-    # nothing else here
+    # the only call site here that exercises the missing keyword: every other caller passes keep_ttl
+    # explicitly, so a silently added default is reached by nothing else
     with pytest.raises(TypeError):
         keyspace.write(b"k", b"v")
 
@@ -467,17 +446,15 @@ def test_check_invariants_raises_on_an_injected_sampling_index_disagreement(keys
     keyspace.write(b"k", b"v", keep_ttl=False)
     keyspace.expire_at(b"k", keyspace.now_ms() + 3_600_000)
 
-    # size: appending a key to _expiry_keys alone, leaving _expiry and _expiry_slots
-    # untouched, throws the three counts out of step before the per-key loop below
-    # ever runs -- the only one of the three sites an appended key can reach
+    # size: appending to _expiry_keys alone throws the three counts out of step before the per-key loop
+    # runs -- the only one of the three sites an appended key can reach
     keyspace._expiry_keys.append(b"ghost_size")
     with pytest.raises(AssertionError, match="disagrees with _expiry on size"):
         keyspace.check_invariants()
     keyspace._expiry_keys.pop()
 
-    # no deadline: swapping the resident key for one _expiry has never heard of, in
-    # place rather than appended, leaves every count equal -- only the per-key loop's
-    # own membership check can still catch it
+    # no deadline: swapping the resident key in place for one _expiry never heard of leaves every count
+    # equal, so only the per-key loop's membership check can catch it
     slot = keyspace._expiry_slots.pop(b"k")
     keyspace._expiry_keys[slot] = b"ghost_deadline"
     keyspace._expiry_slots[b"ghost_deadline"] = slot

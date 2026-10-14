@@ -79,10 +79,8 @@ def test_a_list_command_dispatched_against_a_loaded_store_answers():
     store = Store()
     store.write(b"l", deque([b"a", b"", b"\xff"]), keep_ttl=False)
     loaded = persistence.decode(persistence.encode(store))
-    # a value that decoded back as a Python list rather than a deque raises TypeError
-    # out of kind_of(), which dispatch() does not catch -- so the connection closes
-    # instead of answering. dispatching a real command here checks that outcome
-    # directly, rather than only inspecting the loaded value's type
+    # a value decoded back as a list rather than a deque raises TypeError out of kind_of(), which
+    # dispatch() does not catch, so the connection closes instead of answering
     response, effects = commands.dispatch(loaded, None, [b"LRANGE", b"l", b"0", b"-1"])
     assert response == b"*3\r\n$1\r\na\r\n$0\r\n\r\n$1\r\n\xff\r\n"
     assert effects == []
@@ -116,21 +114,16 @@ def test_save_writes_through_a_temporary_file_and_renames_it(tmp_path, monkeypat
     store = Store()
     store.write(b"k", b"v", keep_ttl=False)
 
-    # one shared list rather than two separate ones, so the order fsync and rename
-    # actually ran in is read back from the list itself instead of assumed from the
-    # order the code below happens to call them in
+    # one shared list rather than two, so the order fsync and rename ran in is read back from the list
+    # instead of assumed from the order the code below calls them
     events = []
     synced = []
     renamed = []
     real_fsync, real_rename, real_fcntl = os.fsync, os.rename, fcntl.fcntl
 
     def recording_fsync(fd):
-        # the size on disk at the moment the sync is called, before real_fsync runs --
-        # bytes still sitting in handle's own userspace buffer have not reached the
-        # file this descriptor names yet, so a deleted flush() shows up here as a short
-        # size rather than only in a size read back after save() has already returned.
-        # directories are recorded separately below: the one that matters here is the
-        # sync of the snapshot's own bytes
+        # the size on disk at the moment of the sync, before real_fsync runs: bytes still in handle's own
+        # buffer have not reached the file, so a deleted flush() shows as a short size and not only later
         if stat.S_ISDIR(os.fstat(fd).st_mode):
             events.append(("sync-directory", None))
             return real_fsync(fd)
@@ -139,9 +132,8 @@ def test_save_writes_through_a_temporary_file_and_renames_it(tmp_path, monkeypat
         return real_fsync(fd)
 
     def recording_full_sync(fd, command, *rest):
-        # where the platform has it, the file's own sync is a device-level flush rather
-        # than os.fsync, so both have to be watched or this test reads as "never synced"
-        # on one platform and passes on the other
+        # where the platform has it the file's own sync is a device-level flush and not os.fsync, so both have
+        # to be watched or this reads as never synced on one platform and passes on the other
         if command == getattr(fcntl, "F_FULLFSYNC", object()):
             return recording_fsync(fd)
         return real_fcntl(fd, command, *rest)
@@ -186,10 +178,8 @@ def test_save_writes_through_a_temporary_file_and_renames_it(tmp_path, monkeypat
 
 
 def test_the_file_sync_falls_back_when_the_device_flush_is_not_supported(tmp_path, monkeypatch):
-    # F_FULLFSYNC exists on the platform but the filesystem under this path refuses it,
-    # which some do -- a network mount, a disk image. the save has to fall back to the
-    # sync every platform has rather than fail, and the file still has to be synced:
-    # treating "not supported" as a failed save would lose every snapshot on those mounts
+    # F_FULLFSYNC exists but the filesystem refuses it, which a network mount or a disk image does: the
+    # save must fall back and still sync, since treating not-supported as failure loses every snapshot
     if not hasattr(fcntl, "F_FULLFSYNC"):
         pytest.skip("this platform has no device-level flush to fall back from")
     plain_syncs = []
@@ -213,9 +203,8 @@ def test_the_file_sync_falls_back_when_the_device_flush_is_not_supported(tmp_pat
 
 
 def test_a_device_flush_that_fails_for_any_other_reason_fails_the_save(tmp_path, monkeypatch):
-    # only "not supported" is tolerated: an I/O error from the flush is the drive saying
-    # the bytes are not on it, which is the one thing this call exists to find out, and a
-    # save that swallowed it would report success over a snapshot that may not be there
+    # only not-supported is tolerated: an I/O error is the drive saying the bytes are not on it, which
+    # is the one thing this call exists to find out, and swallowing it reports a save that may not be there
     if not hasattr(fcntl, "F_FULLFSYNC"):
         pytest.skip("this platform has no device-level flush to fail")
 
@@ -234,10 +223,8 @@ def test_a_device_flush_that_fails_for_any_other_reason_fails_the_save(tmp_path,
 def test_a_directory_that_cannot_be_synced_does_not_fail_a_save_already_on_disk(
     tmp_path, monkeypatch
 ):
-    # the directory sync runs after the rename, so by the time it can fail the snapshot
-    # is already in place and the old one is already gone. a filesystem that does not
-    # sync directories at all answers this way, and reporting it as a failed save would
-    # log an error every interval about a save that worked
+    # the directory sync runs after the rename, so by then the snapshot is in place and the old one gone:
+    # a filesystem that never syncs directories would otherwise log an error every interval over a good save
     real_fsync, real_fcntl = os.fsync, fcntl.fcntl
 
     def refuse_for_directories(fd, *rest):
@@ -260,20 +247,16 @@ def test_a_directory_that_cannot_be_synced_does_not_fail_a_save_already_on_disk(
 def test_an_unsupported_version_is_refused():
     blob = bytearray(persistence.encode(Store()))
     blob[4:8] = struct.pack("<I", persistence.SNAPSHOT_VERSION + 1)
-    # recomputed to match the flipped version -- left as it was, the checksum check
-    # ahead of the version check in decode order would refuse this blob first, for a
-    # mismatch rather than for its version
+    # recomputed to match the flipped version: left as it was, the checksum check ahead of the version
+    # check would refuse this blob for a mismatch rather than for its version
     blob[-4:] = struct.pack("<I", zlib.crc32(bytes(blob[:-4])))
     with pytest.raises(persistence.SnapshotError):
         persistence.decode(bytes(blob))
 
 
 def test_a_blob_shorter_than_the_header_is_refused():
-    # matched on the message and not only on the type: without the length floor this
-    # twelve-byte blob is still refused, for a checksum that happens not to match, and
-    # the length check that must run first goes missing in silence -- match= is what
-    # actually proves it ran, rather than some other check refusing this blob for the
-    # wrong reason and the test passing anyway
+    # matched on the message and not only the type: without the length floor this twelve-byte blob is
+    # still refused for a checksum that happens not to match, and the length check goes missing in silence
     with pytest.raises(persistence.SnapshotError, match="too short"):
         persistence.decode(b"MRDB" + b"\x00" * 8)
 
@@ -285,12 +268,8 @@ def test_a_wrong_magic_is_refused():
 
 
 def test_entries_that_end_before_the_trailer_are_refused():
-    # a blob whose checksum is correct and whose declared count stops short of the bytes
-    # that follow it. unreachable from this encoder -- any appended byte moves the CRC --
-    # and reachable exactly where this module's docstring says the decoder is aimed:
-    # a peer that chooses both the count and the bytes behind it. ignored rather than
-    # refused, a follower silently drops every entry past the count and diverges from
-    # its leader on a key neither end will mention again
+    # a correct checksum whose declared count stops short of the bytes behind it: unreachable from this
+    # encoder, and ignored rather than refused a follower drops every entry past the count and diverges
     store = Store()
     store.write(b"a", b"v", keep_ttl=False)
     store.write(b"b", b"w", keep_ttl=False)
@@ -305,17 +284,8 @@ def test_entries_that_end_before_the_trailer_are_refused():
         persistence.decode(spliced)
 
 
-# a snapshot of one string with no deadline, one string with a real absolute deadline and
-# binary bytes in its value, and a three-element list holding an empty element and a bare CRLF,
-# written out as the bytes this format version is. the type-byte test below pins two of the
-# format's eleven fields against literals and gives the reason -- encode and decode are
-# symmetric, so a change to both is invisible in process -- and this pins the other nine: every
-# length prefix's width and byte order, the field order inside an entry, the expiry's signedness
-# and endianness, the list's element count and per-element framing, the header, and the trailer's
-# position and algorithm. measured against the tree that produced it: flipping the expiry from
-# "<q" to ">q" on both sides of persistence.py passes all 1,179 other tests and decodes a 2096
-# deadline of 4,000,000,000,000 as 18,177,481,152,593,920, CRC verified and SNAPSHOT_VERSION
-# still reading 1, so every snapshot ever written is misread with nothing to say so
+# the bytes this format version is: flipping the expiry from "<q" to ">q" on both sides passes 1,179 other
+# tests and decodes a 4,000,000,000,000 deadline as 18,177,481,152,593,920, CRC verified and version still 1
 _FORMAT_VERSION_1_BYTES = (
     b"MRDB\x01\x00\x00\x00\x03\x00\x00\x00\x01\x00\x00\x00s\x00"
     b"\xff\xff\xff\xff\xff\xff\xff\xff\x01\x00\x00\x00v\x01\x00"
@@ -359,10 +329,8 @@ def test_decode_reads_the_bytes_this_format_version_is():
 
 
 def test_the_two_type_bytes_are_the_literal_values_this_format_version_fixes():
-    # against literals, never against the constants' own names: encode and decode are
-    # symmetric, so swapping the two round-trips perfectly in process and is invisible to
-    # every other assertion in this module -- while every snapshot an earlier build wrote,
-    # and every peer that speaks these bytes, still reads 0 as a string and 1 as a list
+    # against literals, never the constants' names: encode and decode are symmetric, so swapping the two
+    # round-trips in process while every snapshot already written still reads 0 as a string and 1 as a list
     assert (persistence.TYPE_STRING, persistence.TYPE_LIST) == (0, 1), (
         "the on-wire type codes moved without SNAPSHOT_VERSION moving with them",
         persistence.TYPE_STRING, persistence.TYPE_LIST)
@@ -420,14 +388,8 @@ def test_no_refusal_anywhere_leaks_a_struct_error():
 
 
 def test_a_checksummed_blob_that_runs_past_its_own_end_is_refused_through_each_bounds_error():
-    # the checksum is compared first, so no truncation and no flipped bit ever reaches the
-    # parser's bounds errors -- only a blob whose trailer agrees with a layout that runs off
-    # the end does, which is what a peer choosing both the bytes and their checksum can
-    # send. one blob per exception the decoder has to translate: a key whose length
-    # swallows the trailer, so the type byte is read past the end, and a count one larger
-    # than the entries present, so the next key length is read past the end. the cause is
-    # asserted as well as the type, or either blob could be refused by some other check
-    # and prove nothing about the arm it is here for
+    # the checksum is compared first, so only a blob whose trailer agrees with a layout running off the end
+    # reaches the bounds errors: one blob per exception, with the cause asserted and not only the type
     def checksummed(body):
         return body + struct.pack("<I", zlib.crc32(body))
 
@@ -475,15 +437,12 @@ def test_a_list_with_no_elements_is_refused_as_snapshot_error():
         "the control blob does not hold the one element the byte surgery below targets"
     )
 
-    # magic, version and key count are four bytes each, then a four-byte key length and
-    # the key itself, one type byte and an eight-byte expiry, and the list's own element
-    # count is next
+    # magic, version and key count are four bytes each, then a four-byte key length and the key, one type
+    # byte and an eight-byte expiry, and the list's own element count is next
     count_at = 4 + 4 + 4 + 4 + len(b"l") + 1 + 8
     body = bytearray(blob[:-4])
-    # the element's own length prefix and bytes sit right after the count -- stripped
-    # out along with it so a decoder with no check for this reads the shortened body as
-    # a complete, trailing-byte-free zero-element list rather than stumbling onto the
-    # refusal by accident
+    # the element's length prefix and bytes sit right after the count, stripped out with it so a decoder
+    # with no check reads a complete zero-element list rather than stumbling onto the refusal by accident
     element_at = count_at + 4
     element_end = element_at + 4 + len(b"a")
     del body[element_at:element_end]
@@ -554,9 +513,8 @@ def test_a_save_after_the_injection_is_undone_replaces_the_file(tmp_path):
     real_rename = os.rename
     calls = {"n": 0}
 
-    # assigned and restored by hand so the point the real os.rename comes back is
-    # explicit in the test body -- after the failing save and before the save that
-    # must succeed, which is the ordering this test exists to check
+    # assigned and restored by hand so the point the real os.rename comes back is explicit: after the
+    # failing save and before the save that must succeed, which is the ordering under test
     os.rename = _make_rename_failing_once(real_rename, calls)
     try:
         with pytest.raises(OSError):
@@ -571,9 +529,8 @@ def test_a_save_after_the_injection_is_undone_replaces_the_file(tmp_path):
 
 
 def test_an_interrupt_mid_save_leaves_no_temporary_file(tmp_path, monkeypatch):
-    # a KeyboardInterrupt is a BaseException and no Exception, so a cleanup that caught
-    # only Exception let it unwind past the removal and strand a file the size of the
-    # snapshot beside it
+    # a KeyboardInterrupt is a BaseException and no Exception, so a cleanup catching only Exception let it
+    # unwind past the removal and strand a file the size of the snapshot
     def interrupted(*args, **kwargs):
         raise KeyboardInterrupt
 
@@ -608,11 +565,8 @@ def test_a_save_names_its_temporary_file_after_the_snapshot_and_only_that_name_i
     # stranded one too
     assert temporary.startswith("dump.mrdb.") and temporary.endswith(".mrdb"), temporary
 
-    # the very name a real save used, left behind the way a kill leaves it, is what
-    # stale_temporaries() finds -- so if tempfile's own naming ever moves, this is where the
-    # two stop agreeing. beside it, names no save to this path makes -- a random part one
-    # character short and one character long among them -- and a directory and a link
-    # with the right name, none of which it may report
+    # the very name a real save used, left the way a kill leaves it, is what stale_temporaries() finds --
+    # beside names no save makes, a random part one character short and one long, a directory and a link
     stranded = tmp_path / temporary
     stranded.write_bytes(b"left by a killed save")
     near_misses = [
@@ -651,10 +605,8 @@ def test_load_on_an_unreadable_path_raises_snapshot_error(tmp_path):
 
 
 def test_load_refuses_a_named_pipe_by_type_without_ever_blocking_on_open(tmp_path):
-    # a fifo's open() blocks until a writer shows up -- with no writer coming, the old
-    # load() would hang here forever. the bound below is insurance in case a future
-    # change reopens that hang: it kills the process rather than letting the suite hang
-    # with it, since timeout(1) is not available here
+    # a fifo's open() blocks until a writer shows up, and the old load() hung here forever. the bound below
+    # kills the process rather than letting the suite hang with it, since timeout(1) is not available here
     fifo_path = tmp_path / "dump.mrdb"
     os.mkfifo(fifo_path)
     faulthandler.dump_traceback_later(5, exit=True)
@@ -703,10 +655,8 @@ def test_check_writable_refuses_every_path_the_first_save_could_not_complete(
         with pytest.raises(persistence.SnapshotError, match=reason):
             persistence.check_writable(path)
 
-    # the control: a writable directory, a bare filename -- whose directory is the
-    # current one, spelled "" by os.path.dirname, confirmed here from inside tmp_path
-    # rather than wherever the suite happens to run from -- and a snapshot already
-    # there are all accepted, and the check itself leaves nothing behind
+    # the control: a writable directory, a bare filename -- whose directory is "" to os.path.dirname,
+    # confirmed from inside tmp_path -- and an existing snapshot are accepted, leaving nothing behind
     before = sorted(p.name for p in tmp_path.iterdir())
     persistence.check_writable(str(tmp_path / "dump.mrdb"))
     monkeypatch.chdir(tmp_path)
@@ -720,11 +670,8 @@ def test_check_writable_refuses_every_path_the_first_save_could_not_complete(
 
 
 def test_check_writable_needs_both_write_and_search_permission_on_the_directory(tmp_path):
-    # 0600 is writable but not searchable, 0555 is searchable but not writable -- a
-    # directory tried at only 0500 (searchable, not writable) or only 0466-style modes
-    # cannot tell the two permissions apart, since either alone already refuses. both
-    # are needed for os.rename() to land the temporary file at path, and check_writable()
-    # now finds that out by attempting exactly what save() attempts
+    # 0600 is writable but not searchable and 0555 is searchable but not writable: either alone already
+    # refuses, and os.rename() needs both, which the check finds out by attempting what a save attempts
     writable_not_searchable = tmp_path / "writable-not-searchable"
     writable_not_searchable.mkdir()
     writable_not_searchable.chmod(0o600)
@@ -788,12 +735,8 @@ def test_check_writable_refuses_a_basename_whose_temporary_name_the_filesystem_w
 
 
 def test_check_writable_accepts_the_longest_accented_basename_this_filesystem_takes(tmp_path):
-    # the limit belongs to the filesystem, and the two the suite runs on disagree about
-    # what it counts: one counts characters, where two hundred accented ones fit, and one
-    # counts utf-8 bytes, where the same name is twice too long. so the name is found by
-    # asking -- the longest one whose temporary file this filesystem actually creates --
-    # and the check is then required to accept exactly that, which is what a byte count
-    # against PC_NAME_MAX got wrong wherever the two differ
+    # the filesystems the suite runs on disagree: one counts characters, where two hundred accented ones
+    # fit, and one counts utf-8 bytes, so the name is asked for rather than derived from PC_NAME_MAX
     accepted = None
     # upward to the first name this filesystem will not take, so what is tested is its
     # own ceiling rather than a number this test brought with it
@@ -857,10 +800,8 @@ def test_a_failed_removal_after_a_failed_rename_names_the_stranded_temporary_fil
 def test_the_temporary_file_is_created_inside_the_guarded_region_so_an_interrupt_as_mkstemp_returns_leaves_nothing_behind(
     tmp_path, monkeypatch
 ):
-    # tempfile.mkstemp() itself now runs inside save()'s guarded try, with temp_path
-    # pre-set to None ahead of it -- so an interrupt at the earliest possible point,
-    # before mkstemp hands back a path at all, finds nothing to clean up rather than
-    # crashing on a name save() was never given
+    # mkstemp() runs inside save()'s guarded try with temp_path pre-set to None, so an interrupt before
+    # it hands back a path at all finds nothing to clean up rather than crashing on a name never given
     def interrupted_mkstemp(*args, **kwargs):
         raise KeyboardInterrupt
 
@@ -894,11 +835,8 @@ def test_stale_temporaries_names_the_older_bare_tmpxxxxxxxx_shape(tmp_path):
 
 
 def test_stale_temporaries_follows_this_filesystem_on_another_spelling_of_the_path(tmp_path):
-    # a save started as DUMP.MRDB and a start given dump.mrdb are one snapshot where the
-    # filesystem folds case and two where it does not, so what is asserted here is that
-    # the report agrees with the filesystem underneath it rather than with either guess.
-    # the same probe the code cannot make for itself is cheap in a test: write one name,
-    # look for the other
+    # a save started as DUMP.MRDB and a start given dump.mrdb are one snapshot where the filesystem folds
+    # case and two where it does not, so the report must agree with the filesystem rather than either guess
     (tmp_path / "Case.probe").write_bytes(b"")
     folds_case = (tmp_path / "case.PROBE").exists()
     path = tmp_path / "dump.mrdb"
@@ -920,10 +858,8 @@ def test_stale_temporaries_follows_this_filesystem_on_another_spelling_of_the_pa
 
 
 def test_a_save_keeps_the_mode_of_the_snapshot_it_replaces(tmp_path):
-    # the file that survives a save is the temporary one, renamed over the old snapshot,
-    # so without carrying the mode across, every save quietly narrows a file an operator
-    # widened -- for a backup reader, say -- and nothing reports it. a first save has no
-    # mode to carry and keeps mkstemp's own 0600
+    # the file that survives a save is the temporary one renamed over the snapshot, so without carrying the
+    # mode across every save narrows a file an operator widened; a first save keeps mkstemp's own 0600
     path = tmp_path / "dump.mrdb"
     store = Store()
     store.write(b"k", b"v", keep_ttl=False)
@@ -946,9 +882,8 @@ def test_stale_temporaries_still_refuses_a_symlink_and_a_directory_and_escapes_m
     (tmp_path / "dump.mrdb.cccc3333.tmp.mrdb").mkdir()
     (tmp_path / "link-target").write_bytes(b"whatever a link of the right name points at")
     (tmp_path / "dump.mrdb.dddd4444.tmp.mrdb").symlink_to(tmp_path / "link-target")
-    # "." in the snapshot's own basename is a regex metacharacter -- unescaped, it would
-    # also match a literal "X" here, wrongly claiming a file that belongs to a
-    # differently-named snapshot
+    # "." in the snapshot's basename is a regex metacharacter: unescaped it also matches a literal "X"
+    # here, claiming a file that belongs to a differently-named snapshot
     (tmp_path / "dumpXmrdb.eeee5555.tmp.mrdb").write_bytes(b"belongs to a different name")
     assert persistence.stale_temporaries(str(path)) == sorted([current, legacy])
 
@@ -976,12 +911,8 @@ def test_a_snapshot_version_of_zero_with_a_correct_checksum_is_refused_as_unsupp
 
 
 def test_an_unrecognised_type_byte_laid_out_as_a_list_is_refused():
-    # test_an_unrecognised_kind_byte_is_refused_as_snapshot_error above flips the type
-    # byte on a string entry, which a decoder branching on "!= TYPE_STRING" refuses
-    # exactly as well as one branching on "== TYPE_LIST" does. this flips it on a list
-    # entry instead: the bytes behind the byte are shaped as a genuine list, so a
-    # decoder that takes any byte other than TYPE_STRING for TYPE_LIST would parse it
-    # as one and never refuse it at all
+    # the kind-byte test above flips the byte on a string entry, which "!= TYPE_STRING" refuses as well as
+    # "== TYPE_LIST" does; this flips it on a real list, which the second reading would parse and accept
     store = Store()
     store.write(b"l", deque([b"a", b"b"]), keep_ttl=False)
     blob = bytearray(persistence.encode(store))
@@ -1058,10 +989,8 @@ def test_a_list_element_count_too_long_for_the_formats_uint32_length_field_is_re
 
 
 def test_load_decides_the_type_from_the_descriptor_not_the_path(tmp_path, monkeypatch):
-    # the regular-file check reads os.fstat() on the descriptor load() itself opened,
-    # not os.stat() on the path -- a fifo reported for a descriptor that really names a
-    # regular file proves that: a decoder that re-stated the path here would see the
-    # real, unmodified file and load it instead of refusing it
+    # the regular-file check reads os.fstat() on the descriptor load() opened, not os.stat() on the path:
+    # a decoder that re-stated the path would see the real file here and load it instead of refusing
     path = tmp_path / "dump.mrdb"
     store = Store()
     store.write(b"k", b"v", keep_ttl=False)
@@ -1128,9 +1057,8 @@ def test_load_closes_its_descriptor_even_when_the_blob_is_corrupt(tmp_path, monk
 
 
 def test_check_writable_accepts_a_symlink_to_a_directory_and_save_writes_through_it(tmp_path):
-    # os.rename() replaces the symlink itself rather than following it into the
-    # directory it names, so a save through a "current -> real-dir/dump.mrdb"-style
-    # path never touches what the link points at
+    # os.rename() replaces the symlink itself rather than following it, so a save through a
+    # "current -> real-dir/dump.mrdb" path never touches what the link points at
     real_dir = tmp_path / "elsewhere"
     real_dir.mkdir()
     (real_dir / "untouched.txt").write_bytes(b"leave this alone")
@@ -1185,11 +1113,8 @@ def test_check_writable_accepts_a_symlink_to_an_immutable_file_and_save_leaves_i
 def test_a_directory_that_can_be_renamed_into_but_not_read_does_not_fail_the_save(
     tmp_path, caplog
 ):
-    # write and execute permission is everything os.rename() needs from a directory;
-    # read permission is a separate thing, needed only to open the directory itself for
-    # the sync that follows the rename -- a directory granting the first but not the
-    # second is exactly the case _sync_the_directory()'s own os.open() can fail on,
-    # after the snapshot is already safely renamed into place
+    # write and execute is all os.rename() needs from a directory; read is needed only to open it for the
+    # sync after the rename, where _sync_the_directory()'s os.open() fails with the snapshot already in place
     directory = tmp_path / "write-and-execute-only"
     directory.mkdir()
     directory.chmod(0o300)
@@ -1218,10 +1143,8 @@ def test_a_directory_that_can_be_renamed_into_but_not_read_does_not_fail_the_sav
 
 
 def test_a_snapshot_with_an_unrecognised_kind_byte_and_a_repeated_key_is_refused_naming_the_kind():
-    # the same construction test_a_snapshot_with_a_repeated_key_is_refused_naming_the_key
-    # above uses, except the entry's own type byte is first flipped to one this format
-    # does not recognise -- from_items() raises on that before it ever gets far enough
-    # to notice the repeat, so the refusal has to name the kind and not the repeat
+    # the repeated-key construction with the entry's type byte first flipped to one this format does not
+    # know: from_items() raises on the kind before it reaches the repeat, so the refusal names the kind
     store = Store()
     store.write(b"only", b"first", keep_ttl=False)
     blob = bytearray(persistence.encode(store))
@@ -1244,12 +1167,8 @@ def test_a_snapshot_with_an_unrecognised_kind_byte_and_a_repeated_key_is_refused
 
 
 def test_stale_temporaries_follows_this_filesystem_on_another_spelling_of_the_suffix(tmp_path):
-    # a save always lower-cases the random part and the suffix it appends, so the
-    # canonical spelling of any temporary file this path could have produced keeps the
-    # basename exactly as given and lowers everything after it. a name differing only in
-    # the suffix's own case -- TMP.MRDB rather than tmp.mrdb -- is this path's temporary
-    # file wherever the filesystem folds case, and belongs to nothing here otherwise,
-    # which is asked of the filesystem itself rather than assumed either way
+    # a save lower-cases the random part and the suffix, so a name differing only in the suffix's case --
+    # TMP.MRDB -- is this path's wherever the filesystem folds, which is asked of it rather than assumed
     (tmp_path / "Case.probe").write_bytes(b"")
     folds_case = (tmp_path / "case.PROBE").exists()
     path = tmp_path / "dump.mrdb"
@@ -1282,9 +1201,8 @@ class _FakeLengthAtTheUint32Ceiling(bytes):
 
 
 def test_a_value_exactly_at_the_uint32_ceiling_is_accepted_not_refused():
-    # pins > rather than >=: a length of exactly _UINT32_MAX is the largest this
-    # format's length field can hold, not one past it, and belongs on the accepted side
-    # of the boundary
+    # pins > rather than >=: a length of exactly _UINT32_MAX is the largest the format's length field
+    # holds, not one past it, and belongs on the accepted side
     store = Store()
     store.write(b"k", _FakeLengthAtTheUint32Ceiling(b"x"), keep_ttl=False)
     persistence.encode(store)  # must not raise
@@ -1300,9 +1218,8 @@ def test_check_writable_names_an_immutable_directory_as_not_writable(tmp_path):
     except OSError:
         pytest.skip("this filesystem does not honor UF_IMMUTABLE on a directory")
     try:
-        # mkstemp inside an immutable directory fails with EPERM rather than EACCES --
-        # both have to be recognised, or this refusal falls through to the generic
-        # message instead of naming the directory not writable
+        # mkstemp inside an immutable directory fails with EPERM and not EACCES: both have to be
+        # recognised, or the refusal falls through to the generic message instead of naming the directory
         with pytest.raises(persistence.SnapshotError, match="is not writable"):
             persistence.check_writable(str(directory / "dump.mrdb"))
     finally:
@@ -1328,10 +1245,8 @@ def test_check_writable_refuses_an_existing_snapshot_under_uf_append(tmp_path):
 
 
 def test_check_writable_refuses_an_existing_snapshot_under_sf_append(tmp_path, monkeypatch):
-    # asked of the platform's own stat result rather than of the stat module: the
-    # SF_APPEND constant is defined everywhere Python runs, and the field the bitmask
-    # under test reads is not -- st_flags is BSD's, and on Linux the fake below cannot
-    # be built at all. Guarding on the constant skipped nothing and went red in CI
+    # asked of the platform's own stat result and not of the stat module: SF_APPEND is defined everywhere
+    # Python runs and st_flags is BSD's, so guarding on the constant skipped nothing and went red in CI
     if not hasattr(os.lstat(str(tmp_path)), "st_flags"):
         pytest.skip("this platform's stat results carry no flags field")
     path = tmp_path / "dump.mrdb"
@@ -1339,10 +1254,8 @@ def test_check_writable_refuses_an_existing_snapshot_under_sf_append(tmp_path, m
     good.write(b"k", b"v", keep_ttl=False)
     persistence.save(good, str(path))
 
-    # SF_APPEND is a superuser-only flag to set on this platform, so it is faked onto
-    # the snapshot's own lstat rather than actually applied with chflags -- the bitmask
-    # under test only reads st_flags off whatever lstat() answers and does not care how
-    # the flag arrived there
+    # SF_APPEND is superuser-only to set here, so it is faked onto the snapshot's lstat rather than applied:
+    # the bitmask under test only reads st_flags off whatever lstat() answers
     real_lstat = os.lstat
     target = str(path)
 
@@ -1407,9 +1320,8 @@ def test_sync_the_directory_closes_its_descriptor(tmp_path, monkeypatch):
 def test_one_file_under_both_spellings_returns_false_when_the_respelling_names_nothing(
     tmp_path
 ):
-    # called directly with a name whose re-spelled counterpart does not exist on disk at
-    # all -- a stub that always answered True would pass every positive case elsewhere in
-    # this module too, since those all have a real file at the respelled name
+    # called with a name whose re-spelled counterpart does not exist at all: a stub answering True would
+    # pass every positive case elsewhere in this module, since those all have a real file at that name
     assert persistence._one_file_under_both_spellings(
         str(tmp_path), "dump.mrdb.abcd1234.TMP.MRDB", "dump.mrdb"
     ) is False
@@ -1444,9 +1356,8 @@ def test_stale_temporaries_reports_a_name_whose_type_scandir_cannot_determine(
 
 
 def _deny_delete_or_skip(path, user_denied):
-    # asked of the platform by trying it, not of the platform's name: chmod +a is macOS's
-    # ACL syntax and every other system refuses the flag outright, which is the only
-    # answer this needs
+    # asked of the platform by trying it, not by its name: chmod +a is macOS's ACL syntax and every other
+    # system refuses the flag outright, which is the only answer this needs
     done = subprocess.run(["chmod", "+a", "%s deny delete" % user_denied, str(path)],
                           capture_output=True, text=True)
     if done.returncode != 0:
@@ -1472,9 +1383,8 @@ def test_a_key_repeated_three_times_is_refused_with_its_own_count():
 
 
 def test_a_repeat_after_a_unique_key_names_the_repeat_and_not_the_first_key():
-    # every other repeat test builds a blob holding one distinct key, where a scan that
-    # reported whichever key it reached first would still be right by accident. This one
-    # puts a unique key ahead of the repeat, so naming the first key is visibly wrong
+    # every other repeat test builds a blob holding one distinct key, where naming whichever key came
+    # first is right by accident; this puts a unique key ahead of the repeat, so that is visibly wrong
     def entry(key, value):
         return (struct.pack("<I", len(key)) + key + bytes((persistence.TYPE_STRING,))
                 + struct.pack("<q", -1) + struct.pack("<I", len(value)) + value)
@@ -1493,11 +1403,8 @@ def test_a_repeat_after_a_unique_key_names_the_repeat_and_not_the_first_key():
 def test_a_directory_sync_that_raises_outright_does_not_claim_a_stranded_file(
     tmp_path, monkeypatch
 ):
-    # _sync_the_directory swallows what it means to swallow, but its own finally closes a
-    # descriptor and that close is not inside anything. Run from inside save()'s guarded
-    # region, an exception escaping here reaches the handler that removes the temporary
-    # file -- a name the rename has already consumed -- and attaches a note saying a
-    # full-size copy was stranded, over a save whose snapshot is on disk and correct
+    # _sync_the_directory's own finally closes a descriptor outside anything: run inside save()'s guarded
+    # region, an escape reaches the handler that removes the file and claims a stranded copy over a good save
     real_close = os.close
 
     def close_refusing_directories(fd):
@@ -1535,16 +1442,8 @@ def test_a_directory_sync_that_raises_outright_does_not_claim_a_stranded_file(
 def test_a_snapshot_an_acl_will_not_let_a_rename_replace_starts_and_then_fails_safely(
     tmp_path
 ):
-    # the startup check does not catch this, deliberately. The rename needs the right to
-    # remove the existing snapshot's own directory entry, and nothing that can be asked
-    # about the directory answers for that one file: the flags check above sees what a
-    # flags field expresses and no more. Rehearsing it means removing that entry, or
-    # making a second name for the snapshot and removing that -- a version of this check
-    # did the latter, and inside two rounds it deleted a file it had not created and made
-    # concurrent starts refuse each other, all to catch a configuration that fails safely
-    # without it. What is pinned here is that it does fail safely: the server starts, the
-    # save raises where a caller will log it, and the snapshot it could not replace is
-    # still there and still loads
+    # deliberately not caught at startup: rehearsing it means removing the snapshot's own entry, and the
+    # version that did deleted a file it had not created. what is pinned is that the save fails safely
     path = tmp_path / "dump.mrdb"
     store = Store()
     store.write(b"first", b"value", keep_ttl=False)
@@ -1572,10 +1471,8 @@ def test_a_snapshot_an_acl_will_not_let_a_rename_replace_starts_and_then_fails_s
 def test_a_rename_the_filesystem_refuses_fails_safely_on_every_platform(
     tmp_path, monkeypatch
 ):
-    # the same property as the test above, asked without chmod +a: that one skips wherever
-    # macOS ACL syntax is not understood, which is every machine CI runs on, and it is the
-    # only thing pinning the failure mode the startup check was removed in favour of. Here
-    # the rename is refused directly, so what a denying filesystem would do is what runs
+    # the same property without chmod +a, which skips on every machine CI runs: the rename is refused
+    # directly, so what a denying filesystem would do is what runs
     path = tmp_path / "dump.mrdb"
     store = Store()
     store.write(b"first", b"value", keep_ttl=False)
@@ -1608,23 +1505,15 @@ def test_a_rename_the_filesystem_refuses_fails_safely_on_every_platform(
 
 
 def test_check_writable_writes_nothing_into_the_directory_it_checks(tmp_path):
-    # it creates and removes one temporary file of the shape a save writes, and that is
-    # all. A second probe that made a hard link beside the snapshot is what this pins
-    # against coming back without a reason: it wrote into the operator's own directory at
-    # every start, and twice that turned into a defect
+    # it creates and removes one temporary file of the shape a save writes, and no more: a second probe
+    # that hard-linked beside the snapshot wrote into the operator's directory and twice became a defect
     path = tmp_path / "dump.mrdb"
     store = Store()
     store.write(b"k", b"v", keep_ttl=False)
     persistence.save(store, str(path))
 
-    # asked of the snapshot's own inode rather than by intercepting os.link. A link count
-    # read after the call sees nothing, because a probe that makes a second name and
-    # removes it again leaves the count back at one -- and so does patching the os.link
-    # attribute, against a probe that bound it at import time or shelled out to ln. What
-    # does survive is the inode's ctime: linking or unlinking changes the link count,
-    # which is inode metadata, so either one moves it, and neither reading the file nor
-    # creating an unrelated file beside it does. That is the property, and it holds
-    # however the probe spells its call
+    # asked of the snapshot's own inode and not by patching os.link, which a probe binding it at import or
+    # shelling out to ln evades: linking or unlinking moves the inode's ctime, and reading it does not
     beside = tmp_path / "beside.mrdb"
     beside.write_bytes(b"the operator's own file")
     entries_before = {entry.name: entry.stat().st_ino for entry in tmp_path.iterdir()}
@@ -1651,13 +1540,8 @@ def test_check_writable_writes_nothing_into_the_directory_it_checks(tmp_path):
 def test_check_writable_refuses_a_device_that_takes_the_file_but_not_the_bytes(
     tmp_path, monkeypatch
 ):
-    # the defect this exists for: the probe created and removed a file and never wrote to
-    # it, so a device with no room left passed the one check whose job is to refuse a path
-    # the first save fails on. measured on a hard-filled APFS volume, where df still
-    # reported 1,012 KiB available: mkstemp succeeded and one byte answered ENOSPC. the
-    # write is substituted here for the same reason test_write_drain.py substitutes
-    # FIONREAD -- filling a real device is not something a unit test can do, and the
-    # question is whether check_writable asks at all
+    # the probe created and removed a file and never wrote to it, so a full device passed: measured on an
+    # APFS volume df still called 1,012 KiB available, mkstemp succeeded and one byte answered ENOSPC
     written = []
     real_write = os.write
 
@@ -1708,13 +1592,8 @@ def test_check_writable_still_accepts_a_directory_with_room(tmp_path):
 
 
 def test_save_names_the_file_in_an_oserror_that_took_no_path(tmp_path, monkeypatch):
-    # the defect this exists for: write(), flush() and fsync() take no path, so the OSError a
-    # full device raises has filename None and its str() names no file at all -- which is
-    # exactly the failure the startup check exists to anticipate and the one the operator most
-    # needs a file name for. server.py's _guard_task logs str(exc) and no traceback, so a
-    # path-less exception means a save that lost the keyspace is reported as nothing but
-    # "[Errno 28] No space left on device". the write is substituted for the reason the probe's
-    # own tests substitute it: a unit test cannot fill a device
+    # write(), flush() and fsync() take no path, so a full device's OSError has filename None and names no
+    # file, and _guard_task logs str(exc) alone, so a lost keyspace reads as "[Errno 28] No space left"
     path = tmp_path / "dump.mrdb"
     store = Store()
     store.write(b"k", b"v", keep_ttl=False)
@@ -1722,9 +1601,8 @@ def test_save_names_the_file_in_an_oserror_that_took_no_path(tmp_path, monkeypat
     def no_room(descriptor):
         raise OSError(errno.ENOSPC, "No space left on device")
 
-    # the sync rather than the write, because a BufferedWriter's write cannot be substituted --
-    # and the sync is the same shape of failure for this purpose: a filesystem that defers
-    # allocation answers there, with no path either
+    # the sync rather than the write, because a BufferedWriter's write cannot be substituted -- and a
+    # filesystem that defers allocation fails there anyway, with no path either
     monkeypatch.setattr(persistence, "_sync_to_the_device", no_room)
     with pytest.raises(OSError) as failed:
         persistence.save(store, str(path))
@@ -1737,9 +1615,8 @@ def test_save_names_the_file_in_an_oserror_that_took_no_path(tmp_path, monkeypat
 
 
 def test_save_leaves_an_oserror_raised_with_a_bare_message_alone(tmp_path, monkeypatch):
-    # the control for the test above, and the regression it caused once: an OSError built from a
-    # bare string has errno None, and giving that one a filename switches str() to the
-    # "[Errno None] None: 'path'" form, which loses the message the exception was carrying
+    # the control, and the regression it caused once: an OSError from a bare string has errno None, and
+    # giving that one a filename switches str() to "[Errno None] None: 'path'", losing the message
     path = tmp_path / "dump.mrdb"
     store = Store()
     store.write(b"k", b"v", keep_ttl=False)
@@ -1753,13 +1630,8 @@ def test_save_leaves_an_oserror_raised_with_a_bare_message_alone(tmp_path, monke
 
 
 def test_the_startup_probe_is_removed_when_an_interrupt_arrives_mid_probe(tmp_path, monkeypatch):
-    # the defect this exists for: the probe's failure arm caught OSError where save() catches
-    # BaseException and says why -- a KeyboardInterrupt unwinds through here too. the write and
-    # the sync took the probe's life from a median 0.10 ms to 3.03 ms, and measured against a
-    # real server, a Ctrl-C arriving during startup stranded the probe in 5 of 80 trials where
-    # the tree before the write stranded it in 0 of 80. nothing ever removes the stray, and
-    # every later start warns that a save may have been interrupted and that the file may hold
-    # its snapshot
+    # the probe's arm caught OSError where save() catches BaseException: the write and sync took its life
+    # from a median 0.10 ms to 3.03 ms, and a Ctrl-C stranded the probe in 5 of 80 trials against 0 of 80
     def interrupted(descriptor):
         raise KeyboardInterrupt
 
@@ -1774,11 +1646,8 @@ def test_the_startup_probe_is_removed_when_an_interrupt_arrives_mid_probe(tmp_pa
 
 
 def test_the_startup_probe_is_not_named_as_a_file_an_interrupted_save_may_have_left(tmp_path):
-    # the probe and a save's temporary file were the same shape, and the probe's widened window
-    # made two servers starting together in one directory see each other's: measured, one of
-    # them warned that a save had likely been interrupted in 90 of 150 pairs against 21 of 150
-    # before, of a file that was gone three milliseconds later. so the probe carries a suffix of
-    # its own, and stale_temporaries() does not report it
+    # the probe and a save's temporary file were one shape, so two servers starting in one directory saw
+    # each other's: 90 of 150 pairs warned against 21 of 150, over a file gone three milliseconds later
     path = tmp_path / "dump.mrdb"
     probe = tmp_path / (path.name + ".abcdefgh" + persistence._PROBE_SUFFIX)
     probe.write_bytes(b"\0")
@@ -1798,9 +1667,8 @@ def test_the_startup_probe_is_not_named_as_a_file_an_interrupted_save_may_have_l
 
 
 def test_the_startup_probe_syncs_after_it_writes_and_not_before(tmp_path, monkeypatch):
-    # the order is the whole reason the sync is there: a filesystem that defers allocation answers
-    # at the flush rather than at the write, so syncing an empty file asks nothing. nothing pinned
-    # the order, and a mutant that moved the sync above the write passed the suite
+    # the order is the whole reason the sync is there: a filesystem that defers allocation answers at the
+    # flush, so syncing an empty file asks nothing -- and a mutant moving the sync above the write passed
     calls = []
     real_write, real_sync = os.write, persistence._sync_to_the_device
     monkeypatch.setattr(os, "write", lambda fd, data: (calls.append("write"), real_write(fd, data))[1])
@@ -1842,10 +1710,8 @@ def test_the_startup_probe_closes_its_descriptor_on_every_arm(tmp_path, monkeypa
 
 
 def test_the_startup_probe_refuses_a_write_error_that_is_not_enospc(tmp_path, monkeypatch):
-    # the arm is written for OSError and not for ENOSPC alone, because EIO and EDQUOT from the
-    # probe are the same answer -- this device will not take the bytes a save writes -- and a
-    # mutant that narrowed it to ENOSPC let those escape as a bare OSError with a traceback
-    # instead of the one-line refusal every other startup failure gets
+    # written for OSError and not ENOSPC alone, because EIO and EDQUOT say the same thing: a mutant that
+    # narrowed it let those escape as a bare OSError with a traceback instead of the one-line refusal
     for number, name in ((errno.EIO, "Input/output error"),
                          (errno.EDQUOT, "Disc quota exceeded"),
                          (errno.EROFS, "Read-only file system")):

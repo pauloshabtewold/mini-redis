@@ -21,16 +21,11 @@ REPO_ROOT = pathlib.Path(__file__).resolve().parent.parent
 
 
 def pytest_configure(config):
-    # pyproject.toml sets timeout = 300 to turn a parser hang into a failure, and that setting is
-    # pytest-timeout's, not pytest's: without the plugin the whole bound disappears behind one
-    # PytestConfigWarning that a quiet run never shows, and the suite runs with no bound at all.
-    # Under -W error the same warning becomes an INTERNALERROR instead, so the two ways of running
-    # it fail differently and neither says what is missing. Refused here, by name, because a run
-    # with no deadline is a run that can hang CI rather than fail it
+    # pyproject.toml's `timeout = 300` is pytest-timeout's setting and not pytest's: without the plugin the
+    # bound vanishes behind one PytestConfigWarning, and under -W error it becomes an INTERNALERROR instead
     if not config.pluginmanager.hasplugin("timeout"):
-        # installed-and-disabled is named apart from absent, because `-p no:timeout` gets this arm
-        # with the plugin sitting in site-packages, and the remedy it used to print -- install the
-        # dev extra -- was already done
+        # installed-and-disabled is named apart from absent: `-p no:timeout` gets this arm with the plugin
+        # present, and the remedy that message used to print -- install the dev extra -- was already done
         try:
             import pytest_timeout  # noqa: F401
         except ImportError:
@@ -42,13 +37,8 @@ def pytest_configure(config):
             "pytest-timeout is installed but switched off for this run, so pyproject.toml's "
             "`timeout = 300` does nothing and a test that hangs will hang this run instead of "
             "failing it. Drop the -p no:timeout that disabled it")
-    # the EFFECTIVE bound, and a number greater than zero. the version of this check that read
-    # `assert config.getini("timeout")` passed three ways that leave a run unbounded: the ini key
-    # is declared as a string, so "0" is truthy while the plugin's own code reads `timeout > 0`
-    # and arms nothing; `--timeout=0` and PYTEST_TIMEOUT=0 do not touch the ini value at all; and
-    # an unset-but-present key failed as an AssertionError, which pytest reports as an
-    # INTERNALERROR with a traceback at exit 3, where the arm above is a clean UsageError at
-    # exit 4. The plugin is asked for the option first, because that is what it honours
+    # the EFFECTIVE bound: the ini key is a string, so "0" is truthy while the plugin arms nothing, and
+    # --timeout=0 and PYTEST_TIMEOUT=0 never touch it -- the option is asked first because it is what wins
     bound = config.getoption("timeout", None)
     if bound is None:
         bound = config.getini("timeout")
@@ -67,9 +57,8 @@ def pytest_configure(config):
 
 
 def free_port():
-    # bound and released rather than fixed: the port is free when chosen and could in
-    # principle be taken before the server binds it, but a fixed port collides with a
-    # developer's own running instance, which is the more likely of the two
+    # bound and released rather than fixed: free when chosen and takeable before the server binds it, but
+    # a fixed port collides with a developer's own running instance, which is the likelier of the two
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
         sock.bind(("127.0.0.1", 0))
         return sock.getsockname()[1]
@@ -95,32 +84,15 @@ def stop_server(proc):
         proc.kill()
         proc.wait(timeout=5)
     finally:
-        # launch_server reads one line from this pipe and leaves it open; closing it here
-        # rather than at garbage collection keeps a ResourceWarning out of a suite that
-        # starts a server per test
+        # launch_server reads one line from this pipe and leaves it open: closing it here rather than at
+        # garbage collection keeps a ResourceWarning out of a suite that starts a server per test
         if proc.stdout is not None:
             proc.stdout.close()
 
 
 def _bound_this_port(proc, port, deadline):
-    # server.py prints one flushed line naming the address it actually bound. That line,
-    # and not a TCP connect, is what says the process listening on this port is this one:
-    # free_port() binds a port and releases it, so the number is free when chosen and can
-    # be taken before the server binds it, and the ephemeral range on this machine is
-    # 16,384 wide -- once it wraps, two concurrent processes are handed the same number.
-    # The loser then dies with EADDRINUSE while a plain connect still succeeds, because
-    # the winner is listening, and its tests run against the other one's server and read
-    # values they never wrote. That is the shape the 8 MiB round trip's own failure
-    # message describes, and nothing here could see it
-    #
-    # Read through os.read on the raw descriptor rather than readline(): select() bounds
-    # only the wait for readiness, so a readline() entered on one available byte blocks
-    # with no deadline of its own if the rest of the line never comes, and the retry loop
-    # above never gets control back. Today's server prints the whole line in one flushed
-    # write well under PIPE_BUF, so it arrives atomically -- but the bound has to hold on
-    # the path, not on the current server's good manners. Lines are consumed until the one
-    # that matches, because stopping at the first means an unrelated line ahead of it
-    # reads as a failure to bind.
+    # the child's own bind line, not a TCP connect, proves the process on this port is the one we started:
+    # free_port's number can be retaken, and the line is read with os.read under a deadline, never readline()
     expected = b"listening on "
     wanted_tail = (":%d" % port).encode()
     buffered = b""
@@ -135,19 +107,8 @@ def _bound_this_port(proc, port, deadline):
             while b"\n" in buffered:
                 line, buffered = buffered.split(b"\n", 1)
                 if line.startswith(expected) and line.rstrip().endswith(wanted_tail):
-                    # the line proves the port is this process's; a connect proves
-                    # something is serving on it now. Neither alone is enough -- a connect
-                    # answers for whoever holds the port, and a line a child printed before
-                    # dying answers for nothing -- and no check can promise a server stays
-                    # up, so this is the pair that is actually knowable here
-                    # the connect first, and the liveness check after it: asked before,
-                    # a child that exits the instant it has printed is still alive when
-                    # the question is put. Asked after, it has had a connect's worth of
-                    # time to be gone -- which is a better chance and not a guarantee, so
-                    # this half is deliberately unpinned by any test. Asserting that a
-                    # child racing to exit loses that race is asserting a scheduling
-                    # outcome: it held on this machine and lost on CI's. What IS pinned is
-                    # the connect: a port nothing serves is never handed back
+                    # the line proves the port is ours and the connect proves something serves it now; the
+                    # poll after it is deliberately unpinned: a child racing to exit is a scheduling outcome
                     return wait_until_listening(port, deadline) and proc.poll() is None
         elif proc.poll() is not None:
             # exited without ever printing the line: the bind failed
@@ -195,10 +156,8 @@ def launch_server(snapshot_path, extra_args=(), attempts=5):
         if _bound_this_port(proc, port, time.monotonic() + 5):
             return proc, port
         stop_server(proc)
-    # the reason is not knowable from here -- a port taken, a server that died before it
-    # bound, one too slow to answer inside the deadline -- so the message says what was
-    # observed rather than naming a cause. An earlier wording blamed a taken port every
-    # time, including when none had been
+    # the reason is not knowable here -- a port taken, a server dead before it bound, one too slow -- so
+    # the message says what was observed; an earlier wording blamed a taken port even when none had been
     raise AssertionError(
         "no server could be started: %d attempts in a row neither printed a bind line "
         "for the port they were given nor stayed alive to" % attempts)
@@ -206,10 +165,8 @@ def launch_server(snapshot_path, extra_args=(), attempts=5):
 
 @pytest.fixture
 def mini_redis_server(tmp_path):
-    # a path under this test's own tmp_path, not the default ./dump.mrdb: a snapshot
-    # written to the repository's own working directory would outlive the test that
-    # wrote it and load back into whichever test runs against this fixture next.
-    # stderr is left inherited, so a traceback still surfaces
+    # a path under this test's own tmp_path, not ./dump.mrdb: a snapshot in the repository would outlive
+    # the test and load back into whichever test runs next. stderr is left inherited, so tracebacks surface
     proc, port = launch_server(tmp_path / "dump.mrdb")
     try:
         yield port
@@ -219,10 +176,8 @@ def mini_redis_server(tmp_path):
 
 @pytest.fixture
 def redis_client(mini_redis_server):
-    # redis-py defaults to RESP3 and sends HELLO 3 on connect, which this server cannot
-    # answer -- the flat RESP2 array it gets back is not the mapping redis-py expects,
-    # and every reply this server can give to that fails one way or another. protocol=2
-    # belongs here, once, rather than at every place a test builds its own client
+    # redis-py defaults to RESP3 and sends HELLO 3, which this server cannot answer: protocol=2 belongs
+    # here once rather than at every place a test builds its own client
     return redis.Redis(host="127.0.0.1", port=mini_redis_server, protocol=2)
 
 

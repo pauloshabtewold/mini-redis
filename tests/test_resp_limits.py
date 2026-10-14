@@ -16,8 +16,7 @@ REJECTED_HEADERS = [
     pytest.param(b"*-1\r\n", b"ERR Protocol error: invalid multibulk length", id="multibulk -1"),
     pytest.param(b"*-5\r\n", b"ERR Protocol error: invalid multibulk length", id="multibulk -5"),
     # a digit run longer than the interpreter converts: isdigit() passes it and int() raises, so an
-    # unguarded parser dies here rather than rejecting. Skipped rather than silently dropped where
-    # the ceiling is disabled, since the shape has no witness there at all
+    # unguarded parser dies here rather than rejecting; skipped where the ceiling is disabled
     pytest.param(
         b"*1\r\n$" + OVERSIZED_DIGIT_RUN + b"\r\n",
         b"ERR Protocol error: invalid bulk length",
@@ -58,9 +57,8 @@ def test_oversized_digit_run_raises_protocol_error_not_value_error():
         resp.parse_command(b"*" + OVERSIZED_DIGIT_RUN + b"\r\n")
 
 
-# rows needing a cap have nowhere to go in REJECTED_HEADERS above: test_rejected_from_header_alone
-# calls resp.parse_command(wire) with no caps at all, so a row that needs one gets its own table.
-# rows are (wire, caps, message); the test passes **caps through to parse_command unchanged
+# rows needing a cap get their own table: test_rejected_from_header_alone calls parse_command with no
+# caps at all. rows are (wire, caps, message) and the test passes **caps through unchanged
 REJECTED_UNDER_A_CAP = [
     pytest.param(
         b"*1\r\n$65\r\n", {"max_value_size": 64},
@@ -72,9 +70,8 @@ REJECTED_UNDER_A_CAP = [
         b"ERR Protocol error: invalid multibulk length",
         id="multibulk count one over the cap",
     ),
-    # --max-value-size bounds every element, not only the one a human would call a value --
-    # each position gets its own row, so a fix that skips element zero still fails two of
-    # these three
+    # --max-value-size bounds every element and not only the one a human calls a value: one row per
+    # position, so a fix that skips element zero still fails two of these three
     pytest.param(
         b"*3\r\n$99\r\n", {"max_value_size": 8},
         b"ERR Protocol error: invalid bulk length",
@@ -120,10 +117,8 @@ def test_a_declared_size_exactly_at_the_cap_is_accepted():
 
 
 def test_a_zero_cap_disables_and_is_the_default():
-    # 0 disables each cap and is every parameter's default, so every existing call site
-    # that passes no cap keeps its present, uncapped behaviour with no edit. stated
-    # without a count on purpose: an enumeration here is wrong again the next time a
-    # test module calls the parser
+    # 0 disables each cap and is every parameter's default, so every call site passing no cap keeps
+    # its uncapped behaviour with no edit
     whole = b"*3\r\n$3\r\nSET\r\n$1\r\nk\r\n$1\r\nv\r\n"
     expected = ([b"SET", b"k", b"v"], len(whole), 0)
     assert resp.parse_command(whole) == expected
@@ -135,10 +130,8 @@ def test_a_zero_cap_disables_and_is_the_default():
 
 
 def test_the_int_max_ceiling_holds_with_the_configurable_cap_off():
-    # MAX_MULTIBULK_COUNT is the reference's own unconditional INT_MAX ceiling and
-    # must hold whether the configurable cap is off (0) or merely set above it -- folding
-    # the two into one comparison would make the hard ceiling disappear exactly when the
-    # configurable one is switched off
+    # MAX_MULTIBULK_COUNT is the reference's own unconditional INT_MAX ceiling and must hold with the
+    # configurable cap off or set above it: folded into one comparison, the hard ceiling disappears
     over_int_max = b"*2147483648\r\n"
     for caps in ({"max_multibulk": 0}, {"max_multibulk": 4000000000}):
         with pytest.raises(resp.ProtocolError) as exc_info:
@@ -147,10 +140,8 @@ def test_the_int_max_ceiling_holds_with_the_configurable_cap_off():
 
 
 def test_the_caps_reach_the_primitives_directly_not_only_parse_command():
-    # the live server drives parse_multibulk_header and parse_bulk_element directly
-    # (connection.py), never through parse_command -- a cap threaded only into parse_command
-    # would leave the live path uncapped while every test that only calls parse_command
-    # stayed green
+    # the live server drives parse_multibulk_header and parse_bulk_element directly, so a cap threaded
+    # only into parse_command leaves the live path uncapped with every parse_command test green
     for call, wire, caps, want in [
         (resp.parse_bulk_element, b"$65\r\n", {"max_value_size": 64},
          b"ERR Protocol error: invalid bulk length"),
@@ -161,9 +152,8 @@ def test_the_caps_reach_the_primitives_directly_not_only_parse_command():
             call(wire, **caps)
         assert exc_info.value.message == want, (call.__name__, exc_info.value.message)
 
-    # and the whole-command form forwards max_value_size into the element loop, not only
-    # into the header: the parse_bulk_element(buf[pos:]) call inside _parse_multibulk is
-    # the one call in the file with no search_from, and so the easiest to leave unforwarded
+    # the whole-command form must forward max_value_size into the element loop too: the
+    # parse_bulk_element(buf[pos:]) call inside _parse_multibulk is the easiest to leave unforwarded
     with pytest.raises(resp.ProtocolError) as exc_info:
         resp.parse_command(b"*2\r\n$1\r\na\r\n$65\r\n", max_value_size=64)
     assert exc_info.value.message == b"ERR Protocol error: invalid bulk length"
@@ -180,9 +170,8 @@ def test_a_terminated_inline_line_over_the_ceiling_is_refused():
 
 
 def test_an_inline_line_exactly_at_the_ceiling_is_accepted():
-    # a line's \r\n terminator is framing, not content, and must not be counted -- a
-    # line measured with it included would refuse a legal MAX_INLINE_SIZE-byte line as one
-    # or two bytes over. The assertion names the quantity it is about
+    # a \r\n terminator is framing and not content: counted in, a legal MAX_INLINE_SIZE-byte line
+    # would be refused as one or two bytes over
     assert resp.MAX_INLINE_SIZE == 64 * 1024
     line = b"ECHO " + b"A" * (resp.MAX_INLINE_SIZE - 5)
     assert len(line) == resp.MAX_INLINE_SIZE
@@ -192,10 +181,7 @@ def test_an_inline_line_exactly_at_the_ceiling_is_accepted():
 
 
 def test_an_unterminated_inline_line_is_bounded_by_no_size():
-    # a line that has not ended has no declared length to compare against anything, so it
-    # stays unbounded in size here and is bounded in time by --incomplete-command-timeout.
-    # this test's whole job is to fail if the parser is given a size bound for it by
-    # accident -- a pinned absence rather than a pinned behaviour, and it reads as deletable
-    # without this comment
+    # an unended line has no declared length to compare, so it stays unbounded in size here and bounded
+    # in time by --incomplete-command-timeout: this fails if the parser ever gains a size bound for it
     line = b"ECHO " + b"A" * (resp.MAX_INLINE_SIZE * 3)
     assert resp.parse_command(line) == (None, 0, 0)

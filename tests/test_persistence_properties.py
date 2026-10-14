@@ -31,9 +31,8 @@ def _fixture_blob():
     store.write(b"beta", deque([b"x", b"y"]), keep_ttl=False)
     store.write(b"gamma", b"v", keep_ttl=False)
     store.expire_at(b"gamma", 1_700_000_000_000)
-    # the whole store, not only its values -- key, kind, value and absolute expiry --
-    # or a flip that lands on a deadline and nowhere else has nothing here to disagree
-    # with, both in the refusal test's report and in the control at the bottom
+    # the whole store and not only its values -- key, kind, value and absolute expiry -- or a flip that
+    # lands on a deadline alone has nothing here to disagree with
     return persistence.encode(store), list(store.snapshot_items())
 
 
@@ -48,11 +47,8 @@ def test_every_single_bit_flip_is_refused_as_snapshot_error():
         try:
             loaded = persistence.decode(bytes(flipped))
         except persistence.SnapshotError as exc:
-            # the type alone is not proof: checking the version or a length prefix before
-            # the checksum would also refuse every flip as SnapshotError, for the wrong
-            # reason. a flip in the magic is refused before the checksum is ever read;
-            # every other flip corrupts bytes the checksum covers, and a CRC32 catches
-            # every single-bit error, so nothing past the magic can reach any later check
+            # the type alone is not proof: a version or length check before the checksum would refuse
+            # every flip too; a magic flip precedes it, and CRC32 catches every other single-bit error
             message = str(exc)
             if offset < 4:
                 assert message.startswith("wrong magic"), (
@@ -71,11 +67,8 @@ def test_every_single_bit_flip_is_refused_as_snapshot_error():
                 % (round_index, offset, bit, type(exc).__name__)
             ) from exc
         else:
-            # accepted at all is already the failure, so no flip in the corpus can load
-            # a store that differs without failing here. what the report adds is which of
-            # two different defects it was: a flip loaded as the original store, or one
-            # loaded as wrong data. snapshot_items() rather than _data alone, so a flip
-            # that changed only a deadline reads as wrong data too
+            # accepted at all is the failure; the report adds which defect it was, and snapshot_items()
+            # rather than _data so a flip that changed only a deadline reads as wrong data too
             differs = list(loaded.snapshot_items()) != original
             raise AssertionError(
                 "round %d offset %d bit %d was accepted, loading %s" % (
@@ -91,10 +84,8 @@ def test_the_flip_corpus_reaches_every_region_of_the_format():
     regions = {"magic": 0, "version": 0, "payload": 0, "trailer": 0}
     for _ in range(ROUNDS):
         offset = rnd.randrange(len(blob))
-        # the bit itself goes unused here -- drawn only so this rnd consumes the same
-        # two numbers per round as the bit-flip tests above and below, keeping its
-        # offsets in step with the exact corpus those tests run rather than a similar
-        # one that drifts apart after round one
+        # the bit is drawn and unused, so this rnd consumes the same two numbers per round as the tests
+        # above and below and its offsets stay in step with their exact corpus
         rnd.randrange(8)
         if offset < 4:
             regions["magic"] += 1
@@ -108,9 +99,8 @@ def test_the_flip_corpus_reaches_every_region_of_the_format():
 
 
 def test_without_the_checksum_some_flips_are_accepted_with_wrong_data():
-    # measures directly, against this fixture, what a format with no checksum at all
-    # would accept: the same corpus, with the trailer recomputed to agree with each
-    # flip, is what a decoder with no checksum to check would be handed
+    # measures what a format with no checksum would accept: the same corpus with the trailer recomputed
+    # to agree with each flip
     blob, original = _fixture_blob()
     original_values = {key: value for key, _, value, _ in original}
     rnd = random.Random(SEED)
@@ -129,9 +119,8 @@ def test_without_the_checksum_some_flips_are_accepted_with_wrong_data():
         items = list(loaded.snapshot_items())
         if items != original:
             accepted_without_checksum += 1
-            # isolates a flip that reached only a deadline: every value still matches
-            # by key, so the whole-store difference asserted above owes entirely to
-            # the expiry field none of this loop's other bookkeeping looks at
+            # isolates a flip that reached only a deadline: every value still matches by key, so the
+            # whole-store difference owes entirely to the expiry field
             loaded_values = {key: value for key, _, value, _ in items}
             if loaded_values == original_values:
                 accepted_with_only_a_deadline_changed += 1
@@ -146,11 +135,8 @@ def test_without_the_checksum_some_flips_are_accepted_with_wrong_data():
 
 
 def _ordinary41():
-    # the fixture the README's figures are taken on: 41 plainly named keys, one of them a
-    # list, one of them carrying a TTL, sized so the blob lands on exactly 2,036 bytes.
-    # plainly named matters -- key00 and key01 differ by one bit, so this fixture has
-    # duplicate-key collisions and _separated41() below has none, which is the whole
-    # point of publishing two numbers instead of one
+    # the fixture the README's figures are taken on: 41 plainly named keys, one a list, one with a TTL,
+    # 2,036 bytes -- key00 and key01 differ by one bit, so this one has duplicate-key collisions
     store = Store()
     for i in range(41):
         store.write(b"key%02d" % i, b"v" * 27, keep_ttl=False)
@@ -160,9 +146,8 @@ def _ordinary41():
 
 
 def _separated41():
-    # the maximum over key choices at this size: five-byte keys drawn from an alphabet
-    # that leaves every pair at Hamming distance 2 or more, so no single flip in a key can
-    # produce a key another entry already holds and the duplicate-key count is zero
+    # the maximum over key choices at this size: five-byte keys at Hamming distance 2 or more, so no
+    # single flip in a key can produce a key another entry holds and the duplicate-key count is zero
     alphabet = b'!"$\'(+-'
     store = Store()
     keys = []
@@ -177,11 +162,8 @@ def _separated41():
 
 
 def _why_refused(message):
-    # classified off the whole message and never off its first colon-separated field:
-    # every reason but three opens "corrupt snapshot:", so splitting there collapses the
-    # length prefix and the type byte into one bucket, and the duplicate-key messages name
-    # the key so each is its own string. the README itemises these, so the buckets have to
-    # be the ones it names
+    # classified off the whole message and never its first colon-separated field: every reason but three
+    # opens "corrupt snapshot:", and the duplicate-key messages name the key, so each is its own string
     if "wrong magic" in message:
         return "wrong magic"
     if "unsupported snapshot version" in message:
@@ -200,11 +182,8 @@ def _why_refused(message):
 
 
 def _sweep_with_the_trailer_recomputed(blob):
-    # what a length-prefixed format with no checksum amounts to: the trailer is recomputed
-    # over the corrupted bytes, so it cannot be what refuses the flip. three outcomes, and
-    # every flip lands in exactly one -- the trailer's own 32 positions are overwritten by
-    # the recomputation, so the decoder is handed the original bytes and returns the
-    # original store, which is accepted but as IDENTICAL data and not as different
+    # what a length-prefixed format with no checksum amounts to: the trailer is recomputed over the
+    # corrupted bytes, so the trailer's own 32 positions decode as the original and count as identical
     original = persistence.decode(blob)
     different = identical = 0
     reasons = {}
@@ -227,11 +206,8 @@ def _sweep_with_the_trailer_recomputed(blob):
 
 
 def test_the_exhaustive_bit_flip_shares_the_readme_publishes():
-    # the README's flagship finding. before this, its shares came from 3,000 random trials
-    # that no file here reproduced, and the three figures it quoted could not describe one
-    # fixture: 475 + 48 + 5 is 17.60% of 3,000 against a stated 19%, and the 80.9% it gave
-    # as the shape's own exhaustive share is reachable only by a key set with zero
-    # duplicate-key catches, which 5 such catches contradicts
+    # the README's flagship finding, which nothing reproduced: 475 + 48 + 5 is 17.60% of 3,000 against a
+    # stated 19%, and the 80.9% exhaustive share needs zero duplicate-key catches, which 5 contradicts
     blob = _ordinary41()
     assert len(blob) == 2036, ("the fixture the figures belong to is 2,036 bytes", len(blob))
     different, identical, reasons = _sweep_with_the_trailer_recomputed(blob)
@@ -258,11 +234,8 @@ def test_the_exhaustive_bit_flip_shares_the_readme_publishes():
 
 
 def test_the_bit_flip_maximum_is_a_key_choice_and_not_the_shapes_figure():
-    # 80.8939% is reached only where no single flip in a key can produce a key another
-    # entry already holds, and such a fixture has ZERO duplicate-key refusals. the README
-    # used to publish that share beside "5 by a key arriving twice", which cannot both be
-    # true of one blob -- every duplicate-key catch comes one-for-one out of the accepted
-    # pool, so the maximum is exactly the fixture with none
+    # 80.8939% is reached only where no flip in a key can produce a key another entry holds, which means
+    # ZERO duplicate-key refusals -- each such catch comes one-for-one out of the accepted pool
     blob, _keys = _separated41()
     assert len(blob) == 2036, ("the maximum is quoted at the same size", len(blob))
     different, identical, reasons = _sweep_with_the_trailer_recomputed(blob)

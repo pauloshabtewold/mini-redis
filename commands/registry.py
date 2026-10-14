@@ -7,9 +7,8 @@ from typing import Any, NamedTuple
 import resp
 from store import Store, WrongTypeError
 
-# the second element is a list and never None, so the drain loop can append to it
-# unconditionally and the contract test has exactly one shape to assert -- every handler
-# returns this pair, not only the ones that change something
+# the second element is a list and never None, so the drain loop appends unconditionally and the
+# contract test has one shape to assert: every handler returns this pair, not only the writers
 Effects = list[list[bytes]]
 Reply = tuple[bytes, Effects]
 Handler = Callable[[Store, Any, list[bytes]], Reply]
@@ -54,7 +53,7 @@ def command(name: bytes, arity: int, kind: Kind) -> Callable[[Handler], Handler]
 
     def register(handler: Handler) -> Handler:
         if canonical in COMMANDS:
-            # a silent replacement would produce a command that exists, answers, and answers from the wrong handler -- no arity check and no tag check can see it
+            # a silent replacement answers from the wrong handler, which no arity or tag check can see
             raise ValueError(f"command {canonical!r} already registered")
         COMMANDS[canonical] = Command(canonical, arity, kind, handler)
         return handler
@@ -72,19 +71,19 @@ def dispatch(store: Store, conn: Any, argv: list[bytes]) -> Reply:
     canonical = argv[0].upper()
     cmd = COMMANDS.get(canonical)
     if cmd is None:
-        # argv[0] is client-controlled bytes and a multibulk name may legally contain \r\n; an unmapped name would otherwise split one error frame into two and desynchronise every later reply on this connection
+        # argv[0] is the client's and a multibulk name may hold \r\n, which would split one error
+        # frame into two and desynchronise every later reply on this connection
         name = argv[0].replace(b"\r", b" ").replace(b"\n", b" ")
         return resp.encode_error(b"ERR unknown command '" + name + b"'"), []
 
-    # positive arity is exact, negative is a minimum, both counting the command name -- an upper bound is the handler's own check
+    # positive arity is exact, negative a minimum, both counting the name; an upper bound is the
+    # handler's own check
     ok = len(argv) == cmd.arity if cmd.arity >= 0 else len(argv) >= -cmd.arity
     if not ok:
         return wrong_arity(cmd.name), []
 
-    # WRONGTYPE is the store's fact and the dispatcher's reply, so no handler is given the
-    # chance to forget it -- a forgotten check surfaces instead as a TypeError the
-    # per-connection boundary turns into a closed connection, a client error reported as a
-    # server fault
+    # WRONGTYPE is the store's fact and the dispatcher's reply, so no handler can forget it: a
+    # forgotten check surfaces instead as a TypeError that closes the connection
     try:
         return cmd.handler(store, conn, argv)
     except WrongTypeError as exc:

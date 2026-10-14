@@ -25,12 +25,8 @@ _INLINE_SEPARATORS = frozenset({b" ", b"\n", b"\r", b"\t"})
 # a bulk length has its own, configurable ceiling: parse_bulk_element's max_value_size parameter
 MAX_MULTIBULK_COUNT = 2**31 - 1
 
-# the reference's PROTO_INLINE_MAX_SIZE. unlike the two configurable caps above, this one takes no
-# flag: no CLI flag covers the inline limit, and MAX_MULTIBULK_COUNT above is the in-repo
-# precedent for a reference-owned ceiling stated as a constant rather than threaded as a
-# parameter. it bounds only a line that has *ended* -- an unterminated line is a different case,
-# left deliberately unbounded in size here and bounded in time by --incomplete-command-timeout,
-# because a line with no terminator yet has no declared length to compare against anything
+# the reference's PROTO_INLINE_MAX_SIZE, a constant and not a flag like the two caps above; it
+# bounds an ended line only, an unterminated one being bounded by --incomplete-command-timeout
 MAX_INLINE_SIZE = 64 * 1024
 TOO_BIG_INLINE = b"ERR Protocol error: too big inline request"
 
@@ -81,7 +77,7 @@ def parse_command(
     N steps rather than N per element. This is the whole-command form, over
     those same two primitives.
     """
-    # memoryview has neither .find() nor .split(), so normalize once so the rest of this module can scan and slice buf uniformly.
+    # memoryview has neither .find() nor .split(), so normalise once and the rest can scan alike
     if isinstance(buf, memoryview):
         buf = bytes(buf)
     if buf[0:1] == b"*":
@@ -94,7 +90,8 @@ def parse_command(
 
 
 def _parse_length(field: bytes | bytearray, error_message: bytes) -> int:
-    # isdigit() is False for a leading "-" as well as for any non-digit content, so "negative" and "not a decimal integer" collapse into the one check the shared error message already implies.
+    # isdigit() is False for a leading "-" too, so "negative" and "not a decimal integer" collapse
+    # into the one check the shared error message already implies
     if not field.isdigit():
         raise ProtocolError(error_message)
     # real Redis reads both fields with string2ll, which takes "0" only as the whole field and otherwise
@@ -104,7 +101,8 @@ def _parse_length(field: bytes | bytearray, error_message: bytes) -> int:
     try:
         return int(field)
     except ValueError:
-        # isdigit() passes digit strings longer than CPython will convert, 4300 by default, and an escaping ValueError kills the process instead of the connection
+        # isdigit() passes digit strings past CPython's 4300-digit conversion limit, and an escaping
+        # ValueError kills the process instead of the connection
         raise ProtocolError(error_message) from None
 
 
@@ -124,22 +122,20 @@ def parse_multibulk_header(
     `search_from` resumes a terminator search that already came up empty; see
     parse_command. The count itself is always read from byte 1, whatever it says.
     """
-    # clamped like parse_bulk_element's: bytes.find reads a negative start as an
-    # offset from the end, which turns a complete header into "need more data" and
-    # hangs the caller. no call site can pass one today; the asymmetry is the risk
+    # clamped: bytes.find reads a negative start as an offset from the end, which turns a complete
+    # header into "need more data" and hangs the caller
     header_end = buf.find(CRLF, max(0, search_from))
     if header_end == -1:
         return (0, 0, 0)
-    # a negative count is refused here, where real Redis consumes a syntactically valid count of zero or less silently and answers nothing -- a deliberate divergence, and the reason this call is not special-cased around the sign. "syntactically valid" is the whole rule: string2ll refuses -0 there as it does here, so the two agree on -0 and on 0 and part only on -1 and below
+    # a negative count is refused here where real Redis consumes it silently: a deliberate
+    # divergence, and the two still agree on -0 and on 0, parting only at -1 and below
     invalid_count = b"ERR Protocol error: invalid multibulk length"
     count = _parse_length(buf[1:header_end], invalid_count)
     if count > MAX_MULTIBULK_COUNT:
         # refused at the header, as the reference does, rather than read one command later as an element
         raise ProtocolError(invalid_count)
-    # a second, separate check rather than one folded comparison: MAX_MULTIBULK_COUNT is the
-    # reference's unconditional ceiling and must still hold when max_multibulk is switched off
-    # (0) -- folding the two into e.g. min(...) would make the hard ceiling disappear exactly
-    # when it is needed most
+    # a separate check and not one folded comparison: MAX_MULTIBULK_COUNT is unconditional and has
+    # to hold with max_multibulk switched off, where a min(...) would drop the hard ceiling
     if max_multibulk and count > max_multibulk:
         raise ProtocolError(invalid_count)
     return (count, header_end + 2, 0)
@@ -161,7 +157,8 @@ def parse_bulk_element(
         # the type byte alone decides between an element and a protocol error, so one byte is progress
         return (None, 0, 1)
     if buf[0:1] != b"$":
-        # the byte is the client's and this message goes on the wire, so a raw \r or \n in it would split one error frame into two exactly as an unsanitized command name would in registry.dispatch
+        # the byte is the client's and this goes on the wire, so a raw \r or \n in it would split
+        # one error frame into two
         got = bytes(buf[0:1]).replace(b"\r", b" ").replace(b"\n", b" ")
         raise ProtocolError(b"ERR Protocol error: expected '$', got '%s'" % got)
     # never below 1: byte 0 is the `$`, and a resume position is only ever a floor
@@ -171,13 +168,11 @@ def parse_bulk_element(
     length = _parse_length(
         buf[1:header_end], b"ERR Protocol error: invalid bulk length"
     )
-    # the cap fires here, before body_start/body_end exist: past that point the declared
-    # length has already become the `needed` hint connection.py stores as _parse_needed,
-    # which is the buffer-growth commitment -- a check placed after it has already agreed
-    # to hold the oversized body
+    # the cap fires before body_end exists: past that point the declared length has become the
+    # `needed` hint, which is the commitment to buffer the oversized body
     if max_value_size and length > max_value_size:
         raise ProtocolError(b"ERR Protocol error: invalid bulk length")
-    # a bulk body may legally contain \r\n, and searching for it truncates the value, so the end is computed from the declared length
+    # a bulk body may legally hold \r\n, so the end comes from the declared length, not a search
     body_start = header_end + 2
     body_end = body_start + length
     if len(buf) < body_end + 2:
@@ -194,9 +189,8 @@ def _parse_multibulk(
     max_value_size: int = 0,
     max_multibulk: int = 0,
 ) -> tuple[list[bytes] | None, int, int]:
-    # the whole-command form, over the same two primitives Connection drives one step at a time, so there is one grammar here rather than two that can disagree
-    # search_from reaches the header only: every element below is parsed from a fresh
-    # slice whose own header starts at byte zero, so no resume position applies to it
+    # the whole-command form over the two primitives Connection drives, so there is one grammar
+    # search_from reaches the header only: each element is parsed from a slice starting at byte zero
     count, consumed, needed = parse_multibulk_header(buf, search_from, max_multibulk=max_multibulk)
     if consumed == 0:
         return (None, 0, needed)
@@ -228,15 +222,15 @@ def _is_hex_escape(line: bytes, index: int) -> bool:
 
 
 def _terminated(line: bytes, index: int) -> bool:
-    # sdssplitargs scans a NUL-terminated string, so running off the end and meeting a NUL are the
-    # same fact in every state below -- including inside quotes, where the terminator is what makes
-    # them unbalanced, and after a closing quote, where it is what makes the field well formed
+    # sdssplitargs scans a NUL-terminated string, so running off the end and meeting a NUL are one
+    # fact in every state below, inside quotes as well as after a closing one
     char = line[index:index + 1]
     return not char or char == b"\x00"
 
 
 def _split_inline(line: bytes) -> list[bytes]:
-    # real Redis's sdssplitargs rather than bytes.split(): a quoted field is one argument however many spaces it holds, and an unbalanced quote is a protocol error rather than a token
+    # sdssplitargs and not bytes.split(): a quoted field is one argument however many spaces it
+    # holds, and an unbalanced quote is a protocol error rather than a token
     fields = []
     index = 0
     while True:
@@ -262,7 +256,7 @@ def _split_inline(line: bytes) -> list[bytes]:
                     index += 1
                     field += _INLINE_ESCAPES.get(line[index], line[index:index + 1])
                 elif char == b'"':
-                    # a closing quote ends the argument, so anything but a separator after it is a field this grammar cannot represent
+                    # a closing quote ends the argument: a non-separator after it cannot be built
                     if not _terminated(line, index + 1) and not line[index + 1:index + 2].isspace():
                         raise ProtocolError(UNBALANCED_QUOTES)
                     done = True
@@ -308,15 +302,11 @@ def _parse_inline(
 ) -> tuple[list[bytes] | None, int, int]:
     newline = buf.find(b"\n", search_from)
     if newline == -1:
-        # a line that never ends has no declared length yet to compare against anything --
-        # deliberately left unbounded here. --incomplete-command-timeout answers everything
-        # unterminated, by closing a connection that has held one too long: this parser has no clock
+        # a line that never ends has no declared length to compare against, so it is unbounded here
+        # and answered by --incomplete-command-timeout: this parser has no clock
         return (None, 0, 0)
-    # measured off the newline index, ahead of both the slice below (buf[:newline] would copy
-    # a multi-MiB line just to learn it is refused) and _split_inline (which would have already
-    # built the field list the reply quotes). the \r of a \r\n pair is framing, not
-    # content, and is not counted, so a line of exactly MAX_INLINE_SIZE bytes is accepted
-    # rather than refused one byte early
+    # off the newline index, ahead of the slice that would copy a multi-MiB line to refuse it; the
+    # \r of a \r\n is framing and uncounted, so exactly MAX_INLINE_SIZE bytes is accepted
     line_length = newline - 1 if buf[newline - 1:newline] == b"\r" else newline
     if line_length > MAX_INLINE_SIZE:
         raise ProtocolError(TOO_BIG_INLINE)

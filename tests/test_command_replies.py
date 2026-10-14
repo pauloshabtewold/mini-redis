@@ -84,10 +84,8 @@ def test_hello_reports_the_replication_role_not_the_connection_role():
 
 
 def test_hello_answers_with_no_connection_at_all():
-    # conn is None whenever dispatch is driven with no socket, which is this project's
-    # own convention for in-process use and what conftest's r() helper is built on. INFO
-    # guards it for connected_clients; HELLO did not, and raised AttributeError on the
-    # one field that names a connection rather than answering an id of zero
+    # conn is None whenever dispatch is driven with no socket: HELLO raised AttributeError on the one
+    # field that names a connection rather than answering an id of zero
     store = Store()
     response, effects = commands.dispatch(store, None, [b"HELLO"])
     assert b"$2\r\nid\r\n:0\r\n" in response
@@ -175,11 +173,8 @@ def test_a_duplicate_registration_is_refused_rather_than_shadowing():
 
 
 def test_these_handlers_return_bytes_in_the_reply_slot_and_write_nothing_to_the_socket():
-    # a fixed set of argv rather than a sweep of the registry -- test_handler_contract.py
-    # drives every registered command from its own arity, and duplicating that here would
-    # be a second traversal to keep in step with the first. What this adds is the socket:
-    # the command layer never touches one: a handler that wrote to one would make a follower
-    # replaying its leader's stream through this same dispatcher, producing no replies, impossible
+    # a fixed set of argv rather than a sweep of the registry; what this adds is the socket -- a handler
+    # that wrote to one would make a follower replaying its leader's stream impossible
     class Recording:
         def __init__(self):
             self.writes = []

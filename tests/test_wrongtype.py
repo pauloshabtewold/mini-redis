@@ -91,9 +91,8 @@ def test_ttl_and_pttl_are_type_agnostic(store, key):
 
 
 def test_an_expired_key_reads_as_missing_rather_than_wrongtype(store):
-    # Store.lookup() checks the deadline before the kind, so a key that is both logically
-    # expired and of the wrong kind reads as missing. test_store.py pins this ordering for
-    # a key that was never there; this pins it for one that expired
+    # Store.lookup() checks the deadline before the kind, so a key both logically expired and of the
+    # wrong kind reads as missing
     store.expire_at(b"l", FROZEN - 1)
     assert commands.dispatch(store, None, [b"GET", b"l"]) == (b"$-1\r\n", [])
     assert store.take_effects() == [[b"DEL", b"l"]], (

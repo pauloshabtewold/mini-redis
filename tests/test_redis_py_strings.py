@@ -123,10 +123,8 @@ def test_execute_command_incr_and_decr_work_while_the_helper_methods_do_not(redi
 
 
 def test_the_four_later_set_options_survive_the_wire(redis_client):
-    # EX/PX/NX/XX have had wire coverage since this module was written; GET, KEEPTTL, EXAT
-    # and PXAT arrived later and had none -- every test of them drove commands.dispatch()
-    # directly, which never encodes or decodes a byte. That is the half where two real
-    # defects were found, so the parse-it-off-the-wire half is the half worth pinning
+    # GET, KEEPTTL, EXAT and PXAT arrived after this module and had no wire coverage -- every test of
+    # them drove commands.dispatch() directly, which is where two real defects were found
     r = redis_client
     assert r.set("w:get", "first") is True
     assert r.set("w:get", "second", get=True) == b"first", "GET returns the replaced value"
@@ -139,10 +137,8 @@ def test_the_four_later_set_options_survive_the_wire(redis_client):
     assert r.set("w:keep", "x") is True
     assert r.ttl("w:keep") == -1, "a plain SET must still discard it"
 
-    # EXAT/PXAT are absolute where EX/PX are durations; redis-py sends them as datetimes or
-    # ints, and an int is the shape that reaches the wire unchanged
-    # execute_command still runs redis-py's own SET response callback, so the reply comes
-    # back as True rather than b"OK" -- the deadline it set is the thing worth asserting
+    # EXAT/PXAT are absolute where EX/PX are durations, and an int is the shape that reaches the wire
+    # unchanged; execute_command still runs redis-py's SET callback, so the reply is True and not b"OK"
     far = int(time.time()) + 1000
     assert r.execute_command("SET", "w:exat", "v", "EXAT", far) is True
     assert 900 < r.ttl("w:exat") <= 1000, "EXAT is absolute seconds, not a duration"

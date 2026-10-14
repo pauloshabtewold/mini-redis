@@ -22,17 +22,14 @@ import pytest
 from connection import Connection
 from tests.test_server_lifecycle import listening, pump
 
-# a self-imposed budget per read phase, never pytest.mark.timeout -- consistent with
-# tests/test_incr_atomicity.py, the only other module in this suite driving a real
-# socket to a deadline
+# a self-imposed budget per read phase, never pytest.mark.timeout
 DEADLINE_SECONDS = 60
 
 # the count each test's name commits to
 PIPELINE_COUNT = 1000
 
-# one 8 MiB payload, allocated once at module level and shared by the round-trip test
-# and the drain witness -- neither keeps a second copy of it beyond the bytes a reply
-# comparison needs
+# one 8 MiB payload allocated once at module level and shared by the round-trip test and the drain
+# witness, with no second copy beyond what a reply comparison needs
 LARGE_VALUE = os.urandom(8 << 20)
 
 
@@ -44,11 +41,8 @@ def assert_stream_matches(assembled, values, capture_dir=None):
     expected = expected_bulk_stream(values)
     if assembled == expected:
         return
-    # a mismatch here has happened three times in this suite's life, only ever under
-    # several suites at once, and never since -- with no cause established and nothing
-    # kept from the runs that failed. so the bytes are kept now, beside the classification
-    # that says which of the three shapes this is, because the next occurrence is the only
-    # evidence there will be and a failure message alone threw away the payload it needed
+    # the mismatch has happened three times, only under several suites at once, with nothing kept from
+    # the runs that failed: the bytes and the classification are the only evidence there will be
     report = [_classify_stream(assembled, expected)]
     if capture_dir is not None:
         got_path = pathlib.Path(capture_dir) / "received.bin"
@@ -60,10 +54,8 @@ def assert_stream_matches(assembled, values, capture_dir=None):
 
 
 def _classify_stream(assembled, expected):
-    # the three shapes worth telling apart: the stream slid against what was asked for,
-    # it carries a whole value that was never sent on this connection, or it is simply
-    # short. each points somewhere different, and the first differing byte alone does not
-    # say which
+    # the three shapes worth telling apart -- the stream slid, it carries a whole value never sent on
+    # this connection, or it is short -- which the first differing byte alone does not say
     shared = min(len(assembled), len(expected))
     for i in range(shared):
         if assembled[i] != expected[i]:
@@ -123,9 +115,8 @@ def _inproc_write_interest(server, conn):
 
 
 def _inproc_feed(server, client, payload, seconds=DEADLINE_SECONDS):
-    # non-blocking and interleaved with pump(): a plain sendall() of a payload this
-    # size blocks on the client's own kernel buffer once it fills, and nothing drains
-    # that buffer but the server's own read, which only a pump() drives here
+    # non-blocking and interleaved with pump(): a plain sendall() of this size blocks once the client's
+    # own kernel buffer fills, and only the server's read drains it
     client.setblocking(False)
     pos, deadline = 0, time.monotonic() + seconds
     while pos < len(payload) and time.monotonic() < deadline:
@@ -205,12 +196,8 @@ def test_an_eight_mebibyte_value_round_trips_byte_exact_in_both_directions(
 
 @pytest.mark.parametrize("seed", range(24))
 def test_a_large_value_reassembles_byte_exact_however_its_bytes_are_chunked(seed):
-    # what several suites at once change about this path is nothing the server chooses:
-    # it is the size of each recv(), which the kernel decides under load. so the chunk
-    # boundaries are moved deliberately here -- a byte at a time, a megabyte at a time,
-    # and sizes that land inside the header, inside the body and astride the trailing
-    # CRLF -- and the value the parser hands back has to equal the value that was sent,
-    # whichever boundary each piece fell on
+    # what parallel suites change is the size of each recv(), which the kernel decides, so the chunk
+    # boundaries are moved deliberately -- inside the header, inside the body, astride the trailing CRLF
     rng = random.Random(seed)
     payload = rng.randbytes(1 << 20)
     frame = _encode_command(b"SET", b"big", payload)
@@ -236,9 +223,8 @@ def test_a_large_value_reassembles_byte_exact_however_its_bytes_are_chunked(seed
 
 @pytest.mark.parametrize("seed", range(8))
 def test_a_large_reply_drains_byte_exact_however_the_socket_short_writes(seed):
-    # the same question on the way out: the number of bytes each send() takes is the
-    # kernel's to choose, and under load it chooses differently. the reply the peer
-    # assembles has to be the reply that was queued, whatever the split
+    # the same question on the way out: the bytes each send() takes are the kernel's to choose, and the
+    # reply the peer assembles has to be the reply that was queued
     rng = random.Random(seed)
     reply = b"$%d\r\n%s\r\n" % (1 << 20, rng.randbytes(1 << 20))
     first, second = socket.socketpair()
@@ -250,10 +236,8 @@ def test_a_large_reply_drains_byte_exact_however_the_socket_short_writes(seed):
     try:
         conn.queue(reply)
         got = bytearray()
-        # bounded by rounds that achieve nothing rather than by a clock: a drain that
-        # loses a byte never reaches the reply's length, and waiting out a wall-clock
-        # deadline to learn that costs a minute per seed where a stalled round says it
-        # at once
+        # bounded by rounds that achieve nothing rather than by a clock: a drain that loses a byte never
+        # reaches the reply's length, and a wall-clock deadline costs a minute per seed to learn it
         idle_rounds = 0
         while len(got) < len(reply) and idle_rounds < 100:
             before = (len(conn.write_buffer), len(got))
@@ -319,10 +303,8 @@ def test_a_reply_too_large_for_one_send_is_queued_and_drained_across_writable_ev
 # --- the write side's own syscall count, and the local helper that counts it ----------
 
 
-# swapped onto a live connection after accept: send() still reaches the real socket, so
-# what the client receives is untouched -- this only counts how many times flush() had
-# to call into it, which is what turns "one flush for the whole batch" from an inference
-# about buffer sizes into a count of syscalls
+# swapped onto a live connection after accept: send() still reaches the real socket, so this only counts
+# how many times flush() called into it, turning "one flush per batch" into a count of syscalls
 class _SendCounter:
     def __init__(self, sock):
         self._sock = sock
@@ -343,10 +325,8 @@ class _SendCounter:
 
 
 def test_a_pipelined_batch_is_flushed_once_not_once_per_command():
-    # short keys and a count well under RECV_SIZE (65536 in connection.py): the whole
-    # request has to land in one recv() for take_commands() to hand _dispatch_batch
-    # every command in a single call -- a batch that arrived split would cost two
-    # honest flushes, which is not the defect this test exists to catch
+    # short keys and a count well under RECV_SIZE (65536): the whole request has to land in one recv()
+    # or a split batch would cost two honest flushes, which is not the defect this exists to catch
     count = 200
     keys = [b"k%d" % i for i in range(count)]
     values = [b"v%d" % i for i in range(count)]
@@ -365,9 +345,8 @@ def test_a_pipelined_batch_is_flushed_once_not_once_per_command():
         client.setblocking(False)
         reply = _inproc_read_exactly(server, client, len(expected))
 
-        # byte-exact equality against `count` copies of +OK only holds if the batch
-        # really carried `count` commands and came back with `count` replies -- so
-        # send_calls == 1 below cannot pass vacuously against a batch that never formed
+        # byte-exact equality against `count` copies of +OK holds only if the batch carried `count`
+        # commands, so send_calls == 1 below cannot pass vacuously
         assert reply == expected, (len(reply), len(expected))
         # asserted inside the block: _close flushes once more on the way out, and a
         # count taken after that is a count of the batch plus the teardown

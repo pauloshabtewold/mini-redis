@@ -24,9 +24,8 @@ SEED = 20260821
 ROUNDS = 500
 
 KEYS = [b"a", b"b", b"c"]
-# two shapes of each kind: bytes empty/non-empty as before, and now a deque empty/non-empty
-# alongside them, so a write can land either kind and the corpus can reach a keyspace that
-# holds both at once
+# two shapes of each kind -- bytes empty/non-empty and deque empty/non-empty -- so the corpus can
+# reach a keyspace holding both at once
 VALUES = [b"", b"v", b"value", b"\x00\xff", deque(), deque([b"v"])]
 # both sides of "now", and exactly on it -- so lookup's expiry branch and its live branch
 # both fire, and the boundary itself (a deadline equal to now_ms() is expired) gets exercised
@@ -52,9 +51,8 @@ def _random_sequence(rnd):
 
 
 def _apply(store, op):
-    # returns lookup's result so the caller can check its one extra property; every other
-    # op returns None, which never collides with a real lookup result because the caller
-    # only inspects the return value when op[0] == "lookup"
+    # returns lookup's result so the caller can check its one extra property; every other op returns
+    # None, which never collides because the caller only inspects it when op[0] == "lookup"
     name, key = op[0], op[1]
     if name == "write":
         _, _, value, keep_ttl = op
@@ -74,12 +72,8 @@ def _apply(store, op):
     elif name == "take_effects":
         store.take_effects()
     elif name == "sample_and_expire":
-        # the key _random_sequence attached to this op is unused: a sample draws from
-        # the whole index rather than acting on the one key every other op takes, the
-        # same shape "take_effects" already has above. the count passed is the size of
-        # the whole key alphabet, never smaller than the index could possibly be, which
-        # keeps this landing on sample_and_expire's own population clamp whenever fewer
-        # than all three keys currently carry a deadline
+        # the key is unused here: a sample draws from the whole index. the count is the size of the key
+        # alphabet, so it keeps landing on sample_and_expire's own population clamp
         store.sample_and_expire(len(KEYS))
     return None
 
@@ -91,9 +85,8 @@ def _assert_invariants_hold(store, op, result):
     for slot, key in enumerate(store._expiry_keys):
         assert store._expiry_slots.get(key) == slot
     for value in store._data.values():
-        # delegates to the store's own definition of a recognized kind rather than
-        # re-listing types here, so this stays honest as a third kind arrives: kind_of()
-        # raises for anything it does not recognize, which is this invariant's failure
+        # delegates to the store's own definition of a recognized kind rather than re-listing types
+        # here: kind_of() raises for anything it does not recognize, which is this invariant's failure
         store.kind_of(value)
     for effect in store._effects:
         assert len(effect) == 2 and effect[0] == b"DEL" and type(effect[1]) is bytes, effect
@@ -118,9 +111,8 @@ def test_random_operation_sequences_preserve_the_stores_invariants():
 
 
 def test_random_operation_sequences_reach_a_mixed_kind_keyspace():
-    # VALUES carries both bytes and deque shapes. Without this, widening it is a change a
-    # green suite can't tell apart from a no-op: every invariant above holds just as well
-    # over a keyspace that happens to never mix kinds as it does over one that does
+    # without this, widening VALUES is a change a green suite cannot tell from a no-op: every invariant
+    # above holds just as well over a keyspace that never mixes kinds
     rnd = random.Random(SEED)
     mixed_rounds = 0
     for _ in range(ROUNDS):
@@ -135,9 +127,8 @@ def test_random_operation_sequences_reach_a_mixed_kind_keyspace():
 
 
 def test_random_operation_sequences_move_a_key_out_of_a_middle_sampling_slot():
-    # exercised only when the removed key sits in a middle slot and the index holds more
-    # than one key -- a corpus that never grows the index past one entry would leave the
-    # swap-delete's relocation branch untested while every invariant above still holds
+    # exercised only when the removed key sits in a middle slot with more than one key indexed, or the
+    # swap-delete's relocation branch stays untested while every invariant above holds
     rnd = random.Random(SEED)
     moved_rounds = 0
     for _ in range(ROUNDS):

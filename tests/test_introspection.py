@@ -54,9 +54,8 @@ def test_keys_star_lists_every_key_regardless_of_kind(store, conn):
 
 
 def test_dbsize_excludes_an_expired_key_without_deleting_it():
-    # routed through live_count() rather than the shared expiry-aware lookup: DBSIZE and
-    # KEYS are the deliberate exception, because a count or a listing that deletes what
-    # it scanned past would be a read command mutating the keyspace
+    # routed through live_count() rather than the expiry-aware lookup: DBSIZE and KEYS are the deliberate
+    # exception, because a count or listing that deleted what it scanned would be a read that mutates
     s = FrozenStore()
     s.write(b"gone", b"v", keep_ttl=False)
     s.expire_at(b"gone", FROZEN - 1)
@@ -112,13 +111,8 @@ def test_keys_glob_grammar(store, conn, pattern, preload, expected):
 
 
 @pytest.mark.parametrize("pattern, preload, expected", [
-    # every expectation here is redis-server 7.2.7's own answer to the same pattern over
-    # the same keys. A class with no closing `]` runs the matcher off the end of the
-    # pattern, and the reference handles it by stepping back one byte and treating what
-    # it has seen as the whole class -- three separate guards in `_match_atom` implement
-    # that, and mutation testing found none of them covered: widening the range branch's
-    # length test, or dropping the backslash guard, raises IndexError and closes the
-    # connection, and dropping the step-back silently answers nothing at all
+    # every expectation is redis-server 7.2.7's answer. an unclosed class runs the matcher off the end,
+    # and the three guards in _match_atom that step back are uncovered otherwise: IndexError, or nothing
     (b"[", [b"a", b"[", b"[a", b""], []),
     (b"[^", [b"a", b"^", b"[^", b""], [b"^", b"a"]),
     (b"[a", [b"a", b"b", b"[a", b"[", b""], [b"a"]),
@@ -148,12 +142,8 @@ def test_keys_matches_a_character_class_that_is_never_closed(
 
 
 @pytest.mark.parametrize("pattern, preload, expected", [
-    # again the reference's own answers. Every case needs the `*` to be retried at a key
-    # position more than one byte along, which is the half of the backtracker the ten
-    # grammar cases above never reach: `[aL]*` and `[^a]*` let their star consume zero
-    # bytes or one and never make it back off and try again. Recording the star one byte
-    # late -- `star_k = k + 1` -- leaves every one of these answering only its shortest
-    # match, and the whole suite stays green without this
+    # again 7.2.7's own answers. every case needs the `*` retried more than one byte along, which the ten
+    # grammar cases never reach: `star_k = k + 1` leaves each answering only its shortest match
     (b"a*b", [b"ab", b"axb", b"axyb", b"axyzb", b"ab_", b"a", b"b"],
      [b"ab", b"axb", b"axyb", b"axyzb"]),
     (b"a**b", [b"ab", b"axb", b"axyzb", b"a", b"b"], [b"ab", b"axb", b"axyzb"]),
@@ -178,10 +168,8 @@ def test_keys_extends_a_star_across_several_bytes_before_the_rest_matches(
 
 
 def test_keys_star_matches_an_empty_string_key(store, conn):
-    # this used to answer *0 even though the empty key was live and DBSIZE counted it.
-    # The answer now comes from keys()'s one-byte-'*' short-circuit rather than from the
-    # matcher, which is where the reference's comes from -- so the test below can pin
-    # both halves separately without this one changing whichever half supplies it
+    # this used to answer *0 for a live empty key DBSIZE counted. the answer now comes from keys()'s
+    # one-byte-'*' short-circuit, which is where the reference's comes from, and the test below pins both
     commands.dispatch(store, conn, [b"SET", b"", b"v"])
     assert commands.dispatch(store, conn, [b"DBSIZE"]) == (b":1\r\n", [])
     reply, effects = commands.dispatch(store, conn, [b"KEYS", b"*"])
@@ -197,11 +185,8 @@ def test_keys_star_matches_an_empty_string_key(store, conn):
     (b"", [b""]),
 ], ids=["single-star", "double-star", "triple-star", "star-plus-content", "empty"])
 def test_keys_star_variants_against_an_empty_string_key(store, conn, pattern, expected):
-    # measured against redis-server 7.2.7 on each of these five: an empty key matches
-    # only the empty pattern and the one-byte '*'. The two are answered by different
-    # things -- the empty pattern by the matcher, '*' by keys()'s short-circuit -- and
-    # every longer run of stars matches nothing, because the reference's matcher loop is
-    # guarded on the string having bytes left and never consumes them
+    # measured against redis-server 7.2.7: an empty key matches only the empty pattern and the one-byte
+    # '*' -- the first through the matcher, the second through keys()'s short-circuit; longer runs match none
     commands.dispatch(store, conn, [b"SET", b"", b"v"])
     reply, effects = commands.dispatch(store, conn, [b"KEYS", pattern])
     assert effects == []
@@ -209,18 +194,16 @@ def test_keys_star_variants_against_an_empty_string_key(store, conn, pattern, ex
 
 
 def test_the_matcher_itself_refuses_every_star_pattern_against_an_empty_key(store, conn):
-    # the layer below the test above: keys()'s short-circuit is the only reason '*' lists
-    # an empty key, so a repair that moved the answer back into the matcher would pass
-    # every KEYS assertion here and still diverge from the reference on '**'
+    # the layer below: keys()'s short-circuit is the only reason '*' lists an empty key, so a repair that
+    # moved the answer into the matcher would pass every KEYS assertion and still diverge on '**'
     assert _glob_match(b"", b"") is True
     for pattern in (b"*", b"**", b"***", b"*a", b"?"):
         assert _glob_match(pattern, b"") is False, pattern
 
 
 @pytest.mark.parametrize("pattern, preload, expected", [
-    # a range straddling 0x80 is read signed, as the reference reads it: 'a' is 97 and
-    # \xff is -1, so the swap fires and the range is -1..97 -- every byte at or below 'a'
-    # plus \xff, and not 'b', 'c' or \x80
+    # a range straddling 0x80 is read signed, as the reference reads it: 'a' is 97 and \xff is -1, so the
+    # swap fires and the range is -1..97 -- every byte at or below 'a' plus \xff, not 'b', 'c' or \x80
     (b"[a-\xff]", [b" ", b"0", b"a", b"b", b"c", b"\x7f", b"\x80", b"\xff"],
      [b" ", b"0", b"a", b"\xff"]),
     # written the other way round it is the same range, because the swap normalises it
@@ -240,10 +223,8 @@ def test_the_matcher_itself_refuses_every_star_pattern_against_an_empty_key(stor
 def test_keys_class_ranges_read_bytes_the_way_the_reference_does(
     store, conn, pattern, preload, expected
 ):
-    # measured against redis-server 7.2.7. It walks pattern and key through `char`, which
-    # is signed on every platform this is measured on, so a range with exactly one
-    # endpoint at or above 0x80 orders its endpoints differently than an unsigned reading
-    # would. Only ordering is affected -- equality survives either reading
+    # measured against redis-server 7.2.7, which walks pattern and key through a signed `char`: a range
+    # with exactly one endpoint at or above 0x80 orders its endpoints differently. equality is unaffected
     for key in preload:
         commands.dispatch(store, conn, [b"SET", key, b"v"])
     reply, effects = commands.dispatch(store, conn, [b"KEYS", pattern])
@@ -252,19 +233,8 @@ def test_keys_class_ranges_read_bytes_the_way_the_reference_does(
 
 
 def test_keys_matching_against_many_non_consecutive_stars_stays_fast(store, conn):
-    # a naive backtracking matcher retries every split point at every '*', which is
-    # exponential in the number of stars rather than in pattern length -- 20 stars
-    # against a key with no trailing 'y' took 10.8s on the machine this was measured
-    # on, next to single-digit milliseconds for the matcher that shipped. That matcher
-    # keeps one resume point rather than a memo: the most recent '*' and how far into
-    # the key it has been extended, retried a byte at a time. Memoising (pattern index,
-    # key index) pairs bounds the same blow-up but leaves a stack frame per star group,
-    # which is what the sibling test below covers. The budget sits far under that 10.8s
-    # so a real regression still fails it, with enough room above a healthy run that a
-    # loaded machine does not flake it. A second key that the same pattern does match
-    # sits in the same store, so a matcher that is fast only because it is also wrong
-    # -- for instance one that always answers "no match" -- cannot pass by returning a
-    # coincidentally cheap answer
+    # naive backtracking is exponential in the number of stars: 20 stars against a key with no trailing
+    # 'y' took 10.8s where the shipped matcher took single-digit ms. a key that does match is the control
     commands.dispatch(store, conn, [b"SET", b"x" * 25, b"v"])
     commands.dispatch(store, conn, [b"SET", b"x" * 24 + b"y", b"v"])
     pattern = (b"*x" * 20) + b"y"
@@ -279,11 +249,8 @@ def test_keys_matching_against_many_non_consecutive_stars_stays_fast(store, conn
 
 
 def test_keys_matching_against_thousands_of_non_consecutive_stars_does_not_recurse(store, conn):
-    # each non-consecutive '*' cost one Python stack frame in an earlier version of this
-    # matcher, because retrying the rest of the pattern after a star went through a
-    # fresh recursive call rather than a loop -- a pattern built from enough of them
-    # raised RecursionError well below any pattern length a client could be stopped
-    # from sending. 2000 star groups sits well past where that used to break
+    # each non-consecutive '*' cost one Python stack frame when the retry recursed rather than looped, so
+    # enough of them raised RecursionError below any length a client can be stopped at; 2000 is well past
     star_groups = 2000
     matching = b"x" * (star_groups + 5) + b"y"
     other = b"x" * (star_groups + 5) + b"z"
@@ -331,10 +298,8 @@ def test_info_with_no_arguments_reports_every_section(store, conn):
     assert info["total_commands_processed"] == 0, "no server is attached to this connection"
     assert info["db0"] == {"keys": 1, "expires": 1}
     assert isinstance(info["used_memory"], int)
-    # exactly this field set: no uptime, which would need time.monotonic(), and no
-    # persistence fields, which would anticipate a feature this one does not build. the three
-    # that are here beyond the original five are the three redis-cli --stat reads and renders as
-    # LLONG_MIN when they are missing, which is what three of its six columns printed before
+    # exactly this field set: no uptime, which needs a monotonic clock, and no persistence fields. the three
+    # beyond the original five are what redis-cli --stat renders as LLONG_MIN when missing, three of six
     assert set(info) == {
         "redis_version", "connected_clients", "blocked_clients", "used_memory",
         "total_connections_received", "total_commands_processed", "role", "db0",
@@ -342,9 +307,8 @@ def test_info_with_no_arguments_reports_every_section(store, conn):
 
 
 def test_the_three_counters_stat_reads_are_zero_for_a_connection_no_server_accepted(store, conn):
-    # the same two-level guard connected_clients has, and for the same reason: conn is None for
-    # in-process dispatch and conn.server is None for a connection built rather than accepted.
-    # a counter that raised here would take INFO down on exactly the callers the guard is for
+    # the same two-level guard connected_clients has: conn is None for in-process dispatch, conn.server is
+    # None for a connection built rather than accepted, and a counter that raised would take INFO down
     for probe in (conn, None):
         response, _effects = commands.dispatch(store, probe, [b"INFO"])
         info = parse_info(response.split(b"\r\n", 1)[1][:-2].decode("ascii"))
@@ -387,9 +351,8 @@ def test_info_takes_more_than_one_section_name(store, conn):
 
 
 def _info_fields(store, conn, argv):
-    # the field names only, never their values: used_memory is a resident-memory
-    # high-water mark, so two INFO calls a moment apart can legitimately disagree on it
-    # and comparing whole bodies would make that a flaky test rather than a caught one
+    # the field names only, never their values: used_memory is a resident-memory high-water mark, so two
+    # INFO calls a moment apart can legitimately disagree and whole-body comparison would flake
     response, effects = commands.dispatch(store, conn, argv)
     assert effects == []
     body = response.split(b"\r\n", 1)[1][:-2]
@@ -398,9 +361,8 @@ def _info_fields(store, conn, argv):
 
 @pytest.mark.parametrize("selector", [b"all", b"everything", b"default", b"ALL", b"Default"])
 def test_info_whole_report_selectors_report_every_section(store, conn, selector):
-    # 'all', 'everything' and 'default' are the reference's selectors over the whole
-    # report, not section names -- and 'default' is what a bare INFO already means there,
-    # so a client spelling the bare form out used to get a zero-byte body back
+    # 'all', 'everything' and 'default' are the reference's whole-report selectors, not section names --
+    # and a client spelling out the bare form's own meaning used to get a zero-byte body back
     commands.dispatch(store, conn, [b"SET", b"k", b"v"])
     assert _info_fields(store, conn, [b"INFO", selector]) == _info_fields(
         store, conn, [b"INFO"]
@@ -466,9 +428,8 @@ def test_info_reads_connected_clients_through_the_slot():
 
 
 def test_info_reports_zero_connected_clients_with_no_server_attached():
-    # conn=None is this project's own convention for driving a handler with no socket at
-    # all -- tests/conftest.py's r() helper does exactly this -- and a bare Connection
-    # built directly rather than accepted carries the same None in its third slot
+    # conn=None is this project's convention for driving a handler with no socket -- conftest's r() does
+    # it -- and a bare Connection built rather than accepted carries the same None in its third slot
     response, _effects = commands.dispatch(Store(), None, [b"INFO", b"clients"])
     info = parse_info(response.split(b"\r\n", 1)[1].decode("ascii"))
     assert info["connected_clients"] == 0
@@ -488,11 +449,8 @@ def test_info_reports_zero_connected_clients_with_no_server_attached():
 
 
 def test_config_get_answers_a_real_parameter_from_the_table(store, conn):
-    # every value is a true statement about the server answering it. conn here was built
-    # rather than accepted, so no server is attached and nothing saves, which makes save's
-    # "" -- the reference's own snapshotting-off answer -- the true one; a server that
-    # does save is below. three of the five equal redis-server 7.2.7's own default because
-    # those are "off" too
+    # every value is a true statement about the server answering it: conn was built rather than accepted,
+    # so nothing saves and save's "" is the true answer. three of the five equal 7.2.7's own default
     assert commands.dispatch(store, conn, [b"CONFIG", b"GET", b"save"]) == (
         b"*2\r\n$4\r\nsave\r\n$0\r\n\r\n", [])
     assert commands.dispatch(store, conn, [b"CONFIG", b"GET", b"appendonly"]) == (
@@ -502,10 +460,8 @@ def test_config_get_answers_a_real_parameter_from_the_table(store, conn):
 
 
 def test_config_get_answers_an_unknown_parameter_with_an_empty_array(store, conn):
-    # not the name back with an empty value, which is what an echo would do: a name this
-    # server has never heard of is not a parameter that exists and happens to be unset,
-    # and a client cannot tell those apart from the reply. The reference answers the empty
-    # array here and so does this
+    # not the name back with an empty value, which is what an echo would do: a client cannot tell an
+    # unknown parameter from an unset one, and the reference answers the empty array here too
     assert commands.dispatch(store, conn, [b"CONFIG", b"GET", b"nosuchparam"]) == (
         b"*0\r\n", [])
     assert commands.dispatch(store, conn, [b"CONFIG", b"GET", b""]) == (b"*0\r\n", [])
@@ -521,9 +477,8 @@ def test_config_get_looks_an_exact_name_up_without_regard_to_case(store, conn):
 
 
 @pytest.mark.parametrize("pattern, expected", [
-    # a pattern is glob-matched over the table and answers canonical names, where an exact
-    # name is looked up and answers the client's spelling -- the reference draws the same
-    # line, and `*` is the form redis-py's own config_get() sends with no argument
+    # a pattern is glob-matched over the table and answers canonical names, where an exact name answers
+    # the client's spelling -- the reference's own line, and `*` is what redis-py's config_get() sends
     (b"*", [b"appendonly", b"no", b"databases", b"1", b"maxmemory", b"0",
             b"maxmemory-policy", b"noeviction", b"save", b""]),
     (b"maxmemory*", [b"maxmemory", b"0", b"maxmemory-policy", b"noeviction"]),
@@ -539,12 +494,8 @@ def test_config_get_glob_matches_a_pattern_over_the_table(store, conn, pattern, 
 
 
 @pytest.mark.parametrize("pattern, expected", [
-    # the fold happens inside the comparison and, for a class range, AFTER the low-high
-    # swap -- which is the reference's order and is what decides these. `[Z-a]` is 90..97,
-    # needs no swap, and folds to 122..97: an inverted range matching nothing. Lowering
-    # the pattern before matching instead would hand the swap `[z-a]`, which it corrects
-    # to 97..122, and `maxmemory` would match where redis-server 7.2.7 answers nothing.
-    # Every expectation below is 7.2.7's own answer
+    # the fold happens inside the comparison and, for a range, AFTER the swap -- the reference's order:
+    # `[Z-a]` is 90..97 and folds to 122..97, matching nothing, where lowering first would match maxmemory
     (b"[Z-a]axmemory", []),
     (b"[a-Z]axmemory", []),
     (b"[M-a]axmemory", []),
@@ -570,9 +521,8 @@ def test_config_get_folds_case_inside_the_comparison_not_before_it(
 
 
 def test_keys_never_folds_case_however_config_get_matches(store, conn):
-    # the flag belongs to CONFIG GET's caller and to nothing else: a key is arbitrary
-    # bytes and its case is the client's business, so the same pattern that folds over
-    # the parameter table must not fold over the keyspace
+    # the flag belongs to CONFIG GET's caller alone: a key is arbitrary bytes and its case is the client's
+    # business, so the pattern that folds over the parameter table must not fold over the keyspace
     for key in (b"maxmemory", b"MAXMEMORY", b"MaxMemory"):
         commands.dispatch(store, conn, [b"SET", key, b"v"])
     reply, _ = commands.dispatch(store, conn, [b"KEYS", b"MAXMEMORY"])
@@ -596,9 +546,8 @@ def test_config_get_answers_every_pattern_it_is_given_and_never_twice(store, con
     reply, _ = commands.dispatch(store, conn, [b"CONFIG", b"GET", b"*", b"maxmemory"])
     assert names_of(reply) == [
         b"appendonly", b"databases", b"maxmemory", b"maxmemory-policy", b"save"]
-    # and two globs that overlap, which the exact-name case above never reaches --
-    # measured on redis-server 7.2.7, `CONFIG GET maxmemory* ma*` answers eight names
-    # with no repeat among them, and `CONFIG GET * *` answers its whole table once
+    # and two globs that overlap, which the exact-name case never reaches: on 7.2.7 `CONFIG GET maxmemory*
+    # ma*` answers eight names with no repeat, and `CONFIG GET * *` answers its whole table once
     reply, _ = commands.dispatch(store, conn, [b"CONFIG", b"GET", b"maxmemory*", b"ma*"])
     assert names_of(reply) == [b"maxmemory", b"maxmemory-policy"], names_of(reply)
     reply, _ = commands.dispatch(store, conn, [b"CONFIG", b"GET", b"*", b"*"])
@@ -611,12 +560,8 @@ def test_config_subcommand_is_matched_case_insensitively(store, conn):
 
 
 def _config_get_through(server, *names):
-    # a connection holding server in its third slot, which is what Server._on_accept
-    # leaves on every connection it accepts -- test_the_server_slot_is_filled_on_accept_
-    # and_cleared_on_close proves that half, so these tests need no listener of their own.
-    # run() arms the save before it opens the listener, so every connection a running
-    # server accepts sees the save already armed; the tests below arm it the same way,
-    # through _arm_periodic_tasks(), rather than running a loop
+    # a connection holding server in its third slot, which is what _on_accept leaves, so these tests need
+    # no listener; run() arms the save before the listener, and _arm_periodic_tasks() arms it the same way
     a, b = socket.socketpair()
     try:
         conn = Connection(a, ("127.0.0.1", 0))
@@ -628,9 +573,8 @@ def _config_get_through(server, *names):
 
 
 @pytest.mark.parametrize("interval, with_path, expected", [
-    # a reference rule fires once its whole-second clock is MORE than the rule's seconds
-    # past the last completed save, so a save every N seconds is `N-1 0`: measured on
-    # redis-server 7.2.7, `save "1 0"` saved every 2 seconds and `save "3 0"` every 4
+    # a reference rule fires once its whole-second clock is MORE than the rule's seconds past the last save,
+    # so every N seconds is `N-1 0`: on 7.2.7 `save "1 0"` saved every 2 seconds and `save "3 0"` every 4
     (60, True, b"*2\r\n$4\r\nsave\r\n$4\r\n59 0\r\n"),
     (3, True, b"*2\r\n$4\r\nsave\r\n$3\r\n2 0\r\n"),
     # a rule 7.2.7's own parser refuses -- its seconds must be at least 1 -- and still the
@@ -654,10 +598,8 @@ def test_config_get_save_spells_the_attached_servers_own_rule(
 
 
 def test_config_get_save_is_the_off_value_until_the_save_is_armed(tmp_path):
-    # the reply follows the save arm, not the two settings that feed it: a Server whose
-    # loop is driven without run() -- as this suite drives one -- has a path and an
-    # interval and will never save, and answering `59 0` there would promise saves that
-    # never come. the settings alone are identical on both sides of this test
+    # the reply follows the save arm and not the two settings that feed it: a Server driven without run()
+    # has a path and an interval and will never save, and `59 0` there would promise saves that never come
     server = Server(0, snapshot_path=str(tmp_path / "dump.mrdb"), snapshot_interval=60)
     try:
         assert _config_get_through(server, b"save") == (
@@ -670,9 +612,7 @@ def test_config_get_save_is_the_off_value_until_the_save_is_armed(tmp_path):
 
 
 def test_config_get_save_follows_a_run_from_armed_to_returned(tmp_path):
-    # the other end of the unarmed test above: run() arms the save before it opens the
-    # listener and disarms it on the way out, so the reply read inside the running loop
-    # promises saves and the same server read once run() has returned does not. a deadline
+    # the other end: run() arms the save before the listener and disarms it on the way out, so a deadline
     # left set at shutdown went on answering `59 0` for a server that would never save again
     during = []
 
@@ -690,9 +630,8 @@ def test_config_get_save_follows_a_run_from_armed_to_returned(tmp_path):
 
 
 def test_config_get_answers_save_alike_through_a_pattern_and_an_exact_name(tmp_path):
-    # the two branches of the handler both have to read the per-call table. redis-py's
-    # config_get() sends `CONFIG GET *`, so a glob branch left reading a fixed table would
-    # go on telling that client persistence is off while `CONFIG GET save` did not
+    # both branches of the handler have to read the per-call table: redis-py sends `CONFIG GET *`, so a
+    # glob branch on a fixed table would go on telling that client persistence is off
     server = Server(0, snapshot_path=str(tmp_path / "dump.mrdb"), snapshot_interval=60)
     try:
         server._arm_periodic_tasks()
@@ -709,9 +648,8 @@ def test_config_get_answers_save_alike_through_a_pattern_and_an_exact_name(tmp_p
 
 
 def test_config_get_save_is_the_off_value_with_no_server_attached():
-    # conn=None is this project's convention for driving a handler with no socket at all
-    # -- tests/conftest.py's r() helper does it -- and it has no slot to read: a guard that
-    # reached for conn.server before asking whether conn exists raises here instead
+    # conn=None is this project's convention for a handler driven with no socket -- conftest's r() does it
+    # -- and there is no slot to read: a guard reaching conn.server before testing conn raises here
     assert commands.dispatch(Store(), None, [b"CONFIG", b"GET", b"save"]) == (
         b"*2\r\n$4\r\nsave\r\n$0\r\n\r\n", [])
 
@@ -734,9 +672,8 @@ def test_arity_errors(store, conn, argv, expected):
     # the bare form is the one arity error in this server that has a subcommand to name,
     # and the reference names it -- so this asserts `config|get`, not `config`
     ([b"CONFIG", b"GET"], b"-ERR wrong number of arguments for 'config|get' command\r\n"),
-    # every subcommand but GET, including the two the reference answers `+OK` to. Asserted
-    # byte for byte rather than as "some error", because these four shapes are exactly the
-    # ones that diverge from the reference and a startswith() would pin none of them
+    # every subcommand but GET, including the two the reference answers `+OK` to, asserted byte for byte:
+    # these four shapes are exactly the ones that diverge and a startswith() would pin none of them
     ([b"CONFIG", b"SET", b"save", b""], b"-ERR syntax error\r\n"),
     ([b"CONFIG", b"RESETSTAT"], b"-ERR syntax error\r\n"),
     ([b"CONFIG", b"BOGUS"], b"-ERR syntax error\r\n"),

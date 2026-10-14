@@ -13,13 +13,8 @@ def _push(store, argv: list[bytes], name: bytes, *, prepend: bool) -> Reply:
     elements = argv[2:]
     container = store.lookup(key, kind=KIND_LIST)
     if container is None:
-        # bytes is immutable, which is the whole reason Store.write() exists for a
-        # string -- INCR cannot alter a stored value without replacing it outright. A
-        # deque has no such problem: it can be altered in place, so there is nothing
-        # left for a store method to do that holding the object and mutating it does
-        # not already do. Written once, here, on the miss branch only -- a second
-        # write after pushing, or a fresh deque laid over one just mutated, would
-        # silently clear a TTL set between the two writes
+        # a deque is mutable where bytes is not, so nothing is left for a store method to do here.
+        # written once on the miss branch: a second write would clear a TTL set between the two
         container = deque()
         store.write(key, container, keep_ttl=False)
     if prepend:
@@ -48,12 +43,8 @@ def _pop(store, argv: list[bytes], name: bytes, *, from_left: bool) -> Reply:
         return resp.encode_bulk_string(None), []
     element = container.popleft() if from_left else container.pop()
     if not container:
-        # store.remove() is the only thing that may delete a key, and it feeds the
-        # effects queue nothing -- so the pop's own effect below travels alone. A
-        # follower applies this same pop through its own dispatcher and runs the
-        # identical cleanup against its own copy; joining a DEL to this effect would
-        # only double the traffic on every last-element pop for no reason the
-        # follower's own dispatch does not already cover
+        # the pop's own effect travels alone: a follower applies the same pop and runs the identical
+        # cleanup against its own copy, so a DEL beside it would only double the traffic
         store.remove(key)
     return resp.encode_bulk_string(element), [[name, key]]
 
@@ -71,12 +62,8 @@ def rpop(store, conn, argv: list[bytes]) -> Reply:
 @command(b"LRANGE", arity=4, kind=Kind.READ)
 def lrange(store, conn, argv: list[bytes]) -> Reply:
     key = argv[1]
-    # both indices are parsed before the key is looked up at all. Argument validation
-    # outranks both the type check and the existence check -- measured against
-    # redis-server 7.2.7, a bad index against a wrong-kind key answers the index error
-    # rather than WRONGTYPE, and the same bad index against a missing key answers it
-    # too. Looked up first, either the WRONGTYPE or the empty array would arrive
-    # instead and hide this
+    # both indices are parsed before the key is looked up: measured against redis-server 7.2.7, a bad
+    # index answers the index error against a wrong-kind key and against a missing key alike
     start = parse_int64(argv[2])
     stop = parse_int64(argv[3])
     if start is None or stop is None:
@@ -95,17 +82,8 @@ def lrange(store, conn, argv: list[bytes]) -> Reply:
     stop = min(stop, n - 1)
     if start > stop or start >= n:
         return resp.encode_array([]), []
-    # deque has no slice syntax of its own; islice walks the run in place instead of
-    # copying the whole container into a list just to throw most of it away. Which end it
-    # walks from is the rest of the cost: islice only ever starts at the head, so a range
-    # near the tail pays the distance from the head and not the length of the range -- and
-    # `LRANGE k -1 -1`, the ordinary way to read a list's last element, is then linear in
-    # the whole list on a loop with one thread to spend. A deque walks from either end at
-    # the same cost per step, so the half that is closer to the tail is read backward off
-    # reversed() and turned round again. The comparison decides direction and nothing
-    # else, so its own boundary is not observable: at the exact midpoint both directions
-    # walk the same n/2 steps and answer the same bytes, which makes `<=` versus `<` an
-    # equivalent mutant. Noted so the next reader spends no time on it
+    # islice walks in place rather than copying the container, and only ever from the head, so the
+    # half nearer the tail is read off reversed(): `LRANGE k -1 -1` is otherwise linear in the list
     if start <= n - 1 - stop:
         elements = islice(container, start, stop + 1)
     else:

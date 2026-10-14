@@ -24,7 +24,8 @@ from tests.test_server_lifecycle import listening, pump
 REPO_ROOT = pathlib.Path(__file__).resolve().parent.parent
 
 
-# a real send() only short-writes when the kernel's autotuned buffers happen to be full, which is machine-dependent and silently stops testing elsewhere; scripting send() makes the short write mandatory and deterministic here
+# scripting send() makes the short write mandatory and deterministic: a real send() short-writes only
+# when the kernel's autotuned buffers happen to be full, which silently stops testing elsewhere
 class ScriptedSocket:
     def __init__(self, sock, script):
         self._sock = sock
@@ -109,10 +110,8 @@ def test_write_interest_is_deregistered_the_moment_it_empties(make_connection):
 
 
 def test_a_send_that_reports_zero_leaves_the_buffer_untouched(make_connection):
-    # not a documented outcome for a non-blocking socket -- the documented refusal is
-    # BlockingIOError -- so both readings close something. progress leaves write interest set
-    # against a buffer nothing drains, which spins the loop at 100% CPU and stops every client;
-    # a disconnect costs the one connection that produced an outcome the standard forbids
+    # zero is undocumented for a non-blocking socket, and reading it as progress leaves write interest
+    # against a buffer nothing drains: the loop spins at 100% CPU and every client stops
     _server, conn = make_connection([0, 3, 2])
     conn.queue(b"+OK\r\n")
     assert conn.flush() is False, "a zero return must not be reported as progress"
@@ -142,11 +141,8 @@ def test_no_limit_lets_a_queued_reply_grow(make_connection):
 
 
 def test_a_connection_over_the_limit_is_closed_not_slowed(make_connection):
-    # closing rather than throttling: a client that writes every request before reading
-    # a reply blocks in send() the moment the server stops reading it, waiting for room
-    # only its own reading would create, so refusing to read is a deadlock, not a brake
-    # two refusals: the flush that trips the limit, and the best-effort flush _close
-    # makes on the way out to hand the peer whatever the kernel will still take
+    # closing rather than throttling: a client that writes every request before reading blocks in send()
+    # once the server stops reading it, so refusing to read is a deadlock and not a brake
     server, conn = make_connection([BlockingIOError, BlockingIOError])
     server.write_buffer_limit = 4096
     conn.queue(b"x" * 5000)
@@ -174,13 +170,8 @@ def test_a_buffer_exactly_at_the_limit_is_kept(make_connection):
 
 
 def test_the_second_positional_parameter_is_the_limit_that_closes_a_connection_past_it():
-    # the flag is --write-buffer-limit and the constructor takes it as its second
-    # positional parameter, which is where main() binds it. every test above assigns the
-    # attribute directly, so a constructor that took the limit under another name or at
-    # another position would hand it to a different setting, or to none, and all of them
-    # would stay green. this one builds the server the way main() does
-    # the pause off, because a 4,096-byte limit sits under the default high-water mark and both
-    # doors refuse that pairing now; what this test is for is which parameter the limit lands on
+    # the limit must land on the constructor's second positional parameter, where main() binds it: every
+    # other test assigns the attribute, so a limit landing on another setting would leave them all green
     args = build_arg_parser().parse_args(
         ["--write-buffer-limit", "4096", "--write-buffer-high-water", "0"])
     server = Server(args.port, args.write_buffer_limit,
@@ -204,9 +195,8 @@ def test_the_second_positional_parameter_is_the_limit_that_closes_a_connection_p
 
 
 def test_the_write_buffer_limit_defaults_to_thirty_two_mebibytes():
-    # a real limit by default, and below --max-value-size's 64 MiB: a value can be stored
-    # that cannot be read back, which is what a hard limit does and is why neither default
-    # is moved. asserted as the number, not as the name of the constant that holds it
+    # a real limit by default, and below --max-value-size's 64 MiB, so a stored value can be too large to
+    # read back: asserted as the number and not as the name of the constant that holds it
     assert build_arg_parser().parse_args([]).write_buffer_limit == 33554432
     server = Server(0)
     try:
@@ -217,11 +207,8 @@ def test_the_write_buffer_limit_defaults_to_thirty_two_mebibytes():
 
 @pytest.mark.parametrize("value", ["-1", "-4096"])
 def test_the_parser_refuses_a_negative_write_buffer_limit(value):
-    # `limit and len(buf) > limit` reads any non-zero value as enabled, and every buffer
-    # length exceeds a negative number -- including zero. left unchecked, --write-buffer-
-    # limit -1 prints a healthy startup line and then closes every connection after its
-    # first reply. -1 is a conventional spelling of "unlimited", so it is the likeliest
-    # value to be typed here by someone reaching for exactly the opposite behaviour
+    # `limit and len(buf) > limit` reads -1 as enabled and every buffer length exceeds it, so -1 -- the
+    # conventional spelling of unlimited -- starts cleanly and closes every connection after its first reply
     with pytest.raises(SystemExit):
         build_arg_parser().parse_args(["--write-buffer-limit", value])
 
@@ -251,17 +238,15 @@ ECHO_REPLY = b"$4\r\nabcd\r\n"
 
 
 def _dispatch_echoes(server, conn, count):
-    # the real read-and-dispatch path over a socket that never accepts a byte, so the
-    # buffer the in-loop check sees is the one the batch actually built. a socketpair
-    # would drain into the kernel and the check would never meet a full buffer at all
+    # the real read-and-dispatch path over a socket that never accepts a byte, so the in-loop check meets
+    # the buffer the batch actually built; a socketpair would drain into the kernel instead
     conn._sock.peer.sendall(ECHO_ABCD * count)
     server._read_and_dispatch(conn)
 
 
 def test_the_in_loop_limit_keeps_a_buffer_that_lands_exactly_on_it(make_connection):
-    # the limit is consulted in two places and only _flush's boundary was pinned, so
-    # turning the in-loop `>` into `>=` passed the whole suite. a buffer exactly at the
-    # limit is within it: the check is a ceiling to exceed, not to reach
+    # only _flush's boundary was pinned, so turning the in-loop `>` into `>=` passed the whole suite:
+    # a buffer exactly at the limit is within it, since the check is a ceiling to exceed
     server, conn = make_connection([BlockingIOError] * 20)
     server.write_buffer_limit = 4 * len(ECHO_REPLY)
     _dispatch_echoes(server, conn, 4)
@@ -277,9 +262,8 @@ def test_the_in_loop_limit_closes_one_reply_past_it(make_connection):
 
 
 def _mask(server, conn):
-    # the selector's own mask, which is the one record of interest there is. get_key raises
-    # for a connection the selector does not hold, so a connection that wants neither
-    # interest cannot be mistaken here for one that is merely quiet
+    # the selector's own mask is the only record of interest there is, and get_key raises for a connection
+    # it does not hold, so wanting neither interest cannot be mistaken here for being quiet
     return server._loop._selector.get_key(conn).events
 
 
@@ -388,13 +372,8 @@ def test_read_interest_is_restored_at_the_low_water_mark(make_connection):
 
 def test_a_flush_during_the_drain_does_not_restore_reading_that_end_of_input_switched_off(
         make_connection):
-    # during the shutdown drain, end of input on a connection that still owes bytes switches
-    # its reading off, because end of input stays readable and would wake the loop on every
-    # pass. the resume in _flush fires as soon as the queue is at or under the low-water
-    # mark, so without the guard it switches the reading back on and the drain spins on end
-    # of input until its deadline. the end-to-end test of the half-close only notices when
-    # the queue happens to cross the mark while the loop is still waking, which is why this
-    # one sets the situation up directly
+    # end of input during the drain switches reading off for a connection still owing bytes; without the
+    # guard _flush's resume at the low-water mark switches it back on and the drain spins to its deadline
     server, conn = make_connection([BlockingIOError, 3000, BlockingIOError, BlockingIOError])
     server.write_buffer_high_water = 4096
     server.write_buffer_low_water = 1024
@@ -419,11 +398,8 @@ def test_a_flush_during_the_drain_does_not_restore_reading_that_end_of_input_swi
 
 
 def test_the_deadline_is_armed_before_the_dispatch_that_pauses_the_connection(make_connection):
-    # the deadline for a half-sent command is armed when the batch is read and suspended by
-    # the pause, and the order matters: a batch that fills the queue past the mark and ends
-    # on the first half of a command pauses the connection while a command is outstanding,
-    # and an arm that ran after the dispatch would start a deadline on a connection this
-    # server has stopped reading
+    # the deadline is armed when the batch is read and suspended by the pause: armed after the dispatch
+    # instead, a batch ending on half a command starts a deadline on a connection nothing is reading
     server, conn = make_connection([BlockingIOError] * 20)
     server.write_buffer_high_water = 3 * len(ECHO_REPLY)
     server.write_buffer_low_water = len(ECHO_REPLY)
@@ -435,11 +411,8 @@ def test_the_deadline_is_armed_before_the_dispatch_that_pauses_the_connection(ma
 
 
 def test_each_mark_triggers_the_in_loop_flush_on_its_own(make_connection):
-    # one recv can carry thousands of commands, so both the limit and the high-water mark
-    # are consulted between replies as well as after the batch, and each by itself: the
-    # mark is guarded by the mark and not by the limit, since a limit of 0 would otherwise
-    # leave a pause decided once per batch, and the limit is guarded by the limit and not by
-    # a mark that is off. the flushes are counted on a socket that never accepts a byte
+    # one recv can carry thousands of commands, so the mark and the limit are each consulted between
+    # replies and each guarded by itself -- a limit of 0 must not leave the pause decided once per batch
     server, conn = make_connection([BlockingIOError] * 40)
     flushes = []
     real_flush = server._flush
@@ -468,10 +441,8 @@ def test_each_mark_triggers_the_in_loop_flush_on_its_own(make_connection):
 
 def test_the_sweep_closes_every_connection_past_the_incomplete_command_timeout(
         make_connection, monkeypatch):
-    # two connections are past the limit in one sweep, so the sweep has to survive the first
-    # close discarding from the set it is walking: iterating the set itself raises on the
-    # first close, the boundary around the task logs it, and the second connection is left
-    # holding its half-sent command
+    # two connections are past the limit in one sweep, so the sweep has to survive the first close
+    # discarding from the set it walks: iterating the set itself raises and strands the second
     server, first = make_connection([BlockingIOError] * 5)
     second = make_connection([BlockingIOError] * 5)[1]
     idle = make_connection([BlockingIOError] * 5)[1]
@@ -528,10 +499,8 @@ def test_a_half_sent_command_keeps_its_deadline_and_the_next_command_gets_its_ow
         feed(piece)
         assert conn.incomplete_since == first
 
-    # that command completes and the next has begun in the same read: a different command,
-    # so a deadline of its own. a stream cut mid-command by every read would otherwise never
-    # leave a clean buffer and would be closed at the limit however quickly each command
-    # completed
+    # a command completed and the next begun in one read gets a deadline of its own: a stream cut
+    # mid-command by every read would otherwise be closed at the limit however fast each completed
     feed(b"G\r\n*1\r\n$4\r\nPI")
     assert conn.incomplete_since is not None and conn.incomplete_since > first
 
@@ -540,13 +509,8 @@ def test_a_half_sent_command_keeps_its_deadline_and_the_next_command_gets_its_ow
 
 
 def test_the_drain_reads_and_discards_what_a_paused_connection_had_not_read():
-    # a connection the high-water mark has stopped reading is stopped with whatever its peer
-    # sent still in its receive queue, and the drain only reads and discards for a
-    # connection it is reading. unless it switches the reading back on, those requests stay
-    # where they are for the whole drain and the close that ends it is a reset, which
-    # discards what the kernel had not yet put on the wire. the property is the empty
-    # receive queue at the close and an orderly end of input for the peer, and the peer
-    # receives exactly what it was owed: the request that was left unread is not answered
+    # a paused connection stops with its peer's requests still in the receive queue, and the drain only
+    # discards for one it reads: left unread, the close is a reset that discards unsent replies
     with listening() as (server, connect, _listener):
         client = connect()
         pump(server)
@@ -594,10 +558,8 @@ _PING = b"*1\r\n$4\r\nPING\r\n"
 
 
 def test_the_drains_setup_pass_counts_and_clears_what_was_buffered_when_it_began(make_connection):
-    # bytes that arrived before the stop are never dispatched, because the drain dispatches
-    # nothing, so they are a loss and they are counted as one. clearing them here is what
-    # keeps the count in the read path additive: from this point a buffer holds only what
-    # arrived after this pass, so no byte is counted twice
+    # bytes buffered before the stop are never dispatched, so they are a loss and are counted as one;
+    # clearing them keeps the read path's count additive, so no byte is counted twice
     server, conn = make_connection([BlockingIOError])
     conn.read_buffer.extend(_PING * 3)
     buffered = len(conn.read_buffer)
@@ -611,10 +573,8 @@ def test_the_drains_setup_pass_counts_and_clears_what_was_buffered_when_it_began
 
 
 def test_a_read_during_the_drain_adds_what_it_threw_away_to_the_count(make_connection):
-    # the site that catches the loss the pause creates: a connection the high-water mark
-    # stopped reading has its requests waiting in the kernel's receive queue, the drain
-    # switches reading back on and discards every one of them, and before this count
-    # nothing anywhere reported that it had
+    # the loss the pause creates: a paused connection's requests wait in the receive queue, the drain
+    # switches reading back on and discards every one, and nothing reported that before this count
     server, conn = make_connection([BlockingIOError])
     server._draining = True
     sent = _PING * 5
@@ -640,9 +600,8 @@ def test_a_stop_that_discards_nothing_reports_zero(make_connection):
 
 
 def test_the_drain_line_reports_the_bytes_it_discarded(make_connection, caplog):
-    # the count exists to be read, and the drain's one line is the only place a stop says
-    # anything at all. the two reply counts beside it cannot carry this, because a request
-    # discarded undispatched is not a reply anybody is owed
+    # the drain's one line is the only thing a stop says, and the two reply counts cannot carry this:
+    # a request discarded undispatched is not a reply anybody is owed
     server, conn = make_connection([BlockingIOError])
     conn.read_buffer.extend(_PING * 4)
     discarded = len(conn.read_buffer)
@@ -658,10 +617,8 @@ def test_the_drain_line_reports_the_bytes_it_discarded(make_connection, caplog):
 
 
 def test_what_the_drain_never_read_is_counted_for_a_connection_it_closes(make_connection, caplog):
-    # the shape that makes the figure worth having. a connection owing nothing is closed by the
-    # setup pass with no read pass at all, so a count of what the drain read reports 0 for it
-    # however much its peer sent -- and the close over a non-empty receive queue is a reset, which
-    # is what makes those requests a loss rather than something a later pass would have reached
+    # a connection owing nothing is closed by the setup pass with no read pass at all, so a count of what
+    # the drain read reports 0 for it -- and the close over a non-empty queue is a reset
     server, conn = make_connection([BlockingIOError])
     sent = _PING * 5
     conn._sock.peer.sendall(sent)
@@ -672,10 +629,8 @@ def test_what_the_drain_never_read_is_counted_for_a_connection_it_closes(make_co
 
     assert conn.closed, "a connection owing nothing is closed by the setup pass"
     assert server._discarded_request_bytes == len(sent), server._discarded_request_bytes
-    # the level decision, pinned where the figure is not zero, which is the only place it says
-    # anything: no reply was owed to anyone, so the line is INFO and says complete although a
-    # whole pipeline was thrown away. that is the documented choice and not an oversight, and
-    # without this assertion promoting the level on a non-zero count would turn no test red
+    # the level decision where the figure is not zero: no reply was owed, so the line is INFO and says
+    # complete although a whole pipeline was thrown away -- promoting the level turns no other test red
     line = [r for r in caplog.records if "shutdown drain" in r.getMessage()]
     assert len(line) == 1, [r.getMessage() for r in line]
     assert line[0].levelno == logging.INFO, line[0].getMessage()
@@ -683,10 +638,8 @@ def test_what_the_drain_never_read_is_counted_for_a_connection_it_closes(make_co
 
 
 def test_what_the_drain_never_read_is_counted_for_a_connection_still_owing_at_the_deadline(make_connection):
-    # the same loss on the other arm: this connection owes a reply, so the setup pass keeps it, and
-    # at a 0 timeout the loop runs no pass at all -- deadline = now + 0, and the clock does not go
-    # backwards -- so every request its peer sent is still sitting in the receive queue when the
-    # drain gives up. the figure has to carry those too, and nothing before it did
+    # the other arm: this connection owes a reply so the setup pass keeps it, and at a 0 timeout no pass
+    # runs -- deadline = now + 0 -- so every request its peer sent is still in the receive queue
     server, conn = make_connection([BlockingIOError])
     sent = _PING * 7
     conn._sock.peer.sendall(sent)
@@ -717,11 +670,8 @@ def test_a_buffer_and_a_receive_queue_are_both_counted_and_not_one_instead_of_th
 
 
 def test_a_buffer_and_what_a_drain_pass_reads_are_both_counted(make_connection):
-    # the third pairing, and the one only a drain that actually runs a pass reaches: a 0 timeout
-    # runs none -- deadline is now plus nothing and the clock does not go backwards -- so a test
-    # that passes 0 cannot tell the read path's addition from an assignment. the connection is
-    # left owing ten bytes the script blocks on once, so the first pass reads and the second send
-    # empties the buffer and ends the loop rather than spinning it to a deadline
+    # the pairing only a drain that runs a pass reaches: at a 0 timeout none runs, so a test passing 0
+    # cannot tell the read path's addition from an assignment. the script blocks once, then empties
     server, conn = make_connection([BlockingIOError, 10])
     conn.queue(b"x" * 10)
     server._flush(conn)                             # the blocked send, which registers write interest
@@ -756,10 +706,8 @@ def test_the_setup_pass_sums_the_buffers_of_every_connection_and_not_the_last_on
 
 
 def test_a_connection_that_owes_nothing_has_its_buffer_counted_before_it_is_abandoned(make_connection):
-    # counted for every connection, owing or not, and this is the one the arm order could drop: a
-    # client caught half way through a command has bytes in its read buffer and nothing queued for
-    # it, so the setup pass abandons it. that is the case the figure's own level decision is argued
-    # from, which makes it the one that has to be counted
+    # counted for every connection, owing or not: a client caught half way through a command has bytes
+    # buffered and nothing queued, so the setup pass abandons it -- the case the arm order could drop
     server, conn = make_connection([BlockingIOError])
     conn.read_buffer.extend(b"*1\r\n$4\r\nPI")       # a command that has begun and not ended
     buffered = len(conn.read_buffer)
@@ -772,10 +720,8 @@ def test_a_connection_that_owes_nothing_has_its_buffer_counted_before_it_is_aban
 
 
 def test_the_closes_after_the_drain_add_nothing_to_the_figure_it_already_reported(make_connection):
-    # _shutdown closes every connection the drain left open, after the line has been written. those
-    # closes go through _close like any other, so without the flag that scopes the accounting they
-    # would count a receive queue the finally clause has already counted, and the attribute would
-    # not match the figure anyone was shown
+    # _shutdown's closes run after the line is written, so without the flag that scopes the accounting
+    # they count a receive queue the finally clause already counted and the attribute stops matching
     server, conn = make_connection([BlockingIOError])
     conn._sock.peer.sendall(_PING * 4)
     conn.queue(b"x" * 10)
@@ -789,10 +735,8 @@ def test_the_closes_after_the_drain_add_nothing_to_the_figure_it_already_reporte
 
 
 def _raise_the_buffers(*socks):
-    # a default socketpair holds 8 KiB unread, so a pipeline longer than that blocks sendall() before
-    # there is a receive queue for the test to ask about, which is why no test that sends a few
-    # hundred bytes could ever reach a drain that ends with a long queue still unread. raised on both
-    # ends, because which end's limit governs depends on the platform
+    # a default socketpair holds 8 KiB unread, so a longer pipeline blocks sendall() before there is a
+    # receive queue to ask about. both ends, since which end's limit governs depends on the platform
     for sock in socks:
         sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 1 << 21)
         sock.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 1 << 21)
@@ -802,12 +746,8 @@ def _raise_the_buffers(*socks):
 @pytest.mark.parametrize("owes_a_reply", [True, False], ids=["owing", "owing nothing"])
 def test_the_setup_pass_counts_what_a_half_received_multibulk_has_already_consumed(
         make_connection, owes_a_reply, trailing):
-    # take_commands deletes the bytes it parses, so an MSET that declared five elements and sent two
-    # holds its header and both of them in the connection's own count and leaves the read buffer empty,
-    # or holding only the element that is still arriving. a figure built from the buffer alone reported
-    # 0 for 1,400,019 bytes of exactly this. the total is asserted against what went on the wire, which
-    # is the one number that is right however the bytes are split between the buffer and the count, and
-    # for a connection owing nothing as well, which the setup pass closes before either arm below it
+    # take_commands deletes what it parses, so an MSET that declared five elements and sent two holds its
+    # header and both outside the read buffer: a buffer-only figure reported 0 for 1,400,019 bytes of it
     server, conn = make_connection([BlockingIOError])
     sent = b"*5\r\n$4\r\nMSET\r\n$1\r\nk\r\n" + trailing
     conn._sock.peer.sendall(sent)
@@ -826,9 +766,8 @@ def test_the_setup_pass_counts_what_a_half_received_multibulk_has_already_consum
 
 
 def test_a_half_received_multibulk_is_counted_once_across_the_setup_pass_and_a_later_drain_read(make_connection):
-    # the count the setup pass takes is zeroed with the buffer, and what a pass of the drain reads
-    # afterwards is added to a figure that already holds it. the two sites are disjoint by what they
-    # measure and the sum is exact only if neither takes the other's bytes again
+    # the setup pass's count is zeroed with the buffer and a later drain read adds to a figure that already
+    # holds it: the sum is exact only if neither site takes the other's bytes again
     server, conn = make_connection([BlockingIOError, 10])
     held = b"*5\r\n$4\r\nMSET\r\n$1\r\nk\r\n"
     conn._sock.peer.sendall(held)
@@ -849,20 +788,15 @@ def test_a_half_received_multibulk_is_counted_once_across_the_setup_pass_and_a_l
 
 
 def test_a_drain_that_ends_on_an_emptied_buffer_still_counts_what_it_never_read(make_connection):
-    # the survivor walk is the figure's last site and the one that carries it on a real stop: the drain
-    # ends as soon as nothing is owed a reply, and a client with a pipeline longer than one recv() has
-    # most of it still in the kernel when that happens. every other test of the figure leaves this walk
-    # contributing nothing -- the setup pass closes the connection, or the 0 timeout runs no pass, or
-    # the drain reads everything -- so a walk that skipped a connection whose buffer had emptied, which
-    # is the case here, reported 65,542 of a measured 1,546,626 on a line still saying complete
+    # the survivor walk's own site, which every other test leaves contributing nothing: a walk that skipped
+    # a connection whose buffer had emptied reported 65,542 of a measured 1,546,626 on a line saying complete
     server, conn = make_connection([BlockingIOError, 10])
     conn.queue(b"x" * 10)
     server._flush(conn)                             # the blocked send, which registers write interest
     _raise_the_buffers(conn._sock._sock, conn._sock.peer)
     pipeline = _PING * 20_000
-    # a timeout, so that a kernel that takes less is a failure here and not a send that never returns.
-    # sendall() coming back under it is what shows the kernel took the whole pipeline: asking the
-    # connection would be asking the very function the figure under test is made from
+    # a timeout, so a kernel that takes less fails here rather than never returning: sendall() coming back
+    # is what shows the whole pipeline went in, where asking the connection would beg the question
     conn._sock.peer.settimeout(5)
     conn._sock.peer.sendall(pipeline)
     assert len(pipeline) > 4 * RECV_SIZE, "the pipeline has to outlast the one recv() a pass makes by a wide margin"
@@ -875,10 +809,8 @@ def test_a_drain_that_ends_on_an_emptied_buffer_still_counts_what_it_never_read(
 
 
 def test_the_survivor_walk_sums_the_receive_queues_of_every_connection_still_owing(make_connection):
-    # two connections that both owe bytes at the deadline and both have requests the drain never read,
-    # of different lengths so that the total is neither of them and not twice either. the only other
-    # test with two connections puts nothing in either queue, so a walk that stopped after the first
-    # reported a figure that was right for it
+    # two connections owing at the deadline with queues of different lengths, so the total is neither of
+    # them -- the only other two-connection test leaves both queues empty, so stopping at the first passed
     server, first = make_connection([BlockingIOError])
     _, second = make_connection([BlockingIOError])
     first_sent = _PING * 100
@@ -896,21 +828,14 @@ def test_the_survivor_walk_sums_the_receive_queues_of_every_connection_still_owi
         server._discarded_request_bytes, len(first_sent), len(second_sent))
 
 
-# SKB_MAX_HEAD(0) + UNIX_SKB_FRAGS_SZ: what one buffer on an AF_UNIX stream receive queue holds --
-# a page less the shared-info footer (4,096 - 320 = 3,776) plus the 32 KiB of paged fragments one
-# sendmsg will attach to it. Measured rather than taken on faith: one non-blocking send() of 10 MiB
-# into a socketpair whose SO_SNDBUF had been raised to 2 MiB was accepted 438,528 bytes at a time
-# on Linux 6.8, which is twelve of these with nothing left over
+# one buffer on an AF_UNIX stream receive queue: SKB_MAX_HEAD(0) 3,776 plus 32 KiB of paged fragments,
+# measured -- one 10 MiB non-blocking send() was accepted 438,528 bytes at a time on Linux 6.8, twelve of them
 _UNIX_SKB_BYTES = 36_544
 
 
 def _a_kernel_that_answers_for_a_buffer_it_has_handed_over(total_sent):
-    # the answer the kernel CI runs gives, reproduced on any kernel. It walks the receive queue
-    # summing each queued buffer's WHOLE length, so a buffer whose front half a recv() has already
-    # taken is reported as still unread in full; this host's kernel sums only the part of each that
-    # nobody has taken yet. Derived from the real answer rather than from a table: what has been
-    # read is total_sent minus what is really left, and the head buffer's consumed prefix is that
-    # modulo one buffer's size, which is exactly the excess such a kernel reports
+    # the answer CI's kernel gives, reproduced on any kernel: it sums each queued buffer's WHOLE length, so
+    # a buffer a recv() half took reads as unread in full. derived from the real answer, not from a table
     real = connection_module.unread_in_kernel
 
     def answer(sock):
@@ -923,16 +848,8 @@ def _a_kernel_that_answers_for_a_buffer_it_has_handed_over(total_sent):
 
 def test_the_figure_is_right_on_a_kernel_that_answers_for_a_buffer_it_has_handed_over(
         make_connection, monkeypatch):
-    # the one test here whose evidence comes from a kernel this host does not have. CI reported
-    # 308,992 for this exact scenario against 280,000 sent, on both the 3.11 and the 3.13 leg and at
-    # two different commits, because one recv() of RECV_SIZE empties the first 36,544-byte buffer and
-    # leaves 28,992 bytes consumed inside the second, and a queue walk that sums whole lengths then
-    # reports 243,456 still unread where 214,464 is the truth. 65,536 + 243,456 = 308,992, and the
-    # 28,992 the read path had already counted is counted a second time -- which is not a figure
-    # being wrong by a margin, it is the additivity the five shapes are specified to have failing.
-    # Asserting against what the peer sent is what makes this independent of which kernel is
-    # running it: the substituted answer is wrong by construction, and the figure has to come out
-    # right anyway
+    # CI reported 308,992 against 280,000 sent on both legs at two commits: one recv() of 65,536 leaves
+    # 28,992 inside the second 36,544-byte buffer, counted twice, so the five shapes stopped being additive
     server, conn = make_connection([BlockingIOError, 10])
     conn.queue(b"x" * 10)
     server._flush(conn)
@@ -943,9 +860,8 @@ def test_the_figure_is_right_on_a_kernel_that_answers_for_a_buffer_it_has_handed
     monkeypatch.setattr(
         connection_module, "unread_in_kernel",
         _a_kernel_that_answers_for_a_buffer_it_has_handed_over(len(pipeline)))
-    # the control: the substituted kernel really does over-report for this scenario, and by the
-    # amount CI reported. Without it a fix that stopped calling the ioctl at all would pass this
-    # test against an answer that happened to be correct
+    # the control: the substituted kernel really does over-report here, and by the amount CI reported.
+    # without it a fix that stopped calling the ioctl at all would pass against a correct answer
     assert conn.unread_in_kernel() == len(pipeline), (
         "before a single read the whole pipeline sits in whole buffers, where the two kernels agree")
     server._draining = True
@@ -959,14 +875,8 @@ def test_the_figure_is_right_on_a_kernel_that_answers_for_a_buffer_it_has_handed
 
 
 def test_the_close_site_reads_the_queue_rather_than_asking_about_it(make_connection, monkeypatch):
-    # the sixth review's finding 47. the repair has two sites -- _close and the survivor walk --
-    # and reverting the _close one to the bare ioctl passed all 1,096 tests, because the three
-    # tests written for the repair only ever drove the walk. this drives _close: the connection
-    # owes nothing, so the drain's setup pass abandons it through _close before any pass runs,
-    # which is the site under test. one recv was read and DISPATCHED before the stop, so the
-    # over-reporting kernel answers for bytes this server already handled
-    # every send refuses, so the replies stay queued and are cleared below by hand: this test is
-    # about what the CLOSE counts, and a send that succeeds would only add scheduling noise
+    # reverting the _close site to the bare ioctl passed all 1,096 tests, because the three tests for the
+    # repair only ever drove the walk; this drives _close, over a recv already read and DISPATCHED
     server, conn = make_connection([BlockingIOError] * 10)
     _raise_the_buffers(conn._sock._sock, conn._sock.peer)
     pipeline = _PING * 20_000
@@ -975,10 +885,8 @@ def test_the_close_site_reads_the_queue_rather_than_asking_about_it(make_connect
     # read and dispatch one recv's worth before the stop, so the kernel has a partly-consumed
     # buffer to lie about and those bytes are NOT discarded -- they were answered
     server._read_and_dispatch(conn)
-    # counted from the replies, not from what the recv took: one recv of RECV_SIZE does not land
-    # on a command boundary, so a few bytes stay in the read buffer unparsed. those ARE discarded
-    # and the setup pass counts them correctly -- what must not be counted is the bytes that were
-    # dispatched, which is one +PONG each
+    # counted from the replies and not from what the recv took: one recv does not land on a command
+    # boundary, so a few unparsed bytes stay buffered and ARE discarded -- the +PONGs must not be
     dispatched = len(conn.write_buffer) // len(b"+PONG\r\n")
     assert dispatched > 0, "the setup for this test dispatched nothing, so it proves nothing"
     conn.write_buffer.clear()
@@ -1000,12 +908,8 @@ def test_the_close_site_reads_the_queue_rather_than_asking_about_it(make_connect
                          ids=["ValueError", "OSError"])
 def test_a_recv_that_raises_inside_the_walk_does_not_cost_the_drain_its_line(
         make_connection, caplog, raised):
-    # finding 48's third mutant: narrowing the walk's `except (OSError, ValueError)` to
-    # BlockingIOError passed every test, because nothing here made recv raise anything else. the
-    # ioctl's own broad catch is tested; the READ's was not, and it is the newer of the two. a
-    # raise escaping here leaves the drain's finally clause without its one log line, which is the
-    # loss DL-004's invariant exists to prevent -- and ValueError is what a socket object whose
-    # descriptor has gone actually raises, which is why OSError alone is not enough
+    # narrowing the walk's `except (OSError, ValueError)` to BlockingIOError passed every test: a raise here
+    # costs the drain its one log line, and ValueError is what a socket whose descriptor has gone raises
     server, conn = make_connection([BlockingIOError])
     conn.queue(b"x" * 10)
     conn._sock.peer.sendall(_PING * 10)
@@ -1028,9 +932,8 @@ def test_a_recv_that_raises_inside_the_walk_does_not_cost_the_drain_its_line(
 
 
 def test_the_close_counts_nothing_when_the_drain_is_not_accounting(make_connection):
-    # the companion gap, finding 48: replacing the `if self._counting_unread_at_close` gate with
-    # `if True` also passed all 1,096 tests. it would make every ordinary close read and throw
-    # away whatever the kernel held, outside any stop, and add it to a figure nobody is reporting
+    # replacing the `if self._counting_unread_at_close` gate with `if True` passed all 1,096 tests: every
+    # ordinary close would read and throw away what the kernel held, into a figure nobody is reporting
     server, conn = make_connection([BlockingIOError])
     conn._sock.peer.sendall(_PING * 10)
     assert not server._counting_unread_at_close, "this test needs the flag clear"
@@ -1043,11 +946,8 @@ def test_the_close_counts_nothing_when_the_drain_is_not_accounting(make_connecti
 
 
 def test_the_survivor_walk_takes_the_bytes_it_counts_off_the_socket(make_connection):
-    # what makes the figure independent of the kernel's own arithmetic: the walk reads the remainder
-    # and reports what it actually got, rather than asking and reporting the answer. An emptied
-    # receive queue is the observable, and it is worth having for its own sake too -- the close
-    # _shutdown makes next is a FIN over an empty queue where it was a reset over a full one, and a
-    # reset discards whatever the flush in _close had just handed the kernel
+    # the walk reads the remainder and reports what it got rather than asking: an emptied receive queue makes
+    # the close that follows a FIN, where a reset discards what _close's flush had just handed the kernel
     server, conn = make_connection([BlockingIOError, 10])
     conn.queue(b"x" * 10)
     server._flush(conn)
@@ -1066,19 +966,12 @@ def test_the_survivor_walk_takes_the_bytes_it_counts_off_the_socket(make_connect
         conn.unread_in_kernel())
 
 
-# the one test here that fails as a HANG rather than an assertion when what it pins is removed:
-# its recv hook sends on every call, so a walk without a ceiling never finds an empty queue. the
-# suite's own timeout is 300 seconds, which is right for the parser off-by-one it was chosen for
-# and wrong for this -- a five-minute wait for a regression this test can detect in under one.
-# a marker rather than a lower global: the 300 is headroom over the slowest test in the suite and
-# narrowing it for one test's benefit would re-open what it was chosen to close
+# removing the ceiling makes this HANG rather than fail -- its recv hook sends on every call -- and the
+# suite's own 300 second timeout is a five-minute wait for a regression this detects in under one
 @pytest.mark.timeout(20)
 def test_the_walk_reads_no_more_than_the_kernel_claimed_when_it_was_asked(make_connection):
-    # the bound. Reading until the queue is empty would hand a peer that keeps sending a loop with no
-    # end, at a point in the stop sequence that no deadline covers -- so the ioctl's answer is a
-    # ceiling and the loop stops there whatever has arrived since. --shutdown-drain-timeout 0, so no
-    # drain pass runs and the only recv() calls in the whole stop are the walk's own, which is what
-    # lets the flood below be attributed to it
+    # the bound: reading until the queue is empty hands a peer that keeps sending an endless loop, at a point
+    # in the stop no deadline covers. at a 0 timeout the only recv() calls in the whole stop are the walk's
     server, conn = make_connection([BlockingIOError])
     conn.queue(b"x" * 10)
     waiting = _PING * 100
@@ -1107,11 +1000,8 @@ def test_the_walk_reads_no_more_than_the_kernel_claimed_when_it_was_asked(make_c
 
 
 def test_a_socket_closed_behind_its_connections_back_does_not_cost_the_drain_its_line(make_connection, caplog):
-    # the survivor walk asks every connection it left open, from inside the finally clause that writes
-    # the drain's one line, and a socket object that had given up its descriptor made that question
-    # raise a ValueError, which escaped before the line was written and left a stop with no account of
-    # itself at all. closed on the socket and not on the connection, because Connection.close() would
-    # set the flag the walk reads and hide the case
+    # the walk asks every surviving connection from inside the finally clause that writes the drain's one
+    # line, and a socket that had given up its descriptor raised ValueError there and cost the line
     server, conn = make_connection([BlockingIOError])
     conn.queue(b"x" * 10)
     conn._sock.close()
@@ -1128,18 +1018,15 @@ def test_a_socket_closed_behind_its_connections_back_does_not_cost_the_drain_its
     assert "request bytes discarded undispatched: 0" in lines[0], lines[0]
 
 
-# the accept queue the stop leaves behind, as sockets a test hands over one at a time. a real
-# listener's backlog fills a few hundred microseconds after a client's send() returns, with nothing on
-# this side to wait on -- the connection is in nobody's hands -- so a count taken at once was short on
-# about two runs in a hundred over loopback, and a test that waits for it with a sleep is a test of the
-# sleep. an AF_UNIX pair delivers before send() returns, which makes the arithmetic and the order of
-# the two sweeps exact; a real listener with real clients is what test_graceful_shutdown.py drives
+# the stop's accept queue as sockets handed over one at a time: a real listener's backlog fills a few hundred
+# microseconds after send() returns, so a count taken at once was short about two runs in a hundred
 class ScriptedListener:
     def __init__(self):
         self.pending = []
         self.socks = []
         self.events = []
-        # set, accept() raises OSError where an empty queue would raise BlockingIOError: a listener the kernel refuses or whose descriptor has gone, which the sweep reaches only after it has taken whatever was pending
+        # set, accept() raises OSError where an empty queue raises BlockingIOError: a listener the kernel
+        # refuses, which the sweep reaches only after it has taken whatever was pending
         self.broken = False
         self.refused = 0
         self.empty_asks = 0
@@ -1156,17 +1043,19 @@ class ScriptedListener:
             self.events.append("sweep")
             if self.broken:
                 self.refused += 1
-                # bounded, so that a sweep which went back to a listener that had just failed fails the test and does not park it
+                # bounded: a sweep that re-asked a listener that had just failed fails rather than parks
                 assert self.refused <= 10, "the sweep went on asking a listener that had failed"
                 raise OSError(errno.EMFILE, "Too many open files")
-            # what a non-blocking listener raises for an empty queue, and what ends one sweep. bounded the way the broken path above is: a sweep that went back to a listener that had just said nothing was pending -- a break that became a continue -- would append to events for ever, and a timeout's own exception lands in _drain_for's finally clause, which sweeps again and re-enters the loop, so the runaway would be a hang and not a failure. a drain sweeps twice, and no test here sweeps more than a few times
+            # what a non-blocking listener raises for an empty queue, and what ends one sweep
+            # bounded as above: a break that became a continue would hang rather than fail
             self.empty_asks += 1
             assert self.empty_asks <= 20, "the sweep went on asking a listener that had nothing pending"
             raise BlockingIOError()
         return self.pending.pop(0), ("stub", 0)
 
 
-# a swept socket whose close() reports an error. the descriptor is released first and the error raised after, which is what close(2) does when it reports one: the sweep is being asked about an error and not about a leak, and the test can still see that the socket was let go
+# a swept socket whose close() reports an error: the descriptor is released first and the error raised after,
+# the way close(2) does, so the sweep is asked about an error and not about a leak
 class _CloseRefused:
     def __init__(self, sock):
         self._sock = sock
@@ -1188,9 +1077,8 @@ def scripted_listener():
 
 
 def test_the_accept_backlog_is_counted_and_closed_at_the_stop(scripted_listener):
-    # clients that connected and sent before the stop and that nothing served: they are in no
-    # connection set, so nothing else will ever ask what they sent, and the listener's own close would
-    # have reset them. three of different lengths, so that the figure is a sum and not one of them
+    # clients that connected and sent before the stop and that nothing served: they are in no connection
+    # set, so nothing else will ask what they sent. three of different lengths, so the figure is a sum
     server = Server(0)
     try:
         sent = [_PING * 50, _PING * 120, _PING * 300]
@@ -1206,10 +1094,8 @@ def test_the_accept_backlog_is_counted_and_closed_at_the_stop(scripted_listener)
 
 
 def test_a_client_that_arrives_while_the_drain_is_running_is_counted(make_connection, scripted_listener):
-    # one sweep at entry was not enough: the kernel goes on completing handshakes into the backlog for
-    # the whole of the save and the drain, and a client that connects once the drain is under way
-    # arrives after the only look that had been taken. the connection joins on the first pass, so the
-    # sweep that finds it is the one in the finally clause
+    # one sweep at entry is not enough: the kernel goes on completing handshakes for the whole save and
+    # drain, so a client that connects while it is under way is found by the sweep in the finally clause
     server, conn = make_connection([BlockingIOError, 10])
     conn.queue(b"x" * 10)
     server._flush(conn)                             # the blocked send, which registers write interest
@@ -1258,12 +1144,8 @@ def test_the_backlog_is_swept_before_the_first_drain_pass_and_again_after_the_la
 
 
 def test_a_listener_that_cannot_be_accepted_from_costs_the_drain_neither_its_line_nor_what_it_had_counted(scripted_listener, caplog):
-    # the sweep's one way out that is not the ordinary one. the line the drain writes is the only account
-    # a stop gives of itself, and the sweep runs inside the clause that writes it, so an OSError the sweep
-    # let through would put a traceback where the figure should be. two clients are pending and the
-    # listener fails once they are gone: that the figure still holds both is what separates a sweep that
-    # stops where it failed from one that gives up what it had already counted, and the one error per
-    # sweep, with no second ask, is what separates a stop from a retry
+    # the sweep runs inside the clause that writes the drain's one line, so an OSError let through puts a
+    # traceback where the figure should be; the figure still holding both clients is what pins the stop
     server = Server(0)
     try:
         sent = [_PING * 50, _PING * 120]
@@ -1283,9 +1165,8 @@ def test_a_listener_that_cannot_be_accepted_from_costs_the_drain_neither_its_lin
         assert scripted_listener.events == ["sweep", "sweep"], scripted_listener.events
         failures = [r for r in caplog.records if r.getMessage().startswith("could not sweep the accept backlog")]
         assert len(failures) == 2, [r.getMessage() for r in caplog.records]
-        # the error is in the message and there is no traceback, at a level a configuration that hides INFO
-        # still shows. a traceback is rendered by opening source files, and descriptor exhaustion is the
-        # likeliest reason to be here, where that open fails too and only "--- Logging error ---" is left
+        # the error is in the message with no traceback, at a level a configuration hiding INFO still shows:
+        # rendering one opens source files, and descriptor exhaustion is the likeliest reason to be here
         for record in failures:
             assert record.levelno == logging.ERROR, record.levelname
             assert record.exc_info is None, record.exc_info
@@ -1296,12 +1177,8 @@ def test_a_listener_that_cannot_be_accepted_from_costs_the_drain_neither_its_lin
 
 
 def test_a_swept_socket_that_will_not_close_is_still_counted_and_does_not_end_the_sweep(scripted_listener, caplog):
-    # the count is taken before the close and the close is in a finally clause, so a close that raises
-    # is the one place the sweep could lose what it had just learned. the refusing socket comes first
-    # and a healthy one behind it, so that the figure is a sum that includes the one that refused and
-    # the second socket's closure shows the sweep went on past it. one sweep and not the drain, because
-    # the drain looks twice and a sweep that stopped at the refusal would have the second look find
-    # what the first had left, which is exactly the loss this is here to see
+    # the count is taken before the close and the close is in a finally clause, so a close that raises is
+    # the one place the sweep could lose it -- the refusing socket first, a healthy one behind it
     server = Server(0)
     try:
         refusing_sent = _PING * 70
@@ -1325,9 +1202,8 @@ def test_a_swept_socket_that_will_not_close_is_still_counted_and_does_not_end_th
 
 
 def test_a_swept_socket_that_will_not_close_costs_the_drain_neither_its_line_nor_the_figure(scripted_listener, caplog):
-    # the same refusal seen from the drain, whose one line is written from a finally clause: an error
-    # the sweep let out of its own finally would replace the line with a traceback, and the bytes the
-    # refusing socket held are in the figure only if the count was kept when the close failed
+    # the same refusal seen from the drain, whose one line is written from a finally clause: an error out of
+    # the sweep's own finally replaces that line with a traceback and loses the bytes it had counted
     server = Server(0)
     try:
         sent = _PING * 90
@@ -1346,10 +1222,8 @@ def test_a_swept_socket_that_will_not_close_costs_the_drain_neither_its_line_nor
 
 
 def test_a_swept_socket_is_closed_when_asking_what_it_holds_raises_something_unexpected(scripted_listener, monkeypatch):
-    # the close is in a finally clause so that it does not depend on the question being answered: the
-    # question catches OSError and ValueError inside itself, and anything else it raised would otherwise
-    # leave the swept socket open for as long as the exception took to be handled. nothing the kernel
-    # does makes it raise a RuntimeError, so the question is replaced
+    # the close is in a finally clause so it does not depend on the question being answered: the question
+    # catches OSError and ValueError itself, and anything else would leave the swept socket open
     server = Server(0)
     try:
         swept = scripted_listener.join(_PING * 20)
@@ -1383,16 +1257,8 @@ def _how_a_waiting_client_sees_its_connection(client, seconds):
 ], ids=["idle", "sent a command", "half-sent command"])
 def test_a_client_waiting_in_the_backlog_at_the_stop_is_closed_when_the_drain_starts_and_not_when_it_ends(
         make_connection, sent, ends_as):
-    # the entry sweep's one effect, and the only reason it is there: the sweep in the finally clause counts
-    # everything this one does, so the figure is the same without it. what differs is when a client that was
-    # already waiting when the stop landed finds out -- at the start of the drain, or when the drain is over,
-    # which at the shipped timeout is up to five seconds of a connected client whose requests nothing will
-    # read. the client is observed from inside the drain's first pass, which comes after the entry sweep and
-    # before the sweep in the finally clause, and a client left to the later sweep is still open there. one
-    # client per case, and the wait for the listener to be readable is what says its handshake has completed
-    # and it is pending: with several, readable would say only that one of them is. a swept client that had
-    # sent bytes sees the reset the listener's close was going to give it anyway, and an idle one sees an
-    # orderly close
+    # the entry sweep's one effect: the finally sweep counts everything it does, so what differs is when a
+    # client already waiting finds out -- at the drain's start, or five seconds later at the shipped timeout
     server, conn = make_connection([BlockingIOError, 10])
     conn.queue(b"x" * 10)
     server._flush(conn)                             # the blocked send, which holds the drain open for a pass
@@ -1430,11 +1296,8 @@ def test_a_client_waiting_in_the_backlog_at_the_stop_is_closed_when_the_drain_st
 
 
 def test_the_sweep_does_not_take_the_reserve_back_from_whoever_already_has_it(scripted_listener):
-    # the sweep used to release the reserve itself, one statement before its first accept. it no
-    # longer does: run() releases it before the shutdown save, the step whose failure costs the
-    # keyspace, and the save closes its temporary file before returning so the slot is free again
-    # here. a sweep that released it a second time would be closing a descriptor the kernel has
-    # since handed to something else
+    # the sweep no longer releases the reserve: run() releases it before the shutdown save, whose failure
+    # costs the keyspace, so a sweep releasing it again would close a descriptor since handed out
     server = Server(0)
     try:
         scripted_listener.join(_PING * 20)
@@ -1483,11 +1346,8 @@ def test_a_reserve_that_cannot_be_opened_is_reported_without_a_traceback_and_doe
         server._loop.close()
 
 
-# a real descriptor table that is really full, because the failure is the kernel's and nothing scripted
-# stands in for it faithfully: accept() raises EMFILE only when there is no descriptor to give. the child
-# builds its own Server and listener, says which port, and waits to be told that the client has sent; it then
-# lowers its own limit, fills what is left, and sweeps. the limit is lowered in the child and not here, where
-# it would take the rest of the suite's descriptors with it
+# a really full descriptor table, because accept() raises EMFILE only when there is no descriptor to give:
+# the child lowers its own limit and fills what is left, which here would take the rest of the suite's
 _FULL_TABLE_DRIVER = """
 import errno, logging, os, resource, sys
 sys.path.insert(0, %r)
@@ -1521,11 +1381,8 @@ _SENT_TO_THE_BACKLOG = 180
 
 @pytest.mark.parametrize("mode", ["reserve", "no reserve"])
 def test_the_backlog_sweep_counts_a_waiting_client_when_the_descriptor_table_is_full(tmp_path, mode):
-    # measured under `ulimit -n 30`: accept() raised EMFILE, the figure read 0 where 180 bytes had been
-    # sent, and the line that was meant to say so could not be printed. with a descriptor held in reserve
-    # the sweep counts them. the second case is the control that this instrument sees the failure at all,
-    # and the one that pins what the operator is left with when there is no reserve: a figure of 0 that
-    # says, in so many words and without a traceback, that it is short
+    # measured under `ulimit -n 30`: accept() raised EMFILE and the figure read 0 where 180 bytes were sent.
+    # with a reserve the sweep counts them; without it the operator gets a 0 that says it is short
     proc = subprocess.Popen(
         [sys.executable, "-c", _FULL_TABLE_DRIVER % str(REPO_ROOT), mode],
         stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, cwd=tmp_path)
@@ -1562,9 +1419,8 @@ def test_the_backlog_sweep_counts_a_waiting_client_when_the_descriptor_table_is_
     ("--write-buffer-limit", "abc"), ("--write-buffer-limit", "1e6"),
 ])
 def test_a_non_numeric_flag_names_the_flag_rather_than_the_validator(capsys, flag, value):
-    # argparse builds its own message from type='s __name__, which for these is a private
-    # function -- "invalid _port value: 'abc'" puts an internal identifier in front of a
-    # user who typed a bad port
+    # argparse builds its message from type='s __name__, so a private function puts an internal identifier
+    # in front of a user who typed a bad port -- invalid _port value: 'abc'
     with pytest.raises(SystemExit):
         build_arg_parser().parse_args([flag, value])
     message = capsys.readouterr().err
@@ -1573,10 +1429,7 @@ def test_a_non_numeric_flag_names_the_flag_rather_than_the_validator(capsys, fla
 
 
 def test_the_parser_accepts_the_limit_value_its_own_help_text_recommends():
-    # 0 reaches the class default without ever running the type= callback -- argparse
-    # calls it only on a value actually typed -- so every existing check of 0 goes around
-    # the validator rather than through it. Tightening `< 0` to `<= 0` therefore passes
-    # the whole suite while refusing to start for anyone who writes the flag explicitly,
-    # with an error that contradicts itself: "cannot be negative ... not 0"
+    # 0 reaches the class default without running the type= callback, so every other check of 0 goes around
+    # the validator: tightening `< 0` to `<= 0` passes the suite and refuses to start for anyone typing it
     assert build_arg_parser().parse_args(
         ["--write-buffer-limit", "0"]).write_buffer_limit == 0

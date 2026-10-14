@@ -4,7 +4,7 @@ import resp
 
 
 def _feed_one_byte_at_a_time(wire, expected_argv):
-    # Append wire into a bytearray one byte at a time, calling parse command after every byte and deleting the consumed prefix
+    # append wire a byte at a time, parsing after every byte and deleting the consumed prefix
     buf = bytearray()
     last_index = len(wire) - 1
     for index, byte in enumerate(wire):
@@ -57,7 +57,7 @@ def test_nested_array_matches_literal_encoding():
 
 
 def test_bulk_body_containing_crlf_is_one_value():
-    # the body is itself valid RESP, so a parser that scans for CRLF produces a plausible wrong answer rather than an obvious one
+    # the body is itself valid RESP, so a parser scanning for CRLF gives a plausible wrong answer
     body = b"*2\r\n$3\r\nfoo\r\n"
     wire = b"*1\r\n$%d\r\n" % len(body) + body + b"\r\n"
 
@@ -146,7 +146,7 @@ def test_empty_bulk_string():
 
 
 def test_every_buffer_type_parses_and_always_yields_bytes():
-    # memoryview has no .find(), so the parser normalises it first; nothing else in the suite exercises that branch
+    # memoryview has no .find(), so the parser normalises it first -- the only test on that branch
     wire = b"*1\r\n$1\r\nx\r\n"
     for buf in (wire, bytearray(wire), memoryview(wire)):
         argv, consumed, _ = resp.parse_command(buf)
@@ -196,9 +196,8 @@ def test_inline_unbalanced_quote_is_rejected(wire):
     assert exc_info.value.message == resp.UNBALANCED_QUOTES
 
 
-# sdssplitargs separates unquoted tokens on ' ', \n, \r and \t. isspace() is the wrong instrument:
-# it admits \v and \f, which real Redis keeps inside a token. \n is absent below because it ends the
-# line before the splitter is reached
+# sdssplitargs separates unquoted tokens on ' ', \n, \r and \t; isspace() admits \v and \f, which real
+# Redis keeps inside a token. \n is absent below because it ends the line before the splitter
 @pytest.mark.parametrize("sep", [b" ", b"\r", b"\t"])
 def test_inline_token_ends_on_every_sdssplitargs_separator(sep):
     argv, _consumed, _needed = resp.parse_command(b"ECHO" + sep + b"x\n")
@@ -271,7 +270,8 @@ def test_non_dollar_element_inside_multibulk_is_rejected():
 
 
 def test_control_bytes_in_error_frame_are_sanitized_but_printable_bytes_still_render():
-    # got is interpolated straight into the RESP error frame; a raw \r or \n there would split one frame into two on the wire, the way an unsanitized name once did in registry.dispatch
+    # got is interpolated straight into the error frame, and a raw \r or \n there would split one frame
+    # into two on the wire
     for wire in (b"*1\r\n\r", b"*1\r\n\n"):
         with pytest.raises(resp.ProtocolError) as exc_info:
             resp.parse_command(wire)
@@ -376,10 +376,7 @@ def test_a_multibulk_count_above_the_reference_ceiling_is_refused_at_the_header(
 
 @pytest.mark.parametrize("search_from", [-1, -4, -100])
 def test_a_negative_resume_position_does_not_read_as_an_offset_from_the_end(search_from):
-    # bytes.find(sub, start) treats a negative start as an offset from the end, so an
-    # unclamped resume position turns a complete header into "need more data" and parks
-    # the caller forever. no call site can pass one today -- Connection derives it from
-    # max(floor, len - 1) -- but the clamp is the only thing that keeps that true, and
-    # parse_bulk_element carries the same clamp for the same reason
+    # bytes.find(sub, start) reads a negative start as an offset from the end, so an unclamped resume
+    # turns a complete header into "need more data" and parks the caller for ever
     assert resp.parse_multibulk_header(b"*3\r\n", search_from) == (3, 4, 0)
     assert resp.parse_bulk_element(b"$1\r\na\r\n", search_from) == (b"a", 7, 0)

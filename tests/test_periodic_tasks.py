@@ -76,9 +76,8 @@ def _recording_calls(cls, method_name):
 
 
 def _flag_help(parser, flag):
-    # the parser's own action list rather than format_help(): the rendered text wraps at
-    # whatever width argparse finds, and these help strings name other flags, so a wrapped
-    # line beginning with `--snapshot-path` truncates any line-based reader of the entry
+    # the parser's own action list rather than format_help(): the rendered text wraps at whatever width
+    # argparse finds, and a wrapped line beginning with `--snapshot-path` truncates a line-based reader
     for action in parser._actions:
         if flag in action.option_strings:
             return " ".join(action.help.split())
@@ -173,9 +172,8 @@ def test_a_periodic_arm_fires_at_most_once_per_tick_not_once_per_missed_interval
 
 def test_an_interval_of_zero_arms_nothing_and_never_fires(tmp_path):
     with _injected_clock() as clock:
-        # a real path, not None: the CLI always supplies one, so a zero interval is the
-        # only thing between it and a save on every tick. with no path the snapshot arm
-        # stays unarmed for the other reason, and the interval's own check goes untested
+        # a real path and not None: the CLI always supplies one, so a zero interval is the only thing
+        # between it and a save on every tick -- with no path the arm stays unarmed for the other reason
         server = Server(0, snapshot_path=str(tmp_path / "dump.mrdb"), snapshot_interval=0,
                         expiry_sweep_interval=0)
         try:
@@ -234,9 +232,8 @@ def test_the_expiry_sweep_interval_is_read_as_milliseconds_not_seconds():
         "a 101 ms advance did not fire a 100 ms interval -- milliseconds were read as "
         "seconds, which is a sweep every hundred seconds")
 
-    # the arm above only proves the first deadline was read as milliseconds; _tick()
-    # re-arms the same interval on every fire through its own division, which the
-    # single fire above never revisits
+    # the arm above only proves the first deadline was read as milliseconds; _tick() re-arms the same
+    # interval through its own division on every fire, which a single fire never revisits
     with _injected_clock() as clock:
         server = Server(0, snapshot_interval=0, expiry_sweep_interval=100)
         try:
@@ -313,9 +310,8 @@ def test_the_sweep_drains_the_effect_queue_once_per_tick_not_once_per_sampling_p
         try:
             store = server._store
             now = store.now_ms()
-            # ten samples' worth of wholly expired keys, and a clock that does not
-            # advance, so the loop runs until the index is empty rather than until the
-            # budget is spent
+            # ten samples' worth of wholly expired keys and a clock that does not advance, so the loop
+            # runs until the index is empty rather than until the budget is spent
             for i in range(SWEEP_SAMPLE_SIZE * 10):
                 key = b"k%d" % i
                 store.write(key, b"v", keep_ttl=False)
@@ -337,7 +333,8 @@ def test_the_sweep_drains_the_effect_queue_once_per_tick_not_once_per_sampling_p
             server._loop.close()
 
 
-# each flag carries its own ending, spelled out in full and not read from the module under test: the sweep's 0 turns the sweep off, and the snapshot's 0 turns off only the periodic save, so a clean stop still saves. an assertion on "cannot be negative" alone would pass for either ending, and for the ending of any other flag, so a flag handed another's message would go unnoticed
+# each flag's own ending, spelled out in full and not read from the module under test: the sweep's 0 turns
+# the sweep off and the snapshot's only the periodic save, so cannot-be-negative alone passes for either
 _NEGATIVE_INTERVAL_REFUSALS = (
     pytest.param(
         "--snapshot-interval", "snapshot_interval",
@@ -428,12 +425,8 @@ def test_an_arm_that_raises_is_reported_in_full_without_a_traceback_and_keeps_it
                 assert len(attempts) == 3, (
                     "an arm that raised was not retried on its next interval", attempts)
 
-                # the loop above advances by exactly one interval per attempt, so a
-                # deadline left stuck in the past by the last failure would fire on
-                # that same cadence and this could not tell the two apart. ticking at
-                # the instant of the last failure, then short of a full interval, then
-                # past one, is what separates "fires again next interval" from "fires
-                # on every tick"
+                # a deadline stuck in the past by the last failure fires on the loop's own cadence:
+                # ticking at, short of, and past one interval is what tells the two apart
                 server._tick()
                 assert len(attempts) == 3, (
                     "a further attempt happened with no time having passed at all",
@@ -473,9 +466,8 @@ def test_an_arm_that_raises_is_reported_in_full_without_a_traceback_and_keeps_it
 
 
 def _guard_records(server, what, failures):
-    # drives _guard_task directly rather than through the tick: what is under test is the
-    # boundary's own reporting, and a tick would add an interval's arithmetic to every
-    # case for nothing
+    # drives _guard_task directly rather than through the tick: the boundary's own reporting is what is
+    # under test, and a tick would add an interval's arithmetic to every case for nothing
     records = []
     handler = logging.Handler()
     handler.emit = records.append
@@ -492,11 +484,8 @@ def _guard_records(server, what, failures):
 
 
 def test_a_task_failing_on_every_tick_reports_a_bounded_number_of_lines(tmp_path):
-    # the point of the bound. logging writes to stderr with a blocking write and this
-    # server has one thread, so a reader that stops fills its buffer and parks the loop
-    # inside the tick -- after which nothing is served and nothing more is logged. A save
-    # over a path whose snapshot cannot be replaced fails identically once an interval
-    # forever, which is the one thing here that can fill that buffer on its own
+    # the point of the bound: logging writes to stderr with a blocking write on the one thread here, so a
+    # reader that stops fills the buffer and parks the loop inside the tick, serving and logging nothing
     server = Server(0, snapshot_interval=0, expiry_sweep_interval=0)
     try:
         records = _guard_records(server, "snapshot save", [True] * 250)
@@ -511,10 +500,8 @@ def test_a_task_failing_on_every_tick_reports_a_bounded_number_of_lines(tmp_path
     assert len(summaries) == 250 // server_mod.FAILURE_REPEATS_PER_LINE, (
         "one line per FAILURE_REPEATS_PER_LINE suppressed failures, and no more",
         [r.getMessage() for r in summaries])
-    # the last line lands on the last multiple of the threshold, not on the last failure:
-    # nothing fires between multiples, so 250 failures are summarised at 100 and at 200
-    # and the final fifty are still unreported when the run ends. That is the bound doing
-    # its job rather than a gap -- a count is only owed periodically
+    # the last line lands on the last multiple of the threshold and not on the last failure: 250 failures
+    # are summarised at 100 and at 200 and the final fifty go unreported -- a count is only owed periodically
     assert "200" in summaries[-1].getMessage(), (
         "the summary has to carry the count, which is the only thing it adds",
         summaries[-1].getMessage())
@@ -524,9 +511,8 @@ def test_a_task_failing_on_every_tick_reports_a_bounded_number_of_lines(tmp_path
 
 
 def test_the_first_failure_after_a_recovery_is_reported_in_full_again(tmp_path):
-    # cleared on success rather than decayed: a task that failed, recovered and failed
-    # again is a second episode, and suppressing its traceback because an earlier one had
-    # already been printed would hide the failure an operator is actually looking for
+    # cleared on success rather than decayed: a task that failed, recovered and failed again is a second
+    # episode, and suppressing its traceback would hide the failure an operator is looking for
     server = Server(0, snapshot_interval=0, expiry_sweep_interval=0)
     try:
         records = _guard_records(
@@ -576,10 +562,8 @@ def test_an_arm_that_raises_does_not_escape_the_tick(tmp_path):
 def test_the_save_arm_leaves_the_previous_snapshot_intact_when_its_rename_fails(
     tmp_path, monkeypatch
 ):
-    # persistence.save()'s own tests prove the swap is atomic; this is what proves the save
-    # arm goes through it. an arm that wrote its path in place would pass every test that
-    # only reads the file back afterwards, and would destroy the previous snapshot the
-    # moment anything went wrong partway through the write
+    # persistence.save()'s own tests prove the swap is atomic; this proves the arm goes through it. an arm
+    # writing its path in place passes every read-it-back test and destroys the previous snapshot
     path = tmp_path / "dump.mrdb"
     previous = Store()
     previous.write(b"previous", b"v", keep_ttl=False)
@@ -637,9 +621,8 @@ def test_the_sweep_stops_on_its_time_budget_not_on_an_iteration_count():
     assert fast > 10 * slow, (
         "the two arms ran comparable numbers of passes, so this run could not have "
         "distinguished a time budget from an iteration cap", slow, fast)
-    # both arms take their costs from SWEEP_BUDGET_SECONDS itself, so a budget raised a
-    # hundredfold scales them with it and passes. the millisecond the sweep is held to is
-    # pinned here, against the literal
+    # both arms take their costs from SWEEP_BUDGET_SECONDS itself, so a budget raised a hundredfold scales
+    # them with it and passes: the millisecond the sweep is held to is pinned here against the literal
     assert SWEEP_BUDGET_SECONDS == 0.001, SWEEP_BUDGET_SECONDS
 
 
@@ -732,9 +715,8 @@ def test_startup_names_a_temporary_file_an_interrupted_save_left_and_leaves_it_a
     assert [m for m in warned if stranded.name in m], warned
     assert stranded.read_bytes() == b"left by a killed save"
 
-    # and ahead of the writability check as well: a start refused because the first save
-    # could not write the path names the file just the same. the refusal is stood in for by
-    # failing the check's own probe, since a test run as root can write a mode-0555 directory
+    # ahead of the writability check as well: a start refused because the first save could not write names
+    # the file just the same. stood in for by failing the probe, since root can write a mode-0555 directory
     def unwritable():
         with pytest.MonkeyPatch.context() as patch:
             def refuse(*args, **kwargs):
@@ -750,11 +732,8 @@ def test_startup_names_a_temporary_file_an_interrupted_save_left_and_leaves_it_a
 
 
 def test_the_two_shapes_of_stranded_temporary_file_are_warned_about_differently(tmp_path):
-    # is_legacy_temporary_name() is the one thing that tells the two shapes apart: a name
-    # built from the snapshot's own basename can only be this path's own interrupted
-    # save, where the bare tmpXXXXXXXX tempfile.mkstemp() itself would leave carries
-    # nothing about which snapshot -- or which program -- left it, so a warning claiming
-    # it holds THIS save's snapshot is a guess dressed as a fact
+    # is_legacy_temporary_name() tells the two shapes apart: a name built from the snapshot's basename can
+    # only be this path's interrupted save, where a bare tmpXXXXXXXX names neither snapshot nor program
     path = tmp_path / "dump.mrdb"
     good = Store()
     good.write(b"k", b"v", keep_ttl=False)
@@ -811,10 +790,8 @@ def test_a_path_the_first_save_could_not_write_refuses_construction_and_opens_no
             for ignore in (False, True):
                 with pytest.raises(persistence.SnapshotError, match="cannot write snapshot"):
                     Server(0, snapshot_path=path, ignore_snapshot=ignore)
-        # with saving off the directory at the path is still refused, by the load rather
-        # than by the write check: without --ignore-snapshot the refusal never depends on
-        # the interval, only which of the two reasons it gives does. with the flag and
-        # saving off, nothing reads or writes the path at all and the server starts
+        # with saving off the directory at the path is still refused, by the load rather than by the write
+        # check; with the flag and saving off, nothing reads or writes the path and the server starts
         with pytest.raises(persistence.SnapshotError, match="cannot read snapshot"):
             Server(0, snapshot_path=in_the_way, snapshot_interval=0)
         assert built == [], ("a refused construction opened a selector", built)
@@ -925,9 +902,8 @@ def test_main_exits_one_naming_the_path_when_the_snapshot_is_corrupt(tmp_path):
         assert exc.code == 1, (
             "a corrupt snapshot is not a usage error, so not argparse's 2", exc.code)
     assert str(bad) in err.getvalue(), err.getvalue()
-    # and the way past it is named: --ignore-snapshot's own help calls itself the escape hatch for
-    # a file that refuses to load, and none of these refusals used to mention it, while every
-    # numeric refusal this parser writes already points at its own way out
+    # and the way past it is named: --ignore-snapshot's own help calls itself the escape hatch for a file
+    # that refuses to load, and none of these refusals used to mention it
     assert "--ignore-snapshot" in err.getvalue(), (
         "the refusal that announces an unloadable snapshot has to name the flag that exists "
         "for exactly that file", err.getvalue())
@@ -937,9 +913,8 @@ def test_main_exits_one_naming_the_path_when_the_snapshot_is_corrupt(tmp_path):
 
 
 def test_a_snapshot_a_newer_build_wrote_is_not_called_corrupt(tmp_path):
-    # "corrupt snapshot: unsupported snapshot version" sent an operator looking for bad hardware
-    # when what they had was version skew. the checksum passed, so the bytes are exactly what some
-    # build wrote and nothing about them is corrupt
+    # "corrupt snapshot: unsupported snapshot version" sent an operator looking for bad hardware when what
+    # they had was version skew: the checksum passed, so the bytes are exactly what some build wrote
     import struct, zlib
     # the lower version does not say "an older build": SNAPSHOT_VERSION has been 1 since the
     # format was introduced, with the checksum, so nothing ever wrote a lower one
@@ -970,9 +945,8 @@ def test_a_snapshot_a_newer_build_wrote_is_not_called_corrupt(tmp_path):
 
 
 def test_an_unwritable_path_is_not_offered_the_ignore_snapshot_remedy(tmp_path):
-    # the control on the line above: --ignore-snapshot is not the answer to a path no save could
-    # write, because such a server starts and then fails at its first save, so offering it there
-    # would send the operator past the one refusal that was right
+    # the control on the line above: --ignore-snapshot is not the answer to a path no save could write,
+    # since such a server starts and then fails at its first save, past the one refusal that was right
     missing = tmp_path / "nope" / "dump.mrdb"
     err = io.StringIO()
     try:
@@ -987,10 +961,8 @@ def test_an_unwritable_path_is_not_offered_the_ignore_snapshot_remedy(tmp_path):
 
 REPO_ROOT = pathlib.Path(__file__).resolve().parent.parent
 
-# run()'s own loop, in a subprocess with a deadline: the failure this pins is a loop that
-# ticks nothing, and the stop below comes from a plain sleep on another thread so that
-# failure prints counts rather than hanging the suite. the tick counter is a subclass in
-# the shape tests/test_server_lifecycle.py:344-374 already uses for _open_listener
+# run()'s own loop, in a subprocess with a deadline: the failure this pins is a loop that ticks nothing,
+# and the stop comes from a sleep on another thread so that failure prints counts rather than hanging
 _TICK_FROM_RUN = """
 import pathlib, sys, threading, time
 sys.path.insert(0, sys.argv[1])
@@ -1037,10 +1009,8 @@ print("saved=%s" % pathlib.Path(sys.argv[2]).exists())
 
 
 def test_run_arms_both_deadlines_and_ticks_from_its_own_loop(tmp_path):
-    # the one test that drives run() itself -- no other test in this module calls it, so
-    # deleting the tick from run()'s loop body, or deleting the self._arm_periodic_tasks()
-    # call from run(), leaves every other test in this module green and ships a server that
-    # never sweeps and never saves
+    # the one test that drives run() itself, so deleting the tick from run()'s loop body or the
+    # _arm_periodic_tasks() call leaves every other test here green and ships a server that never saves
     path = tmp_path / "dump.mrdb"
     probe = subprocess.run(
         [sys.executable, "-c", _TICK_FROM_RUN, str(REPO_ROOT), str(path)],
@@ -1070,9 +1040,8 @@ def test_run_arms_both_deadlines_and_ticks_from_its_own_loop(tmp_path):
 
 
 def test_ignore_snapshot_discards_a_valid_snapshot_and_says_so(tmp_path):
-    # both existing checks pair the flag with a CORRUPTED file, which is why nothing
-    # noticed that the branch never calls persistence.load at all: a perfectly good
-    # snapshot is discarded too, and the next interval overwrites it
+    # both existing checks pair the flag with a CORRUPTED file, which is why nothing noticed the branch
+    # never calls persistence.load at all: a perfectly good snapshot is discarded and then overwritten
     seed = Store()
     for key in (b"cart:42", b"sessions", b"users"):
         seed.write(key, b"v", keep_ttl=False)
@@ -1096,16 +1065,14 @@ def test_ignore_snapshot_discards_a_valid_snapshot_and_says_so(tmp_path):
     finally:
         loading._loop.close()
 
-    # every surface that describes this flag: a wording corrected in one place can
-    # survive in another place nothing checks, so a check that inspects only one
-    # surface can still miss it
+    # every surface that describes this flag: a wording corrected in one place can survive in another
+    # that nothing checks, so a check inspecting one surface still misses it
     UNCONDITIONAL = "whether or not it is readable"
     FORBIDDEN = ("empty keyspace if", "if the snapshot", "if a snapshot", "if the file",
                  "that fails to load", "that is corrupt", "that cannot be read",
                  "empty over a corrupt", "corrupt file rather than refuse")
-    # both are required: the help text and README.md each have to spell the flag out
-    # as unconditional, because a wording corrected in only one of them can still
-    # survive in the other, where nothing checks it
+    # both are required: the help text and README.md each have to spell the flag out as unconditional,
+    # since a wording corrected in one of them can survive in the other
     REQUIRED = {"--help", "README.md"}
     surfaces = [("--help", _flag_help(build_arg_parser(), "--ignore-snapshot"))]
     published = REPO_ROOT / "README.md"
@@ -1126,10 +1093,8 @@ def test_ignore_snapshot_discards_a_valid_snapshot_and_says_so(tmp_path):
     assert not conditional, (
         "a surface still promises a conditional the branch does not implement", conditional)
 
-    # the control: a sentence that makes the empty start conditional on a broken file,
-    # planted here, has to be refused by both arms above -- the one requiring the
-    # unconditional wording and the one forbidding the conditional phrases -- or the
-    # check could not fail
+    # the control: a planted sentence making the empty start conditional on a broken file has to be
+    # refused by both arms above -- the unconditional wording and the forbidden phrases -- or neither fails
     planted = ("--ignore-snapshot takes no value of its own: passed, a snapshot file that "
                "fails to load starts the keyspace empty instead of refusing to start.")
     assert UNCONDITIONAL not in planted, "the arm that requires the wording cannot fail"
@@ -1148,10 +1113,8 @@ def test_the_snapshot_arm_re_arms_a_whole_interval_out(tmp_path):
             clock.t += 61.0
             server._tick()
             assert len(saves) == 1, ("the first save never fired", saves)
-            # the re-arm read back, which one tick alone never does. a spurious /1000
-            # saves every 60 ms and pins the single-threaded loop; a spurious *1000 saves
-            # every 16.7 hours and makes README's "up to one interval" a lie by three
-            # orders of magnitude. both are one token
+            # the re-arm read back, which one tick never does: a spurious /1000 saves every 60 ms and pins the
+            # loop, where a spurious *1000 saves every 16.7 hours -- both are one token
             clock.t += 59.0
             server._tick()
             assert len(saves) == 1, (
@@ -1167,12 +1130,8 @@ def test_the_snapshot_arm_re_arms_a_whole_interval_out(tmp_path):
 
 
 def test_a_sampling_pass_that_raises_still_drains_what_the_earlier_passes_queued():
-    # the drain is the sweep's last act whatever ends it, because the queue it leaves
-    # behind is read by whoever comes next: _dispatch_batch drains once per dispatched
-    # command, so DELs the sweep queued and did not take back are handed to the next
-    # command as if that command had caused them. a drain written as the loop's last
-    # line instead of a finally is skipped by exactly the case that leaves entries on
-    # the queue -- a pass that raises after an earlier one already removed keys
+    # the drain is the sweep's last act whatever ends it: DELs the sweep queued and did not take back are
+    # handed to the next command, and a drain on the loop's last line is skipped by a pass that raises
     with _injected_clock():
         server = Server(0)
         try:
@@ -1209,10 +1168,8 @@ def test_a_sampling_pass_that_raises_still_drains_what_the_earlier_passes_queued
     ("--expiry-sweep-interval", "expiry_sweep_interval"),
 ], ids=["snapshot", "sweep"])
 def test_an_interval_past_what_can_be_scheduled_is_refused_at_both_doors(flag, keyword):
-    # the other end of the rule the negative check holds: a value this large reaches the
-    # arithmetic that schedules it -- a clock reading plus the interval, or the interval
-    # divided into seconds -- and leaves as an OverflowError traceback, which is the one
-    # shape of bad value the CLI answered with a crash rather than a refusal
+    # the other end of the rule the negative check holds: a value this large reaches the scheduling
+    # arithmetic and leaves as an OverflowError traceback, the one bad value the CLI answered with a crash
     too_large = 10 ** 400
     with pytest.raises(SystemExit):
         build_arg_parser().parse_args([flag, str(too_large)])
@@ -1225,10 +1182,8 @@ def test_an_interval_past_what_can_be_scheduled_is_refused_at_both_doors(flag, k
     ("--expiry-sweep-interval", "expiry_sweep_interval"),
 ], ids=["snapshot", "sweep"])
 def test_the_scheduling_ceiling_itself_is_accepted_and_one_past_it_is_refused(flag, keyword):
-    # _check_schedulable compares with `>`, never `>=`: the ceiling itself still has to
-    # reach the arithmetic that schedules it -- a clock reading plus the interval, or the
-    # interval divided into seconds -- rather than being refused alongside the value one
-    # past it, which is the one the check exists to keep out of that arithmetic
+    # _check_schedulable compares with `>`, never `>=`: the ceiling itself still has to reach the
+    # scheduling arithmetic rather than being refused alongside the value one past it
     args = build_arg_parser().parse_args([flag, str(MAX_SCHEDULABLE_INTERVAL)])
     assert getattr(args, keyword) == MAX_SCHEDULABLE_INTERVAL
 
@@ -1246,13 +1201,8 @@ def test_the_scheduling_ceiling_itself_is_accepted_and_one_past_it_is_refused(fl
 
 
 def test_the_snapshot_arm_counts_its_interval_from_when_the_save_finished(tmp_path):
-    # the interval is the gap between saves, not a window a long save eats into, which is
-    # what `CONFIG GET save` claims when it spells the schedule in the reference's syntax:
-    # there a rule fires once the clock is past its seconds counted from the last
-    # completed save. a deadline taken before the save runs charges the save's own
-    # duration against the next interval, so a save longer than its interval runs again
-    # the moment it returns -- back to back, on the one thread that answers commands,
-    # with the reply still advertising a gap between them
+    # the interval is the gap between saves and not a window a long save eats into, which is what
+    # `CONFIG GET save` claims: a deadline taken before the save makes a long save run back to back
     with _injected_clock() as clock:
         server = Server(0, snapshot_path=str(tmp_path / "dump.mrdb"),
                         snapshot_interval=60, expiry_sweep_interval=0)
@@ -1284,14 +1234,8 @@ def test_the_snapshot_arm_counts_its_interval_from_when_the_save_finished(tmp_pa
 
 
 def test_the_sweep_arm_counts_its_interval_from_when_the_tick_started_not_from_when_the_sweep_returned():
-    # the mirror of the test above, and the opposite rule: the sweep re-arms from the
-    # same clock reading _tick() took at its own start, before _sweep_expired ever runs,
-    # where the save arm re-arms from a fresh reading taken after the save returns. the
-    # sweep is held to its own millisecond budget rather than to _tick()'s cadence, so
-    # counting its interval from after a slow pass returned would run it back to back
-    # with itself exactly the way a slow save is not allowed to -- moving the sweep's
-    # re-arm after _guard_task, to match the save arm's own ordering, passes every other
-    # test in this module and fails only here
+    # the mirror and the opposite rule: the sweep re-arms from the reading _tick() took at its own start,
+    # where the save arm re-arms after the save returns -- moving it after _guard_task fails only here
     with _injected_clock() as clock:
         server = Server(0, snapshot_path=None, snapshot_interval=0,
                         expiry_sweep_interval=100)
@@ -1312,10 +1256,8 @@ def test_the_sweep_arm_counts_its_interval_from_when_the_tick_started_not_from_w
             assert server._next_sweep_at == pytest.approx(tick_started_at + 0.1), (
                 "the sweep's next deadline was not counted from the reading the tick "
                 "took before the sweep ran", server._next_sweep_at, tick_started_at)
-            # the clock already moved 90 seconds inside the sweep, so the rearmed
-            # deadline -- tick_started_at + 0.1 -- is already well behind it; the very
-            # next tick has to fire the sweep again rather than waiting a fresh 0.1
-            # seconds from here
+            # the clock already moved 90 seconds inside the sweep, so the rearmed deadline --
+            # tick_started_at + 0.1 -- is behind it and the very next tick has to fire the sweep again
             server._tick()
             assert len(sweeps) == 2, (
                 "the sweep did not fire again although its rearmed deadline was already "
@@ -1326,11 +1268,8 @@ def test_the_sweep_arm_counts_its_interval_from_when_the_tick_started_not_from_w
 
 
 def test_a_second_run_on_an_already_ran_server_arms_nothing(tmp_path):
-    # run()'s own ordering: the if self._ran: check has to run before
-    # _arm_periodic_tasks(), not after -- swap the two and a server that already ran and
-    # stopped answers CONFIG GET save's schedule again the moment run() is called a
-    # second time, even though the second call never gets past the RuntimeError to open
-    # a listener, tick anything, or reach the finally that would disarm it again
+    # run()'s own ordering: the `if self._ran` check has to run before _arm_periodic_tasks(), or a server
+    # that already ran answers CONFIG GET save's schedule again although the second call arms nothing
     server = Server(0, snapshot_path=str(tmp_path / "dump.mrdb"), snapshot_interval=60,
                     expiry_sweep_interval=0)
     try:
@@ -1345,11 +1284,8 @@ def test_a_second_run_on_an_already_ran_server_arms_nothing(tmp_path):
 
 
 def test_main_lets_a_non_snapshot_construction_failure_propagate(monkeypatch):
-    # main()'s own comment promises this: only persistence.SnapshotError is turned into
-    # a one-line message and a clean exit. anything else raised while constructing a
-    # Server -- a bug, an unrelated OSError -- is left to crash with its own traceback,
-    # which `except Exception` here would swallow just as readily as the one exception
-    # this is supposed to catch
+    # only persistence.SnapshotError is turned into a one-line message and a clean exit: anything else
+    # raised while constructing a Server crashes with its own traceback, which `except Exception` would eat
     def exploding_server(*args, **kwargs):
         raise RuntimeError("not a SnapshotError")
 
@@ -1359,13 +1295,8 @@ def test_main_lets_a_non_snapshot_construction_failure_propagate(monkeypatch):
 
 
 def test_a_periodic_task_raising_keyboardinterrupt_escapes_the_tick():
-    # _guard_task's `except Exception` is deliberate, not a stand-in for a broader catch:
-    # a KeyboardInterrupt or SystemExit raised inside a periodic task has to leave the
-    # tick rather than being logged and swallowed, the same rule _guard already follows
-    # for a connection, and what lets an interrupt arriving during a save still end the
-    # process. widening the clause to `except BaseException` passes every other test in
-    # this module, and this one drives _tick() directly so that mutant fails here on the
-    # missing exception rather than on a loop that never ends
+    # _guard_task's `except Exception` is deliberate: a KeyboardInterrupt or SystemExit inside a task has
+    # to leave the tick rather than be logged, and `except BaseException` passes every other test here
     server = Server(0, snapshot_path=None, snapshot_interval=0, expiry_sweep_interval=1)
     try:
         def exploding():
@@ -1381,12 +1312,8 @@ def test_a_periodic_task_raising_keyboardinterrupt_escapes_the_tick():
 
 
 def test_run_unwinds_cleanly_when_a_periodic_task_raises_keyboardinterrupt():
-    # the other half of the rule above, at run()'s own level: an interrupt from inside a
-    # task takes the same way out as any other raise -- the loop closed, both deadlines
-    # disarmed, both signal handlers restored -- rather than leaving a half-stopped
-    # server behind. the task raises once and then stops the loop, so a boundary that
-    # swallowed the interrupt ends this test on the missing exception instead of hanging
-    # the suite on a sweep that raises every interval forever
+    # the other half at run()'s own level: an interrupt from inside a task takes the same way out as any
+    # raise -- loop closed, both deadlines disarmed, both handlers restored -- not a half-stopped server
     before = (signal.getsignal(signal.SIGINT), signal.getsignal(signal.SIGTERM))
     server = Server(0, snapshot_path=None, snapshot_interval=0, expiry_sweep_interval=1)
     raised = []
@@ -1410,13 +1337,8 @@ def test_run_unwinds_cleanly_when_a_periodic_task_raises_keyboardinterrupt():
 
 
 def test_the_first_failure_line_carries_the_notes_the_exception_arrived_with(tmp_path):
-    # the defect this exists for: persistence.save() attaches a note to say it stranded a
-    # full-size temporary file -- a whole copy of the keyspace, one per failed interval -- and
-    # its own comment says the note "rides along on the exception the caller already logs".
-    # str() never renders __notes__; only traceback formatting does, and this line writes no
-    # traceback. So the line reporting the failure was the only report there would be of a copy
-    # of the keyspace left on disk, and it did not mention it. Measured against a real server
-    # under an ACL that denied the removal: four 104,816-byte files, four log lines, no mention
+    # the one line reporting a failed save was the only report of a stranded full-size copy of the keyspace
+    # and did not mention it: str() never renders __notes__. measured: four 104,816-byte files, no mention
     server = Server(0, snapshot_interval=0, expiry_sweep_interval=0)
 
     def step():

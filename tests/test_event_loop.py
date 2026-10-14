@@ -17,7 +17,8 @@ class Harness:
         self.readable = []
         self.writable = []
         self.order = []
-        # a short timeout, because several tests drive passes that are meant to find nothing ready and an unbounded select() there would hang the suite
+        # a short timeout: several tests drive passes meant to find nothing ready, and an unbounded
+        # select() there would hang the suite
         self.loop = EventLoop(self._accept, self._read, self._write, 0.01)
         self.conns = []
         self.peers = []
@@ -118,7 +119,8 @@ def test_clearing_both_interests_unregisters_rather_than_asking_for_an_empty_mas
     h.loop.register(via_read)
     h.loop.set_write_interest(via_write, True)
     h.loop.set_read_interest(via_write, False)
-    # a spy rather than the selector's own refusal, because epoll accepts an empty mask and the assertion has to hold there too
+    # a spy rather than the selector's own refusal, because epoll accepts an empty mask and the
+    # assertion has to hold there too
     with (
         mock.patch.object(sel, "modify", wraps=sel.modify) as modify,
         mock.patch.object(sel, "register", wraps=sel.register) as register,
@@ -142,7 +144,8 @@ def test_a_connection_unregistered_by_clearing_both_is_registered_again_by_eithe
         h.loop.set_write_interest(conn, False)
         assert not h.is_registered(conn)
         assert restore(conn, True) is True
-        # dispatch finds the connection through the key's data, so a re-registration that dropped it would fire nothing
+        # dispatch finds the connection through the key's data, so a re-registration that dropped it
+        # would fire nothing
         assert h.loop._selector.get_key(conn).data is conn
 
 
@@ -167,10 +170,12 @@ def test_restoring_read_interest_on_a_write_only_connection_modifies_rather_than
     conn = h.make()
     h.loop.register(conn)
     h.loop.set_write_interest(conn, True)
-    # what end of input does during a shutdown drain to a connection that still owes bytes: read interest goes, write interest stays, and the connection is still registered
+    # what end of input does during a drain to a connection still owing bytes: read interest goes,
+    # write interest stays, and the connection is still registered
     assert h.loop.set_read_interest(conn, False) is True
     assert h.mask(conn) == WRITE
-    # a spy on modify and nothing else, because the resulting mask reads the same whether the applier modified the registration or tore it down and made it again, and a spy on register cannot tell them apart where the standard library's own modify is an unregister and a register, as it is on kqueue
+    # a spy on modify alone: the mask reads the same whether the applier modified or tore down and
+    # remade the registration, and on kqueue the library's own modify is an unregister and a register
     with mock.patch.object(sel, "modify", wraps=sel.modify) as modify:
         assert h.loop.set_read_interest(conn, True) is True
     assert masks_asked(modify) == [READ | WRITE]
@@ -191,7 +196,8 @@ def test_an_unchanged_mask_does_not_touch_the_selector(h):
         mock.patch.object(sel, "modify", wraps=sel.modify) as modify,
         mock.patch.object(sel, "unregister", wraps=sel.unregister) as unregister,
     ):
-        # a bit already set, a bit already clear, and an absent connection asked to give up interest it never had
+        # a bit already set, a bit already clear, and an absent connection asked to give up interest it
+        # never had
         assert h.loop.set_read_interest(both, True) is False
         assert h.loop.set_write_interest(both, True) is False
         assert h.loop.set_write_interest(read_only, False) is False
@@ -217,7 +223,8 @@ def test_unregister_is_idempotent(h):
 
 
 def test_unregister_is_idempotent_for_a_closed_connection(h):
-    # a closed socket reports descriptor -1, which the selector rejects with ValueError before it looks anything up, where an open one it does not hold raises KeyError. both are the same state to a caller: not registered.
+    # a closed socket reports descriptor -1, which the selector rejects with ValueError, where an open
+    # one it does not hold raises KeyError -- both are not-registered to a caller
     bystander = h.make()
     h.loop.register(bystander)
     never_registered = h.make()
@@ -234,7 +241,8 @@ def test_unregister_is_idempotent_for_a_closed_connection(h):
         h.loop.unregister(absent)
         assert h.loop.set_write_interest(absent, False) is False
         assert h.loop.set_read_interest(absent, False) is False
-    # the selector still finds a registration by identity after its socket closes, so the one that was never removed is removed here rather than skipped as absent
+    # the selector still finds a registration by identity after its socket closes, so the one never
+    # removed is removed here rather than skipped as absent
     h.loop.unregister(closed_while_registered)
     assert list(h.loop._selector.get_map()) == [bystander.fileno()]
     assert h.mask(bystander) == READ
@@ -264,7 +272,8 @@ def test_a_listener_unregistered_mid_loop_dispatches_no_further_accepts(h):
         listener.listen()
         h.loop.register_listener(listener)
         client.connect(listener.getsockname())
-        # the harness never accept()s, so the pending connection keeps the listener readable on every pass; two dispatches before the unregister is what makes silence after it mean something
+        # the harness never accept()s, so the pending connection keeps the listener readable every pass;
+        # two dispatches before the unregister is what makes silence after it mean something
         h.loop.run_once()
         h.loop.run_once()
         assert len(h.accepted) == 2
@@ -298,15 +307,8 @@ def test_run_once_dispatches_read_and_write_for_one_connection_in_one_pass(h):
     ids=["one-entry-both-bits", "write-entry-first", "read-entry-first"],
 )
 def test_run_once_dispatches_no_second_arm_to_a_connection_the_first_one_closed(h, ready, first):
-    # one select() return carries both read and write readiness for the same descriptor --
-    # the test above is the live witness that it does -- and the arm that runs first is free
-    # to close the connection, which the dispatch loop has to notice before it runs the
-    # other: a closed socket's descriptor is -1, and a handler handed one has nothing to
-    # work with. how that readiness is reported is the backends' own business, one entry
-    # carrying both bits or one entry per filter in either order, so every shape is driven
-    # here rather than only the one this machine happens to produce -- the arm whose turn
-    # comes second is a different arm under each of them, and a guard on one alone would
-    # pass for the shapes that never reach it
+    # one select() return carries both bits for one descriptor, and the arm that runs first may close
+    # the connection -- a closed socket's descriptor is -1, so every reporting shape is driven here
     conn = h.make()
     h.loop.register(conn)
     h.loop.set_write_interest(conn, True)
@@ -328,7 +330,8 @@ def test_run_once_dispatches_no_second_arm_to_a_connection_the_first_one_closed(
 
 
 def test_the_selector_itself_refuses_an_empty_mask(h):
-    # shaped as a disjunction because the backends disagree: kqueue raises and drops the registration, epoll accepts the empty mask. it exists so the applier's never-ask-for-zero test cannot pass vacuously on a backend that tolerates it.
+    # a disjunction because the backends disagree -- kqueue raises and drops the registration, epoll
+    # accepts mask 0 -- so the applier's never-ask-for-zero tests cannot pass vacuously
     sel = h.loop._selector
     conn = h.make()
     h.loop.register(conn)

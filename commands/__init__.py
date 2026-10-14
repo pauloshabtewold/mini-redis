@@ -2,7 +2,8 @@
 
 from commands.registry import dispatch
 
-# a decorator registers only when its module is imported; without this the registry is empty in the running server, and only a test that reaches the package rather than a handler module can see it
+# a decorator registers only when its module is imported: without this the registry is empty in
+# the running server, and only a test reaching the package rather than a handler module sees it
 from commands import server as _server_commands
 from commands import string as _string_commands
 from commands import list as _list_commands

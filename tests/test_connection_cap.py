@@ -41,7 +41,7 @@ INFO = b"*1\r\n$4\r\nINFO\r\n"
 
 @contextlib.contextmanager
 def _injected_clock(start=1_000.0):
-    # server.py's own `time` binding is replaced and not time.monotonic itself, because patching the real function reaches every module in this process. the namespace holds exactly the three names server.py reads from it
+    # server.py's own `time` is rebound, not time.monotonic itself, which would reach every module here
     clock = types.SimpleNamespace(t=start)
     real = server_mod.time
     server_mod.time = types.SimpleNamespace(monotonic=lambda: clock.t, time=real.time, sleep=real.sleep)
@@ -59,7 +59,8 @@ def _capped(cap):
 
 
 def _until_closed(client):
-    # a clean close and a reset are the two spellings of one refusal, and neither carries a byte, so both end in whatever had been received by then. a timeout is the failure: the server kept the connection
+    # a clean close and a reset are the two spellings of one refusal and neither carries a byte; a
+    # timeout is the failure, meaning the server kept the connection
     client.settimeout(1)
     received = b""
     try:
@@ -98,7 +99,8 @@ class _Records(logging.Handler):
 
 @contextlib.contextmanager
 def _server_log():
-    # DEBUG is below the logger's inherited level, so it is lowered for the duration and put back: a DEBUG record that was never emitted would make "quieter" pass for the wrong reason
+    # DEBUG is below the logger's inherited level, so it is lowered and put back: a DEBUG record never
+    # emitted would make "quieter" pass for the wrong reason
     log = logging.getLogger("server")
     handler = _Records()
     before = log.level
@@ -118,7 +120,8 @@ def test_the_connection_at_the_cap_is_admitted():
         assert server.connected_clients == 2, "a cap of two refused one of the first two clients"
         assert _ping(server, first) == b"+PONG\r\n"
         assert _ping(server, second) == b"+PONG\r\n"
-        # the other side of the same boundary: with a count equal to the cap there is no room for one more, so a comparison that reads equal as not-yet-full admits a third here
+        # with a count equal to the cap there is no room for one more, so a comparison reading equal as
+        # not-yet-full admits a third here
         third = connect()
         pump(server, times=6)
         assert server.connected_clients == 2, "a third client was admitted at a cap of two"
@@ -131,14 +134,16 @@ def test_the_connection_past_the_cap_is_refused():
         pump(server, times=8)
         assert server.connected_clients == 3
         refused = connect()
-        # a socket dropped without a close is closed by the garbage collector on CPython, which looks the same from the client and warns here: the refusal has to close it itself
+        # a socket dropped without a close is closed by CPython's collector, which looks the same from
+        # the client and warns here: the refusal has to close it itself
         with warnings.catch_warnings(record=True) as caught:
             warnings.simplefilter("always")
             pump(server, times=4)
             gc.collect()
         assert not [w for w in caught if issubclass(w.category, ResourceWarning)], [str(w.message) for w in caught]
         assert _until_closed(refused) == b"", "the refused client was answered"
-        # a cap lowered beneath a count that already exceeds it still refuses, so the test is on "is there room" and not on "is the count exactly the cap"
+        # a cap lowered beneath a count that already exceeds it still refuses: the question is "is there
+        # room" and not "is the count exactly the cap"
         server.max_connections = 2
         lowered = connect()
         pump(server, times=4)
@@ -161,10 +166,8 @@ def test_a_refused_connection_never_enters_the_connection_set():
 
 
 def test_a_refused_connection_still_counts_as_one_received():
-    # the two counts answer different questions and a refusal separates them: connected_clients is
-    # how many there are, total_connections_received is how many there have been, and a cap
-    # turning a retrier away is the traffic an operator most needs to see. counting the refusal
-    # after the cap instead would make a saturated server read as an idle one in redis-cli --stat
+    # connected_clients is how many there are and total_connections_received how many there have been:
+    # counting a refusal after the cap would make a saturated server read as idle in redis-cli --stat
     with _capped(2) as (server, connect):
         _first, _second = connect(), connect()
         pump(server, times=6)
@@ -195,7 +198,8 @@ def test_a_refused_connection_receives_no_bytes_before_the_close():
         kept = connect()
         pump(server, times=4)
         refused = connect()
-        # sent before the server has looked at the connection, so a reply of any kind -- a PONG, an error line explaining the refusal -- has a request to answer
+        # sent before the server has looked at the connection, so a reply of any kind would have a
+        # request to answer
         refused.sendall(PING)
         pump(server, times=4)
         assert _until_closed(refused) == b""
@@ -243,7 +247,8 @@ def test_a_negative_cap_is_refused_at_the_cli(capsys):
 def test_a_negative_cap_is_refused_by_the_constructor():
     with pytest.raises(ValueError, match="max_connections"):
         Server(0, max_connections=-1)
-    # appended after the existing parameters, so a caller that passes the first four positionally and the rest by name is unaffected
+    # appended after the existing parameters, so a caller passing the first four positionally and the
+    # rest by name is unaffected
     server = Server(0, 0, 0, 0, max_connections=7)
     try:
         assert server.max_connections == 7
@@ -262,7 +267,8 @@ def test_the_first_refusal_warns_and_the_rest_are_quieter():
         episode = [record.levelno for record in records if "refusing" in record.getMessage()]
         assert episode == [logging.WARNING, logging.DEBUG, logging.DEBUG], episode
 
-        # the count falls back below the cap and the slot is taken again, and a refusal after that is still the same episode: a close is what a saturated cap's retrier is waiting for, so it cannot be what ends one
+        # a refusal after the slot is freed and taken again is still the same episode: a close is what a
+        # saturated cap's retrier is waiting for, so it cannot be what ends one
         records.clear()
         kept.close()
         pump(server, times=6)
@@ -286,7 +292,8 @@ def test_a_quiet_gap_starts_a_new_episode():
         kept = connect()
         pump(server, times=4)
         outcomes = []
-        # the first refusal, one exactly a gap later, and one a little more than a gap after that: only a gap longer than the limit ends the episode, so the second is the same episode and the third is a new one
+        # the first refusal, one exactly a gap later, and one a little more: only a gap longer than the
+        # limit ends an episode, so the second is the same one and the third is new
         for step in (0, REFUSAL_EPISODE_GAP_SECONDS, REFUSAL_EPISODE_GAP_SECONDS + 1):
             clock.t += step
             refused = connect()
@@ -302,11 +309,13 @@ def test_a_churning_cap_does_not_write_a_warning_per_refusal(monkeypatch):
     every = 4
     monkeypatch.setattr(server_mod, "REFUSALS_PER_LINE", every)
     refusals = 12
-    # a cap that is neither one, which is what the first refusal's own count is, nor the interval between count lines, so a figure printed from the wrong source reads differently from the right one
+    # a cap that is neither 1, the first refusal's own count, nor the interval between count lines, so a
+    # figure printed from the wrong source reads differently from the right one
     cap = 3
     with _server_log() as records, _capped(cap) as (server, connect):
         for _ in range(refusals):
-            # the slots are held by short-lived clients while another knocks, and freed again before the next group: a close, and an admission, between every two refusals
+            # slots held by short-lived clients while another knocks, and freed before the next group: a
+            # close, and an admission, between every two refusals
             holders = [connect() for _ in range(cap)]
             pump(server, times=cap + 4)
             refused = connect()
@@ -319,12 +328,14 @@ def test_a_churning_cap_does_not_write_a_warning_per_refusal(monkeypatch):
         lines = _refusals_logged(records)
     assert len(lines) == refusals, "a refusal was not logged at all, at any level"
     levels = [line.levelno for line in lines]
-    # the first in full and then one line per `every`, the same shape as a periodic task's failures: one warning per refusal is what a close re-arming it wrote, and 300 refusals wrote 300 lines
+    # the first in full and then one line per `every`: one warning per refusal is what a close re-arming
+    # the episode wrote, and 300 refusals wrote 300 lines
     assert levels == [logging.WARNING if n == 1 or n % every == 0 else logging.DEBUG for n in range(1, refusals + 1)], levels
     assert levels.count(logging.WARNING) == 1 + refusals // every
     assert "%d connections refused" % every in lines[every - 1].getMessage(), lines[every - 1].getMessage()
     assert "refusing" in lines[0].getMessage() and "refused so far" not in lines[0].getMessage()
-    # the figures an operator reads, each from its own source: the first line gives the limit, how often a count follows and how long a quiet gap ends the episode, and a count line gives the count so far and the limit
+    # the figures an operator reads, each from its own source: the first line gives the limit, the count
+    # interval and the quiet gap, and a count line gives the count so far and the limit
     first = lines[0].getMessage()
     assert "%d connections is the --max-connections limit" % cap in first, first
     assert "with a count every %d, until none has come for %d seconds" % (every, REFUSAL_EPISODE_GAP_SECONDS) in first, first
@@ -336,12 +347,14 @@ def test_a_churning_cap_does_not_write_a_warning_per_refusal(monkeypatch):
 
 
 def test_the_cap_defaults_reach_both_doors_and_leave_room_for_the_standard_benchmark():
-    # redis-benchmark -c 50 is the standard invocation, and a cap under it turns the benchmark into a test of the cap -- not a cap of exactly 50, which admits exactly 50, because the comparison asks whether there is room for one more. the property is what is asserted, so a later change of the number for a good reason does not fail here for a bad one
+    # redis-benchmark -c 50 is the standard invocation and a cap under it turns the benchmark into a test
+    # of the cap -- the property is asserted, so moving the number for a good reason does not fail here
     benchmark_clients = 50
     args = build_arg_parser().parse_args([])
     server = Server(0)
     try:
-        # each read from the one constant: a literal in either place would pass the checks below for the wrong reason
+        # each read from the one constant: a literal in either place would pass the checks below for the
+        # wrong reason
         assert args.max_connections == DEFAULT_MAX_CONNECTIONS
         assert server.max_connections == DEFAULT_MAX_CONNECTIONS
     finally:
@@ -367,7 +380,8 @@ def _launch_through_main(tmp_path, *flags):
 
 
 def test_the_flag_reaches_a_server_started_through_main(tmp_path):
-    # every other test here sets max_connections on a Server it built itself, which goes around main(): a main() that stopped passing the flag on would leave all of them green
+    # every other test here sets max_connections on a Server it built itself, going around main(): a
+    # main() that stopped passing the flag on would leave all of them green
     proc, port = _launch_through_main(tmp_path, "--max-connections", "2")
     clients = []
     try:
@@ -392,7 +406,8 @@ def test_the_flag_reaches_a_server_started_through_main(tmp_path):
         proc.stdout.close()
 
 
-# this module's own copies of the three helpers test_graceful_shutdown.py waits on a child with, and not an import of them: the names are private there and a rename would break this module from a distance. the bound on every wait is a thread join or a deadline, never a wait() that a process which does not exit would hold for ever
+# this module's own copies of the three helpers test_graceful_shutdown.py waits on a child with, since
+# those names are private there; every wait is bounded by a join or a deadline, never a bare wait()
 _MARGIN_SECONDS = 3.0
 
 
@@ -419,7 +434,8 @@ def _reap(proc):
         proc.stdout.close()
 
 
-# a real descriptor table that is really full: accept() fails with EMFILE only when there is no descriptor to give, and nothing scripted stands in for that faithfully. the limit is lowered by a thread inside the child, once it is told to, and not by the test, where it would take the rest of the suite's descriptors with it; the thread says when the table is full so that the clients are sent to a process that has none to give
+# a real descriptor table that is really full: accept() fails EMFILE only with no descriptor to give and
+# nothing scripted stands in faithfully -- a thread in the child lowers the limit and says when it is full
 _FULL_TABLE_THEN_MAIN = """
 import errno, os, resource, sys, threading
 sys.path.insert(0, %r)
@@ -446,7 +462,8 @@ server.main(sys.argv[1:])
 
 
 def test_a_connection_refused_for_want_of_descriptors_is_reported_and_bounded(tmp_path):
-    # _on_accept used to read every OSError out of accept() as a peer that aborted between readiness and accept, which is normal and says nothing -- and EMFILE arrives there too. the failed accept() takes the pending connection with it on this platform, so the client saw a reset and the server logged nothing, where the connection cap, which refuses for the same reason, writes a line. a refusal by descriptors is now reported through the cap's own bounded path: a WARNING for the first that names the error, DEBUG for the rest, a count line every REFUSALS_PER_LINE, because what fills a descriptor table fills it as fast as a client can connect and logging writes to stderr with a blocking write on the only thread. the stream is read by a thread and not after the exit, so that a platform whose failed accept leaves the connection in the backlog, and so refuses again on the next pass, cannot fill the pipe and park the child inside a log write. the bound is asserted as arithmetic over every refusal that was logged, whatever it came to, and not as a count of three, for the same reason
+    # _on_accept used to read every OSError from accept() as an aborting peer, so EMFILE was refused in
+    # silence; it now reports through the cap's own bounded path -- WARNING first, DEBUG after, counted
     snapshot = tmp_path / "dump.mrdb"
     proc = subprocess.Popen(
         [sys.executable, "-c", _FULL_TABLE_THEN_MAIN % str(REPO_ROOT),
@@ -493,6 +510,7 @@ def test_a_connection_refused_for_want_of_descriptors_is_reported_and_bounded(tm
     assert len(table) >= 3, ("a client the full table refused was not reported", table)
     assert levels[0] == "WARNING", levels[:3]
     assert "OSError(%d, " % errno.EMFILE in table[0] and "Too many open files" in table[0], table[0]
-    # one WARNING for the first refusal and one per REFUSALS_PER_LINE after it, however many there were: a WARNING for the second and the third as well is the line per attempt this path exists to prevent
+    # one WARNING for the first refusal and one per REFUSALS_PER_LINE after it: a WARNING for the second
+    # and the third as well is the line-per-attempt this path exists to prevent
     assert levels.count("WARNING") == 1 + len(table) // server_mod.REFUSALS_PER_LINE, (
         len(table), levels.count("WARNING"))

@@ -15,16 +15,8 @@ from store import KIND_STRING
 
 INVALID_EXPIRE_TIME = b"ERR invalid expire time in 'set' command"
 
-# SET's option families: EX/PX/EXAT/PXAT/KEEPTTL all name what happens to the deadline,
-# NX/XX name a condition, GET stands alone. Within a family, a repeat of the same token is
-# ordinary (last value wins); meeting a DIFFERENT member of the same family is a syntax
-# error the moment it happens -- two independent checks over the token history, not a dict
-# staged and validated once scanning finishes. Staged-and-validated is the natural-looking
-# alternative and it is wrong: it accepts "EX 10 PX 20000 EX 30", which real Redis refuses
-#
-# KEEPTTL sits in the deadline family with the other four but takes no argument, which is
-# why the family is two tuples rather than one: the exclusivity check spans both, the
-# argument handling does not
+# a repeat of one token is ordinary and a different member of the same family is a syntax error
+# at once: staged and validated instead, it accepts "EX 10 PX 20000 EX 30", which Redis refuses
 _TTL_TOKENS = (b"EX", b"PX", b"EXAT", b"PXAT")
 _KEEPTTL_TOKEN = b"KEEPTTL"
 _CONDITION_TOKENS = (b"NX", b"XX")
@@ -53,10 +45,8 @@ def set_(store, conn, argv: list[bytes]) -> Reply:
                 return resp.encode_error(SYNTAX_ERROR), []
             if i + 1 >= len(argv):
                 return resp.encode_error(SYNTAX_ERROR), []
-            # the field is kept, not parsed: a repeat of the same token overrides this
-            # one, and the reference validates only whichever occurrence survives. parsing
-            # here rejects "EX abc EX 10", which the reference answers +OK. the overflow
-            # check below was already deferred for this reason; the grammar check was not
+            # kept, not parsed: the reference validates only the occurrence that survives, so parsing
+            # here rejects "EX abc EX 10", which it answers +OK
             ttl_kind, ttl_field = token, argv[i + 1]
             i += 2
         elif token == _KEEPTTL_TOKEN:
@@ -85,19 +75,14 @@ def set_(store, conn, argv: list[bytes]) -> Reply:
         if ttl_amount is None:
             return resp.encode_error(NOT_AN_INTEGER), []
         millis = ttl_amount * _TTL_SCALE[ttl_kind]
-        # an absolute deadline is the argument itself; a duration is measured from now.
-        # the reference bounds the argument at zero either way, which is why EXAT 0 is an
-        # error while PXAT 1 is accepted and expires immediately -- the check is on what
-        # was asked for, not on where it lands
+        # the reference bounds the argument at zero either way, which is why EXAT 0 is an error
+        # and PXAT 1 is accepted and expires at once: the check is on what was asked for
         deadline = millis if _TTL_IS_ABSOLUTE[ttl_kind] else store.now_ms() + millis
         if ttl_amount <= 0 or not (INT64_MIN <= deadline <= INT64_MAX):
             return resp.encode_error(INVALID_EXPIRE_TIME), []
 
-    # the expiry-aware lookup, never a raw dict test: a logically-expired key must not
-    # block NX, and the DEL that expiry produces reaches the store's own queue from
-    # inside lookup(), never this handler's effects. read once, before anything is
-    # written, because GET owes the caller the value this command replaced -- and the
-    # kind is passed so GET answers WRONGTYPE on a key SET itself would overwrite happily
+    # the expiry-aware lookup, never a raw dict test: a logically-expired key must not block NX.
+    # read before anything is written, and with a kind only when GET owes the caller the old value
     previous = store.lookup(key, kind=KIND_STRING) if want_old else store.lookup(key)
 
     # GET reports what was there whether or not the condition let the write happen, so
@@ -108,39 +93,24 @@ def set_(store, conn, argv: list[bytes]) -> Reply:
         return (resp.encode_bulk_string(previous) if want_old
                 else resp.encode_bulk_string(None)), []
 
-    # keep_ttl is False unless KEEPTTL asked otherwise: a plain SET discards whatever TTL
-    # was there, and this is the only place that decides -- a deadline resolved above is
-    # re-applied right after, and cannot be combined with KEEPTTL in the first place
+    # keep_ttl is False unless KEEPTTL asked: a plain SET discards whatever TTL was there, and a
+    # deadline resolved above is re-applied just after and cannot be combined with KEEPTTL
     store.write(key, value, keep_ttl=keep_ttl)
-    # KEEPTTL is carried into the effect rather than dropped. Without it a follower
-    # replays a plain SET, whose own keep_ttl=False clears the deadline this command was
-    # written to preserve, and the two ends disagree about when the key dies with nothing
-    # to notice. _incr_by below re-emits its own command name for the same reason
+    # KEEPTTL is carried into the effect: without it a follower replays a plain SET, whose
+    # keep_ttl=False clears the very deadline this command was written to preserve
     effects = [[b"SET", key, value] + ([_KEEPTTL_TOKEN] if keep_ttl else [])]
     if deadline is not None:
         if deadline <= store.now_ms():
-            # a deadline already past deletes here rather than being written into the
-            # index, for the reason EXPIRE's own path deletes: a follower has no license
-            # to remove a key on its own initiative, and a past deadline left in the index
-            # would reach it as a DEL only when this server's own lookup or sweep got to
-            # the key, and a sampled sweep promises nothing about any one key. Deleting
-            # here sends the DEL with the command that made the key dead. EXAT and
-            # PXAT reach this from a valid argument by naming a past instant outright,
-            # and EX and PX reach it too, rarely: the deadline is computed from one clock
-            # read and compared against a second taken after lookup() and write(), so a
-            # small enough relative TTL can be overtaken in between -- measured, 6 of
-            # 20,000 back-to-back `SET k v PX 1` calls took this branch with nothing
-            # injected
+            # a past deadline deletes here, so the DEL rides with the command: a follower may not
+            # remove a key on its own. EX/PX reach this too -- 6 of 20,000 `SET k v PX 1` calls did
             store.remove(key)
             # the DEL alone, not a SET/DEL pair: the follower needs the end state, and
             # store.remove's own comment gives the reason a redundant pair is worse
             return (resp.encode_bulk_string(previous) if want_old
                     else resp.encode_simple_string(b"OK")), [[b"DEL", key]]
         store.expire_at(key, deadline)
-        # the unconditional form, with NX/XX dropped: the leader already evaluated the
-        # condition, and re-evaluating it on a follower would make correctness depend on
-        # the follower's own notion of existence -- which its expiry rule deliberately
-        # makes differ from the leader's
+        # the unconditional form, NX/XX dropped: the leader evaluated the condition, and a
+        # follower re-evaluating it would depend on its own notion of existence
         effects.append([b"PEXPIREAT", key, b"%d" % deadline])
     if want_old:
         return resp.encode_bulk_string(previous), effects
@@ -149,11 +119,8 @@ def set_(store, conn, argv: list[bytes]) -> Reply:
 
 @command(b"GET", arity=2, kind=Kind.READ)
 def get(store, conn, argv: list[bytes]) -> Reply:
-    # one of nine commands that unconditionally pass a kind -- INCR and DECR here, and
-    # all six list commands in list.py. SET passes one too, but only when its GET option
-    # is present, since only then does it need to reject a value it could not return as
-    # the old string; DEL, EXISTS and TYPE stay genuinely type-agnostic, on a real server
-    # and here
+    # one of nine commands that pass a kind unconditionally; DEL, EXISTS and TYPE stay
+    # type-agnostic, on a real server and here
     value = store.lookup(argv[1], kind=KIND_STRING)
     return resp.encode_bulk_string(value), []
 
@@ -186,27 +153,20 @@ def type_(store, conn, argv: list[bytes]) -> Reply:
     return resp.encode_simple_string(store.kind_of(value)), []
 
 
-# EXPIRE, PEXPIRE and PEXPIREAT: real Redis 7 takes NX/XX/GT/LT on this family and this
-# server does not, so arity is the exact 3 rather than a minimum -- a minimum would accept
-# a trailing option and silently ignore it instead of raising
+# real Redis 7 takes NX/XX/GT/LT on this family and this server does not, so arity is the exact
+# 3: a minimum would accept a trailing option and silently ignore it
 INVALID_EXPIRE_TIME_EXPIRE = b"ERR invalid expire time in 'expire' command"
 INVALID_EXPIRE_TIME_PEXPIRE = b"ERR invalid expire time in 'pexpire' command"
 INCR_DECR_OVERFLOW = b"ERR increment or decrement would overflow"
 
-# EXPIRE's bound on its seconds argument, before the multiply to milliseconds. INT64_MAX
-# // 1000 in both directions: the reference divides with C semantics, which truncate
-# toward zero, so its own negative bound is exactly -this
+# EXPIRE's bound on its seconds argument, before the multiply: the reference truncates toward
+# zero with C semantics, so its own negative bound is exactly -this
 MAX_EXPIRE_SECONDS = INT64_MAX // 1000
 
 
 def _apply_expiry(store, key: bytes, deadline_ms: int) -> Reply:
-    # the one place EXPIRE, PEXPIRE and PEXPIREAT turn a resolved absolute deadline into
-    # a reply and an effect, so the three cannot drift apart. a deadline at or before now
-    # deletes the key here, in the handler, rather than being written into the index and
-    # left for the next lookup to clean up: a past-dated deadline on a follower would be
-    # an entry the follower has no license to remove on its own initiative, and the DEL
-    # that grants one would come only once the leader's own lookup or sweep reached the
-    # key, which nothing bounds -- deleting here sends it with this command instead
+    # one place for all three, so they cannot drift. a deadline at or before now deletes here, so
+    # the DEL rides with this command: a follower may not remove a key on its own initiative
     if store.lookup(key) is None:
         return resp.encode_integer(0), []
     if deadline_ms <= store.now_ms():
@@ -222,12 +182,8 @@ def expire(store, conn, argv: list[bytes]) -> Reply:
     seconds = parse_int64(argv[2])
     if seconds is None:
         return resp.encode_error(NOT_AN_INTEGER), []
-    # rejected before the multiply, not after: a seconds value outside this range would
-    # carry the millisecond figure past where a 64-bit deadline could hold it, even though
-    # Python's own int never overflows and so never raises to catch this on its own.
-    # symmetric rather than INT64_MIN // 1000, which floors where the reference truncates
-    # -- one value apart, and on that one value a floor accepts what the reference refuses
-    # and silently deletes the key instead of answering an error
+    # rejected before the multiply: a seconds value outside this range carries the millisecond
+    # figure past a 64-bit deadline, and a floor would accept the one value the reference refuses
     if not (-MAX_EXPIRE_SECONDS <= seconds <= MAX_EXPIRE_SECONDS):
         return resp.encode_error(INVALID_EXPIRE_TIME_EXPIRE), []
     deadline = store.now_ms() + seconds * 1000
@@ -267,11 +223,8 @@ def _remaining_ms(store, key: bytes) -> int:
     deadline = store.deadline(key)
     if deadline is None:
         return -1
-    # clamped at zero, as the reference clamps, because the clock is read twice: lookup()
-    # read it first and found this deadline still in the future, and the read below can
-    # have crossed it. the two negative values here are a vocabulary -- -1 says "no
-    # deadline" and -2 says "no key" -- so an unclamped remainder would not report a small
-    # number, it would report one of those two facts about a key for which neither is true
+    # clamped at zero, as the reference clamps: the clock is read twice, and -1 and -2 are a
+    # vocabulary -- no deadline, no key -- that an unclamped remainder would speak by accident
     return max(0, deadline - store.now_ms())
 
 
@@ -302,9 +255,8 @@ def _incr_by(store, argv: list[bytes], name: bytes, delta: int) -> Reply:
     new_value = base + delta
     if not (INT64_MIN <= new_value <= INT64_MAX):
         return resp.encode_error(INCR_DECR_OVERFLOW), []
-    # keep_ttl=True: INCR/DECR reinterpret the value in place rather than replacing it the
-    # way SET does, and clearing the TTL here would answer a deadline the client set
-    # moments earlier with a key that now outlives it
+    # keep_ttl=True: INCR/DECR reinterpret the value in place, and clearing the TTL would leave
+    # a key outliving a deadline the client set moments earlier
     store.write(key, b"%d" % new_value, keep_ttl=True)
     # the command verbatim, never a computed SET -- the pure effect "SET k <new>" would
     # tell a follower more than this command actually did

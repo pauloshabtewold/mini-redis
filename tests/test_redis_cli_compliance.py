@@ -27,9 +27,8 @@ def _cli(port, *args):
     )
 
 
-# --- one case per registered command, each against its own dedicated key. EXPECTED's
-# keys are driven as a set, not a sequence, so no case here may depend on another
-# having already run against the shared server -----------------------------------------
+# --- one case per registered command, each against its own dedicated key -------------------
+# EXPECTED's keys are driven as a set, so no case may depend on another having already run
 
 
 def _case_ping(port):

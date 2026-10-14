@@ -12,10 +12,8 @@ TWO_PONGS = b"+PONG\r\n" * 2
 
 
 def _stream(tail, limits, prefix=TWO_PINGS, seconds=10):
-    # read to the close, not to a byte count: a count has to be told in advance how
-    # many replies to expect, which is exactly the thing that goes wrong when replies
-    # are dropped -- a server that answers but never closes fails on the read here
-    # rather than passing a comparison it was never asked to make
+    # read to the close and not to a byte count: a count has to be told how many replies to expect,
+    # which is the thing that goes wrong -- a server that answers and never closes fails here
     with listening() as (server, connect, _listener):
         for name, value in limits.items():
             setattr(server, name, value)
@@ -52,19 +50,16 @@ def _stream(tail, limits, prefix=TWO_PINGS, seconds=10):
         id="over-cap multibulk count"),
 ])
 def test_commands_ahead_of_a_protocol_error_are_answered_before_it(tail, limits, error):
-    # two pipelined PINGs precede each malformed tail in one sendall(), so this
-    # is the same read batch as the failure. The caps are set small -- 10, not their
-    # defaults -- because what is under test is the ordering of the replies, not the
-    # size that triggers the refusal
+    # two pipelined PINGs precede each malformed tail in one sendall(), so this is the same read batch
+    # as the failure; the caps are small because what is under test is the ordering of the replies
     body, tracked = _stream(tail, limits)
     assert body == TWO_PONGS + error, body
     assert tracked == 0, tracked
 
 
 def test_a_batch_that_fails_on_its_first_bytes_answers_only_the_error():
-    # the near miss: nothing parsed ahead of the failure means nothing is owed, so a
-    # server that simply prefixed every error with whatever it had already answered
-    # would be caught here rather than by the parametrised cases above
+    # the near miss: nothing parsed ahead of the failure means nothing is owed, so a server prefixing
+    # every error with what it had already answered is caught here and not above
     body, tracked = _stream(b"*abc\r\n", {}, prefix=b"")
     assert body == b"-ERR Protocol error: invalid multibulk length\r\n", body
     assert tracked == 0

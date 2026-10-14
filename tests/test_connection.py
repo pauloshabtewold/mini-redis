@@ -96,9 +96,8 @@ def test_fileno_is_the_underlying_descriptor(pair):
 
 
 def test_unread_in_kernel_answers_what_the_peer_sent_and_nothing_was_read(pair):
-    # asked rather than read, so the answer must not consume what it counts: the server asks this
-    # of a connection it is about to close during a stop, and a question that took the bytes would
-    # be a read the drain decided not to do
+    # asked rather than read, so the answer must not consume what it counts: the drain asks this of a
+    # connection it is about to close, and a question that took the bytes would be a read it declined
     conn, peer = pair
     assert conn.unread_in_kernel() == 0, "nothing has been sent yet"
     peer.sendall(b"*1\r\n$4\r\nPING\r\n")
@@ -110,9 +109,8 @@ def test_unread_in_kernel_answers_what_the_peer_sent_and_nothing_was_read(pair):
 
 
 def test_unread_in_kernel_answers_zero_for_a_closed_connection(pair):
-    # the one caller is assembling a figure for a log line written from a finally clause, and it
-    # asks every connection the drain disposed of, some of which are already closed. a descriptor
-    # of -1 raises from the ioctl, and a report that raises on the way out is worse than a short one
+    # the drain asks every connection it disposed of, some already closed: a descriptor of -1 raises from
+    # the ioctl, and a report that raises on the way out is worse than a short one
     conn, peer = pair
     peer.sendall(b"PING\r\n")
     conn.close()
@@ -120,11 +118,8 @@ def test_unread_in_kernel_answers_zero_for_a_closed_connection(pair):
 
 
 def test_unread_in_kernel_answers_zero_for_a_socket_closed_behind_the_connections_back(pair):
-    # the connection's closed flag is its own and says nothing about its socket: a socket object that
-    # has given up its descriptor leaves closed False and answers -1 from fileno(), and what ioctl
-    # raises for that is a ValueError and not the OSError a refused question raises. the drain asks
-    # this of every connection it left open, from inside the finally clause that writes its one line,
-    # so a raise here is the line not being written
+    # a socket that gave up its descriptor leaves closed False and fileno() -1, and the ioctl raises
+    # ValueError there and not OSError -- the drain asks from the finally that writes its one line
     conn, peer = pair
     peer.sendall(b"PING\r\n")
     conn._sock.close()
@@ -133,9 +128,8 @@ def test_unread_in_kernel_answers_zero_for_a_socket_closed_behind_the_connection
 
 
 def test_the_module_level_unread_in_kernel_answers_zero_for_a_closed_socket_object():
-    # the function the server asks of a socket no Connection owns, the accept backlog's, and the one
-    # the method above delegates to. the same ValueError as above, reached without a connection in
-    # the way: a closed socket object answers -1 from fileno()
+    # the module function the backlog sweep asks of a socket no Connection owns, and what the method
+    # delegates to: the same ValueError, from a closed socket object answering -1 from fileno()
     a, b = socket.socketpair()
     try:
         b.sendall(b"PING\r\n")
@@ -147,9 +141,8 @@ def test_the_module_level_unread_in_kernel_answers_zero_for_a_closed_socket_obje
 
 
 def test_the_module_level_unread_in_kernel_answers_zero_when_the_kernel_refuses_the_question():
-    # the other family, which is an OSError and not the ValueError above: a descriptor number the
-    # process holds nothing under is refused by the kernel with EBADF. a number this far up is never
-    # open in a test process, so the refusal does not depend on what the rest of the suite left open
+    # the other family, an OSError and not the ValueError above: a descriptor the process holds nothing
+    # under is refused with EBADF, and a number this far up is never open in a test process
     class Unheld:
         def fileno(self):
             return 1 << 20
@@ -158,11 +151,8 @@ def test_the_module_level_unread_in_kernel_answers_zero_when_the_kernel_refuses_
 
 
 def test_unread_in_kernel_answers_a_queue_longer_than_a_sixteen_bit_count_holds(pair):
-    # the answer is written into a buffer the call is handed, and CPython copies a mutable buffer
-    # that small through its own and copies back only as many bytes as the buffer was long, so one
-    # sized for a short is not refused: it truncates, to the low sixteen bits and signed. 140,000
-    # reads back as 8,928, and a stop that had thrown away 40,000 bytes published a negative figure.
-    # the two tests above send at most a few bytes and could not see any of it
+    # the answer is copied back into a buffer only as long as the one handed in, so one sized for a short
+    # truncates to the low sixteen bits, signed: 140,000 reads back as 8,928 and a stop published a negative
     conn, peer = pair
     # a socketpair holds 8 KiB by default in either direction, so the queue could not get this long
     # without both ends being raised, which end's limit governs depending on the platform
@@ -201,7 +191,8 @@ def test_take_commands_yields_nothing_until_a_partial_command_completes(pair):
 
 def test_take_commands_consumes_input_that_yields_no_command(pair):
     conn, peer = pair
-    # a blank inline line and a *0 header consume bytes and produce nothing; looping on argv instead of consumed spins forever here
+    # a blank inline line and a *0 header consume bytes and produce nothing; looping on argv instead of
+    # consumed spins forever here
     peer.sendall(b"\r\n*0\r\nPING\r\n")
     conn.receive()
     assert conn.take_commands() == [[b"PING"]]
@@ -209,12 +200,8 @@ def test_take_commands_consumes_input_that_yields_no_command(pair):
 
 
 def test_take_commands_does_not_reparse_a_large_bulk_from_byte_zero(pair, monkeypatch):
-    # a growing buffer re-parsed from byte zero on every readable event turns one large
-    # command into a quadratic number of parses; _parse_needed exists to make this O(1).
-    # what is counted is parse_multibulk_header and parse_bulk_element, the two functions
-    # take_commands() actually drives for this wire shape -- it never calls parse_command
-    # for a multibulk, so a shim on parse_command would count zero calls no matter how
-    # much rescanning happened, and a bound compared against zero would pass either way
+    # a buffer re-parsed from byte zero on every event makes one large command quadratic; the two counted
+    # are the functions take_commands drives here, since a shim on parse_command would count zero calls
     conn, _peer = pair
     header_calls = 0
     element_calls = 0
@@ -250,9 +237,8 @@ def test_take_commands_does_not_reparse_a_large_bulk_from_byte_zero(pair, monkey
     # zero, and an upper bound alone does not catch that -- <= 3 is satisfied by 0 too
     assert header_calls > 0 and element_calls > 0, (header_calls, element_calls)
     total_calls = header_calls + element_calls
-    # the real assertion is the ratio: three parses total against `invocations` readable
-    # events on a buffer that grew to 200 KB in 500-byte steps. a parser re-scanning from
-    # byte zero on every event would make total_calls track invocations, not stay flat at 3
+    # the ratio is the assertion: three parses total against `invocations` events on a buffer grown to
+    # 200 KB in 500-byte steps -- a parser rescanning from zero tracks invocations instead of staying at 3
     assert total_calls <= 3, (total_calls, invocations)
 
 
@@ -266,7 +252,8 @@ def test_take_commands_propagates_protocol_error(pair):
 
 @pytest.mark.skipif(NO_CONVERSION_CEILING, reason=NO_CEILING_REASON)
 def test_oversized_length_header_is_a_protocol_error_not_a_crash(pair):
-    # isdigit() passes this and int() refuses it, so an unguarded parser raises ValueError here and drops every connection instead of only this one
+    # isdigit() passes this and int() refuses it, so an unguarded parser raises ValueError here and drops
+    # every connection instead of only this one
     conn, peer = pair
     _deliver(conn, peer, b"*" + OVERSIZED_DIGIT_RUN + b"\r\n")
     with pytest.raises(resp.ProtocolError):
@@ -355,10 +342,8 @@ class ScanCountingBuffer(bytearray):
     ids=["inline", "multibulk-count", "bulk-length"],
 )
 def test_a_header_arriving_in_pieces_is_scanned_once_not_once_per_read(opening):
-    # a header line's length is declared nowhere, so _parse_needed can never bound one.
-    # without a resume position the search restarts at byte zero on every readable event,
-    # which is quadratic in what one connection has sent: 300 reads of a 1 KiB chunk walk
-    # ~150x the bytes received, and one connection can hold the whole single-threaded loop
+    # a header line declares no length, so _parse_needed cannot bound one: without a resume position the
+    # search restarts at byte zero every event -- 300 reads of a 1 KiB chunk walk ~150x the bytes received
     sock, peer = socket.socketpair()
     try:
         conn = Connection(sock, ("127.0.0.1", 0))
@@ -381,16 +366,13 @@ def test_a_header_arriving_in_pieces_is_scanned_once_not_once_per_read(opening):
     "first, second, expected",
     [
         (b"*1\r", b"\n$4\r\nPING\r\n", [[b"PING"]]),
-        # the width of the count is what makes the header's own reset observable: at one
-        # digit the position left behind lands on the next element's terminator anyway,
-        # and only from two digits up does it point past that terminator, into the middle
-        # of a header that starts at byte zero -- a bogus protocol error on a valid command
+        # two digits is what makes the header's own reset observable: at one digit the stale position
+        # lands on the next element's terminator anyway, and only past it is a valid command refused
         (b"*10\r", b"\n" + b"$1\r\na\r\n" * 10, [[b"a"] * 10]),
         (b"*1\r\n$4\r", b"\nPING\r\n", [[b"PING"]]),
         (b"*2\r\n$4\r\nECHO\r\n$1\r", b"\nx\r\n", [[b"ECHO", b"x"]]),
-        # the inline path resumes at the end rather than one byte short, because its
-        # terminator is a single \n -- but the \r before it is still part of the line,
-        # so a line split between the two has to come back as one command, not two
+        # the inline path resumes at the end rather than one byte short, but the \r before its single \n
+        # is still part of the line, so a line split between the two must come back as one command
         (b"PING\r", b"\n", [[b"PING"]]),
         (b"ECHO hi\r", b"\nPING\r\n", [[b"ECHO", b"hi"], [b"PING"]]),
     ],
@@ -398,9 +380,8 @@ def test_a_header_arriving_in_pieces_is_scanned_once_not_once_per_read(opening):
          "inline", "inline-then-more"],
 )
 def test_a_header_crlf_split_across_two_reads_is_still_found(pair, first, second, expected):
-    # the resume position has to stop one byte short of the end: a \r already buffered
-    # pairs with a \n that has not arrived, and resuming at the end steps over that pair
-    # and the header is never located -- the connection then hangs with no error anywhere
+    # the resume position stops one byte short of the end: a buffered \r pairs with a \n still to come,
+    # and resuming at the end steps over the pair, so the header is never found and the connection hangs
     conn, peer = pair
     peer.sendall(first)
     conn.receive()
@@ -412,11 +393,8 @@ def test_a_header_crlf_split_across_two_reads_is_still_found(pair, first, second
 
 
 def test_a_completed_element_clears_the_resume_position_for_the_next_one(pair):
-    # _scan_from is only non-zero while a header's own terminator search is unfinished.
-    # if that search resolves and the body completes in the same pass, the reset is the
-    # only thing stopping a stale offset from being applied to the NEXT element's buffer,
-    # where it points into the middle of a header that starts at byte zero. the symptom
-    # is a bogus protocol error on a well-formed command, and a dropped connection
+    # _scan_from is non-zero only while a header's terminator search is unfinished: left set, a stale offset
+    # points into the middle of the NEXT element's header -- a bogus protocol error on a good command
     conn, peer = pair
     peer.sendall(b"*2\r\n$1")           # element one's header arrives incomplete
     conn.receive()
@@ -449,10 +427,8 @@ class CountingSocket:
 
 
 def test_close_really_is_idempotent_not_merely_survivable():
-    # socket.close() is itself safe to call twice, so asserting `closed is True` after
-    # two calls passes with the guard deleted. what the guard is for is the descriptor:
-    # ids are counted rather than taken from fileno() precisely because descriptors get
-    # reused, and a second close on a stale Connection would shut a socket it never owned
+    # socket.close() is itself safe twice, so `closed is True` passes with the guard deleted; what the
+    # guard protects is the descriptor, which gets reused -- a second close would shut one it never owned
     sock, peer = socket.socketpair()
     try:
         counting = CountingSocket(sock)
@@ -550,10 +526,8 @@ def test_incomplete_since_is_none_on_a_new_connection_and_is_never_written_by_co
 
 
 def test_a_multibulk_awaiting_elements_reports_the_bytes_it_has_consumed_with_an_empty_buffer(pair):
-    # take_commands deletes the bytes it parses, so the read buffer alone says a half-received
-    # command holds nothing at exactly the points where has_incomplete_command needs _argv as well.
-    # the shutdown drain reports the bytes it throws away, and these are among them: the count is
-    # kept because nothing afterwards can recover it from the buffer
+    # take_commands deletes the bytes it parses, so the read buffer alone says a half-received command
+    # holds nothing; the drain reports these bytes and nothing afterwards can recover them from the buffer
     conn, peer = pair
     stages = [
         (b"*3\r\n", 4),                 # the header alone
@@ -573,12 +547,8 @@ def test_a_multibulk_awaiting_elements_reports_the_bytes_it_has_consumed_with_an
 
 
 def test_what_a_connection_holds_for_an_incomplete_command_is_accounted_at_every_byte(pair):
-    # the count and the buffer together are every byte of the command that has not completed, and
-    # that is asserted after each byte of a stream rather than at chosen points: the stream mixes a
-    # multibulk, an inline line, an empty line, an empty multibulk and a second multibulk, so every
-    # branch of take_commands that touches the count is crossed, and a figure that drifts at any
-    # byte is reported at that byte. the sum is what the drain publishes, and it is only right if
-    # a byte is in one of the two and never in both or neither
+    # the count and the buffer together are every byte of an incomplete command, asserted after each byte
+    # of a mixed stream so a figure that drifts is reported at the byte where it drifted
     conn, peer = pair
     pieces = [
         b"*3\r\n$3\r\nSET\r\n$1\r\nk\r\n$1\r\nv\r\n",
@@ -606,11 +576,8 @@ def test_what_a_connection_holds_for_an_incomplete_command_is_accounted_at_every
 
 @pytest.mark.parametrize("step", [b"PING\r\n", b"\r\n", b"*0\r\n"], ids=["inline command", "empty line", "empty multibulk"])
 def test_a_step_that_leaves_no_command_outstanding_leaves_the_count_at_zero(pair, step):
-    # the three ways a step ends with nothing owed: an inline command, an empty line, and a header that
-    # declares no elements. none can be reached with anything held, so the count is put there by hand,
-    # which is the only way to see that each of them resets it rather than relying on the reset that
-    # completing a multibulk makes: a count that drifted up would put bytes in the drain's figure that
-    # were never on the wire
+    # the three steps that end with nothing owed -- inline, empty line, zero-element header -- each reset
+    # the count, put there by hand because none can be reached holding anything: a drift invents wire bytes
     conn, peer = pair
     conn.consumed_for_incomplete_command = 99
     peer.sendall(step)

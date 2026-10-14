@@ -53,17 +53,13 @@ def test_every_registered_handler_returns_a_reply_pair():
         arity = commands.registry.COMMANDS[name].arity
         return [name] + [filler] * (abs(arity) - 1)
 
-    # neither LPOP nor RPOP creates a container of its own -- unlike every other write
-    # command the pass below exists for, each can only ever produce an effect against a
-    # key that is already a non-empty list, which a store preloaded as a string can never
-    # give them
+    # neither LPOP nor RPOP creates a container of its own: each can only produce an effect against a
+    # key that is already a non-empty list, which a store preloaded as a string cannot give
     NEEDS_A_LIST = {b"LPOP", b"RPOP"}
 
     try:
-        # every pass below builds a fresh Store() per command rather than sharing one
-        # across the whole traversal: a shared store lets an earlier command's write
-        # decide what kind a later command's key holds, which makes that later command's
-        # own pass-or-fail depend on registration order instead of on its own handler
+        # a fresh Store() per command rather than one shared across the traversal: a shared store lets
+        # an earlier write decide a later command's kind, making its pass depend on registration order
         for name in commands.registry.COMMANDS:
             drive(Store(), argv_for(name, b"x"))
 
@@ -79,10 +75,8 @@ def test_every_registered_handler_returns_a_reply_pair():
             store.write(b"x", b"1", keep_ttl=False)
             drive(store, argv_for(name, b"1"))
 
-        # one filler cannot be both an existing key and a parsing integer, so EXPIRE,
-        # PEXPIRE and PEXPIREAT cannot reach store.expire_at through the uniform
-        # derivation above -- this pass rebuilds the store before each command instead,
-        # with a real key at [1] and an absolute deadline at the tail for the *AT commands
+        # one filler cannot be both an existing key and a parsing integer, so EXPIRE/PEXPIRE/PEXPIREAT
+        # need a real key at [1] and an absolute deadline at the tail for the *AT commands
         for name in commands.registry.COMMANDS:
             store = Store()
             store.write(b"x", b"1", keep_ttl=False)

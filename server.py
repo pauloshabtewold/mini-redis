@@ -20,30 +20,8 @@ from connection import BatchProtocolError, Connection, Role, unread_in_kernel
 from event_loop import EventLoop
 from store import Store
 
-# set by the handler main() installs, and consumed by run() once run() has armed its own
-# handlers. main() installs the recording handler before anything that can take time or fail,
-# so the only window left with SIGTERM at its default disposition is the interpreter's own
-# startup and this module's imports. the record exists because the argument parse, the Server
-# construction and the whole snapshot load inside it run before run() can install anything of
-# its own, and without the record they ran with SIGTERM at its default. In a container the
-# server is PID 1, and the kernel does not deliver a default-disposition signal to PID 1 at
-# all: `docker stop` was discarded outright for as long as the load took, the container served
-# on for the rest of the stop timeout and then died on SIGKILL with no save, and a write
-# acknowledged in that window was gone after a restart. That window scaled with the snapshot,
-# because the load is inside it; the interpreter's own startup and this module's imports, which
-# are what is left, do not
-#
-# only SIGTERM is recorded, and SIGINT keeps whatever it had before main() ran: Ctrl-C during a
-# slow load still raises KeyboardInterrupt and abandons it, as it did before this record
-# existed. the defect was `docker stop`, which sends SIGTERM, and recording SIGINT as well took
-# from an operator at a terminal the one way they had to give up on a load that was taking too
-# long
-#
-# "whatever it had" is normally Python's own default_int_handler and is SIG_IGN for a process
-# started from a non-interactive background job, under nohup or under setsid, which Python
-# leaves alone. run() honours that too and installs its own handler for SIGINT only when the
-# inherited one is not SIG_IGN -- without which one signal had two dispositions in the same
-# process, dropped in silence during startup and a clean saving stop a moment later
+# set by main()'s handler, consumed by run() after its own are armed: the parse and the snapshot
+# load run first, and PID 1 gets no default-disposition SIGTERM. SIGTERM only, so Ctrl-C still aborts a load
 _stop_requested_during_startup = False
 
 
@@ -53,14 +31,8 @@ def _note_stop_requested_during_startup(signum, frame) -> None:
 
 
 def _consume_stop_requested_during_startup() -> bool:
-    # read and cleared in one step. run() calls this after installing its own handlers, which is
-    # what closes the gap: a signal arriving before that point set the flag and is honoured here,
-    # and one arriving after it reaches _request_stop like any other. main() calls it as well,
-    # on the way in and again as the last thing it does on every way out, after its handlers are
-    # back, so a request recorded by a startup that never reached run() -- a usage error, a
-    # refused snapshot, an OSError out of the Server's construction -- is not left set for a
-    # Server built directly afterwards in the same process, whose run() would honour it, open
-    # its port and run no iteration of its loop
+    # read and cleared in one step. main() calls it on the way in and on every way out, so a request
+    # from a startup that never reached run() is not left set for the next Server in the process
     global _stop_requested_during_startup
     requested = _stop_requested_during_startup
     _stop_requested_during_startup = False
@@ -68,37 +40,31 @@ def _consume_stop_requested_during_startup() -> bool:
 
 
 DEFAULT_PORT = 6379
-# loopback, so that starting a server exposes it to nothing by accident: it has no authentication of any kind, and whatever can reach the port can read, overwrite or flush every key. --host is the explicit way to listen anywhere else
+# loopback by default: there is no authentication, so whatever reaches the port owns every key
 LISTEN_HOST = "127.0.0.1"
-# bounds how long a stop signal waits to be noticed, and on an idle loop floors both --expiry-sweep-interval and --snapshot-interval: either deadline is checked only when run_once() returns -- see Server._tick -- so with no traffic a deadline can be noticed up to one timeout late, and the default sweep interval is equal to it. under traffic run_once() returns as soon as a socket is ready, so a shorter interval is honoured.
+# bounds how long a stop takes to be noticed, and on an idle loop floors both periodic intervals:
+# a deadline is checked only when run_once() returns, and the default sweep interval equals it
 SELECT_TIMEOUT_SECONDS = 0.1
-# the most one connection may have queued once the kernel has taken what it will, past which it is closed. with the water marks below in force this is not what slows a client down: one that stops reading is paused rather than throttled here, so what this bounds is a reply larger than it, or the replies to one read's batch of pipelined requests, which the pause cannot unqueue once they are parsed. what the pause does not do is hold such a client near the mark -- the batch that crossed the mark is still dispatched whole, and measured a paused connection holds almost the whole of this default, so the pause keeps it from being closed here rather than keeping it far away; README.md carries the figure. 0 turns the check off. see Server._flush for why exceeding it closes the connection instead of slowing it down
-# a local choice and not the reference's, which leaves an ordinary client unlimited. it is below DEFAULT_MAX_VALUE_SIZE, so a value that was stored can be too large to read back: the reply to a GET of it exceeds this and the connection is closed. that is what a hard limit does, and neither default is moved to hide it
+# the most one connection may hold queued once the kernel has taken what it will, then it is closed
+# a divergence: the reference leaves an ordinary client unlimited, and a stored value can exceed it
 DEFAULT_WRITE_BUFFER_LIMIT = 32 * 1024 * 1024
-# a connection with more than this queued for it stops being read, and is read again once the queue falls to the low-water mark below. the gap between the two is the reason there are two: equal marks would pause and resume the connection on every event. 0 disables the pause. the pause is what keeps a client that pipelines faster than it reads from being closed by the limit above, and not what keeps it away from it: a paused connection holds this mark plus the one batch that crossed it, which the limit in turn caps at the limit plus one reply, so at the two shipped defaults it holds almost the whole of that ceiling rather than anything near this mark -- README.md carries the measured figure and the aggregate it implies
+# above this a connection stops being read, and is read again at the low-water mark; 0 disables it
+# two marks because equal ones would pause and resume on every event; it bounds across reads, not one
 DEFAULT_WRITE_BUFFER_HIGH_WATER = 1024 * 1024
 DEFAULT_WRITE_BUFFER_LOW_WATER = 256 * 1024
-# how long a connection may sit on a command it has only partly sent. the size caps bound one element, one command's element count and one connection's queued replies, and none bounds how long a connection may hold part of one, so a hundred connections can each sit on almost all of a large element for as long as they like; this closes a connection that has held one for longer than this. it bounds the time and not the sum: inside the limit those read buffers still add up. 0 turns the check off
+# how long a connection may sit on a partly sent command, which no size cap bounds; 0 turns it off
+# it bounds the time and not the sum -- inside the limit those read buffers still add up
 DEFAULT_INCOMPLETE_COMMAND_TIMEOUT_SECONDS = 30
-# applied by _parse_and_run(), which main() reaches, and nowhere else: a library module that configures logging takes the decision away from whatever imports it
+# applied by _parse_and_run() and nowhere else: a module that configures logging at import steals it
 DEFAULT_LOG_LEVEL = "INFO"
-# a local choice and not the reference's: proto-max-bulk-len defaults to 512 MiB there,
-# eight times this. 64 MiB is well above the largest value the suite round-trips and
-# below anything that risks OOMing a development machine. --max-value-size bounds every
-# inbound bulk element, including the command name and any key, not only what a human
-# would call "the value"
+# a divergence: proto-max-bulk-len is 512 MiB there. bounds every inbound bulk element, the command
+# name and any key included, not only what a human would call the value
 DEFAULT_MAX_VALUE_SIZE = 64 * 1024 * 1024
-# this project's own number as well, and with less to borrow: the reference has no
-# multibulk default at all, and refuses a count only above INT_MAX -- which is
-# MAX_MULTIBULK_COUNT in resp.py, checked separately and unconditionally
+# this project's own: the reference has no multibulk default and refuses only above INT_MAX
 DEFAULT_MAX_MULTIBULK = 1024 * 1024
-# relative to the process's current working directory, not to this file or the
-# repository root: a server launched from a different directory reads and writes its
-# snapshot there
+# relative to the process's cwd, not to this file: a server started elsewhere reads its snapshot there
 DEFAULT_SNAPSHOT_PATH = "./dump.mrdb"
-# a local choice and not the reference's: its own save policy is a three-tier
-# changes-based 3600 1 300 100 60 10000, where this is one flat interval that runs
-# unconditionally, never skipped for having nothing new to write
+# a divergence: the reference's policy is three changes-based tiers, this is one flat interval
 DEFAULT_SNAPSHOT_INTERVAL_SECONDS = 60
 # refusing to start over a corrupt file is the default; --ignore-snapshot is the
 # explicit escape hatch for bringing a server back up past one anyway
@@ -106,59 +72,40 @@ DEFAULT_IGNORE_SNAPSHOT = False
 # matches the cadence an idle redis-server 7.2.7 runs its background cycle at: hz is 10
 # there by default, so the cycle runs every 100 ms
 DEFAULT_EXPIRY_SWEEP_INTERVAL_MS = 100
-# a local choice: long enough for a reader that is only slow to take what is already queued for it, and short enough that an operator's own kill timer -- docker stop waits ten seconds -- does not land inside the drain and skip the teardown behind it
+# long enough for a reader that is only slow, short enough to stay inside docker stop's ten seconds
 DEFAULT_SHUTDOWN_DRAIN_TIMEOUT_SECONDS = 5
-# a local choice, and it must not fall under 50: redis-benchmark -c 50 is the standard invocation, and a cap under it refuses some of the benchmark's own clients and turns it into a test of the cap. a cap of exactly 50 admits exactly 50, since a count equal to the cap is full
+# must not fall under 50: redis-benchmark -c 50 is standard, and a lower cap tests the cap instead
+# a cap of exactly 50 admits 50, since a count equal to the cap is full
 DEFAULT_MAX_CONNECTIONS = 1024
-# off, and this is the one default here that is off rather than a value: with a limit on,
-# redis-benchmark at -c 50 -n 100000 trips it on the first batch and the published benchmark
-# would measure the rejection path instead of the server. placed here and not beside
-# DEFAULT_WRITE_BUFFER_LIMIT, where these two were first put: they went in between that
-# constant's comment and the constant, so the comment described this line instead and the write
-# buffer limit was left with none
+# off, and the one default here that is off rather than a value: with a limit on, redis-benchmark
+# at -c 50 trips it on the first batch and the published benchmark would measure the rejection path
 DEFAULT_RATE_LIMIT = 0
 # the window the limit is counted over. a duration, so time.monotonic() deals in it and not the
 # wall clock the expiry deadlines use
 DEFAULT_RATE_LIMIT_WINDOW_SECONDS = 1
-# the sweep's own three constants, read off the tagged sources rather than assumed:
-# 7.2.7's expire.c:109-111 and 5.0.14's server.h:172-174 compile in 20 keys a pass, a
-# 1000-microsecond budget and 25 per cent, and the 20 and the 1 ms here are those. the
-# 25 per cent is not: it bounds a share of a tick there, where SWEEP_RELOOP_THRESHOLD
-# below is a fraction of the sample a pass actually drew, and the two are different
-# quantities that happen to be written with the same digits.
-#
-# what is deliberately not written here is how the reference reaches those numbers --
-# which of its two cycles each belongs to, how it draws its sample, when it re-loops.
-# every attempt to set that down here has been wrong about one clause or another, each
-# correction introducing the next, and none of it was load-bearing: nothing in this file
-# behaves differently for any of it. the numbers above are checkable against the sources
-# named; the machinery around them is the reference's and not this file's to describe
+# the reference's own numbers, read off 7.2.7's expire.c:109-111: 20 keys a pass and a 1 ms budget
+# its 25 per cent is not reused -- SWEEP_RELOOP_THRESHOLD below is a share of the sample, not of a tick
 SWEEP_SAMPLE_SIZE = 20
 SWEEP_RELOOP_THRESHOLD = 0.25
 SWEEP_BUDGET_SECONDS = 0.001
-# how many repeats of one periodic task's failure pass in silence before a line says how
-# many there were. see _guard_task: a task that fails on every tick -- a save over a path
-# whose snapshot cannot be replaced, a full disk -- writes one line naming the exception
-# and then a short line per this many, instead of one line per interval for as long as the
-# server runs
+# how many repeats of one task's failure pass before a line says how many there were, so a task
+# failing on every tick writes one line and then a short line per this many, not one per interval
 FAILURE_REPEATS_PER_LINE = 100
-# the cap's counterpart to FAILURE_REPEATS_PER_LINE, ten times larger because the two rates differ: a periodic task fails at most once an interval, where a client retrying in a loop is refused as fast as it can connect, and a hundred of those would still write a line every few milliseconds. see Server._log_refusal
+# the cap's counterpart, ten times larger because a retrier is refused as fast as it can connect
+# where a periodic task fails at most once an interval
 REFUSALS_PER_LINE = 1000
-# how long refusals must stop for before the next one is reported in full again. a close cannot end the episode, however natural that looks: a freed slot is what a retrier is waiting for, so with slots turning over one comes between every pair of refusals
+# how long refusals must stop before the next is reported in full. a close cannot end an episode:
+# a freed slot is what a retrier waits for, so one comes between every pair of refusals
 REFUSAL_EPISODE_GAP_SECONDS = 60
 # the one site --expiry-sweep-interval's milliseconds are turned into the seconds
 # time.monotonic() deals in
 _MILLISECONDS_PER_SECOND = 1000
-# the ceiling _check_schedulable refuses past. the arithmetic that schedules an
-# interval -- now + value for the snapshot arm, value / 1000 for the sweep -- raises
-# OverflowError from float's own limit (around 10**308), and the ceiling is there so that
-# a value that large is refused cleanly at startup instead. 2**63 - 1 is this project's own
-# convention for the largest integer any value here is ever let hold (see
-# commands/registry.py's INT64_MAX), reused as a ceiling that is still far below where
-# the float conversion actually breaks
+# the ceiling _check_schedulable refuses past, so an absurd interval is a startup refusal and not an
+# OverflowError a tick later. 2**63 - 1 is this project's convention, far below where float breaks
 MAX_SCHEDULABLE_INTERVAL = 2**63 - 1
 
-# importing this module configures nothing: with nothing configured, logging.lastResort writes records at WARNING and above to stderr as bare messages, and _parse_and_run(), reached through main(), is the one place that configures logging
+# importing this module configures nothing: logging.lastResort writes WARNING and above to stderr,
+# and _parse_and_run() is the one place that configures it
 logger = logging.getLogger(__name__)
 
 
@@ -174,11 +121,8 @@ class ListenFailed(OSError):
 
 
 def _port(value: str) -> int:
-    # argparse's own type=int lets -1 and 99999 through to bind(), which answers them with
-    # an OverflowError traceback where a mistyped port answers with a usage message. the
-    # range is checked here so all three shapes of bad port fail the same clean way
-    # ValueError is caught rather than left to argparse, which builds its message from
-    # type='s own __name__ and would tell the user "invalid _port value"
+    # checked here because argparse's type=int lets -1 and 99999 reach bind(), which answers with an
+    # OverflowError traceback; ValueError would make argparse say 'invalid _port value'
     try:
         number = int(value)
     except ValueError:
@@ -188,32 +132,27 @@ def _port(value: str) -> int:
     return number
 
 
-# the ending of every negative-value refusal but three: for the flags this rule was written for, 0 is the value that turns the check off, and it is the one the operator is steered to
+# the ending of every negative-value refusal but three: for those flags 0 is what turns the check off
 _ZERO_DISABLES = "0 disables the check, not %d"
-# --shutdown-drain-timeout's own ending, because its 0 is the restrictive value: no drain pass, so whatever the kernel will not take in one pass is discarded. -1 is the likeliest spelling of "unlimited" and is exactly what is refused here, so the shared ending would send the operator from the value they typed to the one that does the opposite of what they meant
-# "no drain pass" and not "no drain": at 0 the setup pass and both sweeps of the accept backlog still run, so what a connection was holding is still counted and a client waiting in the backlog is still swept, and what 0 skips is the read loop alone
+# --shutdown-drain-timeout's own, because its 0 is restrictive: no read pass, so -1 meaning
+# 'unlimited' would be steered to the opposite. the setup pass and both backlog sweeps still run
 _ZERO_SKIPS_THE_READ_LOOP = "%d does not mean unlimited, and 0 means no drain pass"
-# --write-buffer-low-water's own ending, because its 0 disables nothing: with the pause on it means resume only once the queue is empty, the most conservative resume, so the shared ending would send an operator who typed -1 to a value that does not switch anything off
+# --write-buffer-low-water's own, because its 0 disables nothing: with the pause on it means resume
+# only once the queue is empty, the most conservative resume
 _ZERO_RESUMES_WHEN_EMPTY = "%d does not turn anything off, and 0 means resume only when the queue is empty"
-# --snapshot-interval's own ending, because its 0 turns off the periodic save and no more: a clean stop still saves, unless --ignore-snapshot is set as well, so the shared ending would send an operator who typed -1 to a value that does not stop saving
+# --snapshot-interval's own, because its 0 stops the periodic save alone: a clean stop still saves,
+# unless --ignore-snapshot is set with it
 _ZERO_STOPS_THE_PERIODIC_SAVE = "%d does not turn saving off, and 0 stops only the periodic save"
-# the window takes no 0 at all, where --rate-limit's 0 is what disables the limiter. a
-# window of zero would put every reading instantly outside it and permit everything, so an
-# operator who typed it meaning "off" would get a limiter that never fires and says nothing
+# the window takes no 0, where --rate-limit's 0 disables the limiter: a zero window puts every
+# reading instantly outside it, so an operator meaning 'off' would get one that never fires
 _WINDOW_TAKES_NO_ZERO = "%d is not a window, and --rate-limit 0 is what disables the limiter"
-# what an over-limit command is answered with. terse and lowercase after the code, which is
-# every other error this server writes; it names no figure, because the limit is the
-# operator's configuration and not the client's business
+# terse and lowercase after the code, like every other error here, and it names no figure:
+# the limit is the operator's configuration and not the client's business
 _RATE_LIMITED = b"ERR rate limit exceeded"
 
 
-# every numeric setting is a whole number of bytes, seconds, milliseconds or things, and the
-# comparisons that enforce them are all orderings -- which is why a value that is not an int gets
-# past them rather than failing loudly. `nan < 0` is False, so nan reached every one of these
-# checks and was accepted; so were inf and, because bool subclasses int, True. A limiter at
-# rate_limit=nan never refuses, a window of 1e-9 never fires, and a shutdown_drain_timeout of True
-# is a one-second drain nobody asked for. The sixth review found this through the rate limiter and
-# it was never the rate limiter's: it is one line missing from the rule every flag shares
+# a value that is not an int gets past every check below, because they are all orderings:
+# nan < 0 is False, inf is accepted, and True is 1 -- so a limiter at nan never refuses
 def _check_whole_number(value, label: str) -> None:
     # bool before int, because isinstance(True, int) is True and the message has to name what was
     # actually passed rather than call it an integer
@@ -223,14 +162,8 @@ def _check_whole_number(value, label: str) -> None:
 
 
 def _check_not_negative(value: int, label: str, ending: str = _ZERO_DISABLES) -> None:
-    # the "0 disables, a negative number is refused" rule, stated once and used by every
-    # CLI validator below and by Server.__init__. `limit and len(buf) >
-    # limit` reads any non-zero value as "enabled", and every buffer length is greater
-    # than a negative number -- including zero -- so a negative limit reaching that
-    # check would close every connection after its first reply while the server still
-    # logs a healthy startup line. -1 is a conventional spelling of "unlimited"
-    # elsewhere, which makes it the likeliest value to be typed here by someone
-    # reaching for the opposite of what it does
+    # the '0 disables, a negative is refused' rule, stated once for the CLI and Server.__init__:
+    # a negative limit reads as enabled and every buffer length exceeds it, so every connection closes
     _check_whole_number(value, label)
     if value < 0:
         raise ValueError(("%s cannot be negative; " + ending) % (label, value))
@@ -245,18 +178,8 @@ def _check_rate_limit_window(value: int, label: str) -> None:
 
 
 def _check_schedulable(value: int, label: str, unit: str) -> None:
-    # shared by the CLI validators for --snapshot-interval, --expiry-sweep-interval,
-    # --shutdown-drain-timeout and --incomplete-command-timeout and by Server.__init__
-    # for the same four, the only numeric settings that are durations. the first three are
-    # added to a clock reading or divided by a constant -- the periodic tick for the first
-    # two, the drain's deadline for the third -- and a value far enough past this ceiling
-    # reaches that arithmetic as an OverflowError instead of a clean refusal; for the drain
-    # timeout that is a traceback on SIGTERM, after the save. that is the same failure mode
-    # _check_not_negative exists to prevent at the other end of the range, and the reason
-    # this check runs beside it rather than replacing it. the fourth never meets arithmetic
-    # that can overflow: the stalled-command sweep only compares an elapsed time against it,
-    # and comparing an int with a float cannot overflow however large the int is. it takes
-    # the same ceiling so that one rule covers every duration, and would not fail without it
+    # the ceiling for the four durations, so an absurd value is refused instead of reaching the clock
+    # arithmetic as an OverflowError. the command timeout only compares, and takes it for one rule
     if value > MAX_SCHEDULABLE_INTERVAL:
         raise ValueError(
             "%s cannot exceed %d %s; a larger value cannot be scheduled, not %d"
@@ -264,9 +187,8 @@ def _check_schedulable(value: int, label: str, unit: str) -> None:
 
 
 def _check_water_marks(high: int, low: int, high_label: str, low_label: str) -> None:
-    # the one rule that spans two settings, stated once for the two places that can see both: _parse_and_run(), reached through main(), which turns the refusal into a usage error because argparse has no hook for a pair, and Server.__init__, which is built directly by tests and by anything embedding it. the labels are the caller's, so each door names the settings the way its own messages do
-    # guarded by the high-water mark, because 0 for it disables the pause, and a pause that is off has no band for a low-water mark to be inconsistent with: without the guard --write-buffer-high-water 0 alone would be refused against the default low-water mark, and so would the one way to switch the pause off
-    # >= and not >: marks that are equal are the band of zero width the two settings exist to avoid
+    # the rule spanning two settings, stated once for both doors: argparse has no hook for a pair
+    # guarded on the high-water mark, whose 0 switches the pause off; >= because equal marks are a zero band
     if high and low >= high:
         raise ValueError(
             "%s (%d) must be below %s (%d); equal marks would pause and resume a "
@@ -277,9 +199,8 @@ def _check_water_marks(high: int, low: int, high_label: str, low_label: str) -> 
 def _check_limit_above_high_water(
     limit: int, high: int, limit_label: str, high_label: str
 ) -> None:
-    # the second rule that spans two settings, stated once for the same two doors as the one above. a non-zero limit at or below a non-zero high-water mark leaves both water marks unreachable: _flush tests the limit before it decides read interest and returns on the close, and crossing the mark means being over the limit, so the pause can never fire and the low-water mark is never consulted. measured with the selector's own mask, a connection goes from read-registered straight to unregistered at a limit of 65,536 against the default 1 MiB mark, at a limit equal to it, and at a limit below the low-water mark, where the shipped defaults go read-registered to write-registered
-    # refused rather than warned about, for the reason the marks' own inconsistency is: a setting that cannot act is what that check exists to prevent, and the two cases are the same shape. it was accepted in silence before, which is a configuration where two flags an operator set do nothing at all
-    # guarded on both, because each 0 has its own meaning: 0 for the limit removes it, so there is no ceiling for a mark to sit under, and 0 for the mark switches the pause off, so there are no marks to be unreachable
+    # the second such rule: a non-zero limit at or below a non-zero mark leaves both marks dead,
+    # since _flush tests the limit first and returns on the close. guarded on both, each 0 its own
     if limit and high and limit <= high:
         raise ValueError(
             "%s (%d) must be above %s (%d); a limit at or below the mark closes a "
@@ -289,7 +210,8 @@ def _check_limit_above_high_water(
 
 
 def _check_host(value: str, label: str) -> None:
-    # stated once and used by the --host validator and by Server.__init__. an empty host is refused rather than read as a shorthand, because the one thing bind() does with it is listen on every interface, which is the exposure LISTEN_HOST is loopback to avoid, on a server with no authentication at all. it is not a spelling anyone means: it is what `--host "$HOST"` becomes when HOST is unset. 0.0.0.0 is not refused, since it names the same thing and whoever types it has chosen it
+    # stated once for both doors. an empty host is what `--host "$HOST"` becomes when HOST is unset, and
+    # bind() reads it as every interface; 0.0.0.0 is accepted, since whoever types it has chosen it
     if not value:
         raise ValueError(
             "%s cannot be empty; an empty host listens on every interface, and 0.0.0.0 "
@@ -301,20 +223,11 @@ def _load_initial_store(
 ) -> Store:
     if snapshot_path is None:
         return Store()
-    # a process killed mid-save strands its temporary file where no later save looks
-    # for it, and one killed after the fsync may have left a complete snapshot newer than
-    # the one about to be loaded, so each is named here and left alone. first, ahead of
-    # every refusal below -- a path no save could write, a corrupt snapshot -- so the
-    # name is already out when the start is refused, which is when that file is likeliest
-    # to be the way back. whether or not saving is on: such files belong to the path and
-    # not to the interval, and a directory this process cannot list reports none
+    # a save killed mid-write strands its temporary file, and one killed after the fsync may hold a
+    # newer snapshot, so each is named and left alone -- first, so the name is out even on a refusal
     for name in persistence.stale_temporaries(snapshot_path):
-        # two sentences, because the two shapes say different things. A name built from
-        # the snapshot's own basename can only have come from a save to this path. The
-        # bare tmpXXXXXXXX an earlier build left is tempfile's own default and carries
-        # nothing about which snapshot it belongs to -- anything on the machine that
-        # called mkstemp in this directory leaves the same name -- so telling an operator
-        # it may hold their snapshot is a guess presented as a fact
+        # two sentences, because a name built from the snapshot's basename can only be a save to this path,
+        # where the bare tmpXXXXXXXX an earlier build left is tempfile's own and names no snapshot
         if persistence.is_legacy_temporary_name(name):
             logger.warning(
                 "found %s beside %s: it has the bare temporary-file name an earlier build "
@@ -330,16 +243,8 @@ def _load_initial_store(
                 "snapshot; nothing reads or removes it", name, snapshot_path,
             )
     if snapshot_interval:
-        # ahead of both the load and --ignore-snapshot: a path no save could write as
-        # things stand would otherwise start a server that answers every write and loses
-        # them at the next restart, and --ignore-snapshot's warning would promise a
-        # replacement no save can make. a save can happen unless the snapshot was ignored
-        # and periodic saving is off, which is wider than the non-zero interval this runs
-        # under: with --snapshot-interval 0 and no --ignore-snapshot the stop still saves
-        # there and nothing checks the path first, so one a save could not write is first
-        # found at the stop, where the failure is logged and the exit status stays 0. a
-        # directory at the path is still refused at interval 0, by the load, unless
-        # --ignore-snapshot skips the load as well
+        # ahead of the load and --ignore-snapshot: a path no save could write would otherwise answer every
+        # write and lose it. at interval 0 nothing checks, so the stop's own save is where it is first found
         persistence.check_writable(snapshot_path)
     if ignore_snapshot:
         if os.path.exists(snapshot_path):
@@ -357,11 +262,8 @@ def _load_initial_store(
         return Store()
     try:
         return persistence.load(snapshot_path)
-    # a missing file is a first run, not a failure, and is treated the same as
-    # snapshot_path=None above. anything else persistence.load raises -- a
-    # corrupt file -- is left uncaught here, so it propagates out of __init__ and
-    # refuses construction rather than starting empty over a snapshot that failed
-    # to load and then overwriting it at the next save
+    # a missing file is a first run, not a failure. anything else load raises propagates out of __init__,
+    # so a corrupt snapshot refuses construction rather than being overwritten at the next save
     except FileNotFoundError:
         return Store()
 
@@ -397,7 +299,7 @@ LOG_LEVELS = ("DEBUG", "INFO", "WARNING", "ERROR")
 
 
 def _is_an_ipv6_literal(host: str) -> bool:
-    # the zone id a link-local address carries is cut first, since ipaddress does not parse it and fe80::1%en0 is still an IPv6 address for the purpose of saying why this listener refused it
+    # the zone id is cut first: ipaddress will not parse fe80::1%en0, which is still IPv6 for this
     try:
         return isinstance(ipaddress.ip_address(host.partition("%")[0]), ipaddress.IPv6Address)
     except ValueError:
@@ -405,14 +307,14 @@ def _is_an_ipv6_literal(host: str) -> bool:
 
 
 def _notes_of(exc: BaseException) -> str:
-    # str() of an exception renders its args and, for an OSError, its filename -- never its notes, which only traceback rendering prints. persistence.save() puts one on the exception it re-raises to say it stranded a full-size temporary file, and _guard_task writes no traceback, so without this the single line reporting a failed save is the only report there will be of a copy of the keyspace left on disk, and it does not mention it
+    # str() renders args and an OSError's filename, never notes, and save() puts one there to say it
+    # stranded a full-size temporary file -- without this nothing reports that copy at all
     return "".join("; " + str(note) for note in getattr(exc, "__notes__", ()))
 
 
 def _log_level(value: str) -> str:
-    # folded only when the folded form is a level, so argparse's own "invalid choice" quotes what
-    # the operator typed. type=str.upper refused "verbose" as invalid choice: 'VERBOSE', naming a
-    # value nobody wrote, and leaving the comparison to argparse keeps one refusal rather than two
+    # folded only when the folded form is a level, so argparse's 'invalid choice' quotes what was typed:
+    # type=str.upper refused 'verbose' as 'VERBOSE', naming a value nobody wrote
     folded = value.upper()
     return folded if folded in LOG_LEVELS else value
 
@@ -573,10 +475,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--ignore-snapshot",
-        # no default= naming DEFAULT_IGNORE_SNAPSHOT, unlike every flag above: store_true
-        # already defaults to False, which is that constant's own value, so nothing here
-        # reads it -- Server.__init__ is what actually consults DEFAULT_IGNORE_SNAPSHOT,
-        # for a caller that builds a Server directly instead of going through this parser
+        # no default= here, unlike every flag above: store_true already defaults to False, which is that
+        # constant's own value, and Server.__init__ is what consults it for a direct caller
         action="store_true",
         help="start with an empty keyspace instead of loading --snapshot-path: the "
              "snapshot is ignored whether or not it is readable, so a good one is "
@@ -688,9 +588,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--log-level",
-        # the level is folded for the comparison and the refusal quotes what was typed: with
-        # type=str.upper, "verbose" was refused as invalid choice: 'VERBOSE', naming a value
-        # the operator never wrote
+        # folded for the comparison, quoted as typed in the refusal: type=str.upper refused 'verbose' as
+        # invalid choice: 'VERBOSE', naming a value the operator never wrote
         type=_log_level,
         choices=LOG_LEVELS,
         default=DEFAULT_LOG_LEVEL,
@@ -714,43 +613,32 @@ class Server:
         write_buffer_limit: int = DEFAULT_WRITE_BUFFER_LIMIT,
         max_value_size: int = DEFAULT_MAX_VALUE_SIZE,
         max_multibulk: int = DEFAULT_MAX_MULTIBULK,
-        # None, not DEFAULT_SNAPSHOT_PATH: the three defaults below mirror what the CLI
-        # already defaults to, but a constructor default of ./dump.mrdb would write into
-        # whatever directory happens to be current when something builds a Server
-        # directly, which is every test in this suite and anything embedding it
+        # None, not DEFAULT_SNAPSHOT_PATH: a constructor default of ./dump.mrdb would write into whatever
+        # directory happens to be current, which is every test here and anything embedding this
         snapshot_path: str | None = None,
         snapshot_interval: int = DEFAULT_SNAPSHOT_INTERVAL_SECONDS,
         expiry_sweep_interval: int = DEFAULT_EXPIRY_SWEEP_INTERVAL_MS,
         ignore_snapshot: bool = DEFAULT_IGNORE_SNAPSHOT,
         shutdown_drain_timeout: int = DEFAULT_SHUTDOWN_DRAIN_TIMEOUT_SECONDS,
         max_connections: int = DEFAULT_MAX_CONNECTIONS,
-        # appended and not placed beside the settings they resemble: _parse_and_run() binds the first
-        # four positionally, so a parameter inserted ahead of any of them would rebind every
-        # positional call site without an error
+        # appended and not placed beside what they resemble: _parse_and_run() binds the first four
+        # positionally, so a parameter inserted ahead of one rebinds every positional call site silently
         write_buffer_high_water: int = DEFAULT_WRITE_BUFFER_HIGH_WATER,
         write_buffer_low_water: int = DEFAULT_WRITE_BUFFER_LOW_WATER,
         incomplete_command_timeout: int = DEFAULT_INCOMPLETE_COMMAND_TIMEOUT_SECONDS,
         host: str = LISTEN_HOST,
-        # after host and not before it, which is what the comment above means by appended: these
-        # two were inserted ahead of host, moving it from positional 14 to 16, and a fourteen
-        # positional call that worked before raised a TypeError afterwards. no caller in this
-        # repository passes that many positionally, which is exactly why nothing caught it
+        # after host for that reason: these two once went ahead of it, moving host from positional 14 to
+        # 16, and a fourteen-positional call raised TypeError. no caller here passes that many
         rate_limit: int = DEFAULT_RATE_LIMIT,
         rate_limit_window: int = DEFAULT_RATE_LIMIT_WINDOW_SECONDS,
     ) -> None:
-        # both checked here as well as in the parser, for the same reason: Server is
-        # constructed directly by tests and will be by anything embedding this, so a
-        # validator that lives only on the CLI is a validator with a door beside it. a
-        # negative limit reaching _flush closes every connection after its first reply
-        # rather than failing at startup, and a port outside the range reaches bind()
-        # and answers with an OverflowError traceback
+        # checked here as well as in the parser, because Server is built directly by tests and by anything
+        # embedding it: a negative limit would close every connection after its first reply instead
         if not 0 <= port <= 65535:
             raise ValueError("port must be between 0 and 65535, not %d" % port)
         self.port = port
         _check_not_negative(write_buffer_limit, "write_buffer_limit")
-        # a per-connection ceiling on queued replies, not a process-wide one: what this
-        # bounds is one client's ability to make the server hold bytes it has not managed
-        # to send, and connections do not share a write buffer to divide between them
+        # per connection and not process-wide: connections do not share a write buffer to divide
         self.write_buffer_limit = write_buffer_limit
         _check_not_negative(max_value_size, "max_value_size")
         self.max_value_size = max_value_size
@@ -768,8 +656,7 @@ class Server:
         _check_not_negative(shutdown_drain_timeout, "shutdown_drain_timeout", _ZERO_SKIPS_THE_READ_LOOP)
         _check_schedulable(shutdown_drain_timeout, "shutdown_drain_timeout", "seconds")
         self.shutdown_drain_timeout = shutdown_drain_timeout
-        # the limit takes the shared zero rule and the window takes its own, which is the
-        # asymmetry --rate-limit-window's refusal names: 0 requests per second is off, and
+        # the limit takes the shared zero rule and the window takes its own: 0 requests is off, and
         # 100 requests per 0 seconds is a limiter that permits everything in silence
         _check_not_negative(rate_limit, "rate_limit")
         self.rate_limit = rate_limit
@@ -793,10 +680,8 @@ class Server:
         self.incomplete_command_timeout = incomplete_command_timeout
         _check_host(host, "host")
         self.host = host
-        # the last validation before self._loop below: every refusal in this constructor
-        # lands before the selector opens, so a refused construction -- here, a corrupt
-        # snapshot or a path no save could write -- leaks no descriptor for the caller
-        # to close
+        # the last validation before self._loop, so every refusal here lands before the selector opens
+        # and leaks no descriptor for the caller to close
         self._store = _load_initial_store(snapshot_path, ignore_snapshot, snapshot_interval)
         self._connections: set[Connection] = set()
         self._loop = EventLoop(
@@ -804,31 +689,32 @@ class Server:
         )
         self._running = False
         self._ran = False
-        # None means "not scheduled": a Server constructed and left unrun fires neither
-        # arm, and an arm whose interval is 0 -- or, for the snapshot, with no path --
-        # never gets a deadline in the first place. _arm_periodic_tasks() sets these
-        # from time.monotonic() once run() actually starts it, and run() sets both back
-        # to None on its way out
+        # None means not scheduled: an unrun Server fires neither arm, and an interval of 0 never gets a
+        # deadline. _arm_periodic_tasks() sets them once run() starts, and run() clears them on the way out
         self._next_sweep_at: float | None = None
         self._next_snapshot_at: float | None = None
-        # per task name: how many failures in a row, counting the one already reported.
-        # _guard_task keeps it; a task that succeeds drops its entry, so the next failure
-        # after a recovery is a first failure again and is reported in full
+        # per task name: failures in a row, counting the one reported. a success drops the entry, so the
+        # next failure after a recovery is reported in full again
         self._failures_in_a_row: dict[str, int] = {}
-        # set when the shutdown drain begins and never cleared: it is what turns a read into a discard instead of a dispatch, and what lets end of input on a connection that still owes bytes wait for the drain instead of closing it, which is the reset _drain_for reads to avoid
+        # set when the drain begins and never cleared: it turns a read into a discard, and lets end of input
+        # on a connection that owes bytes wait rather than close into a reset
         self._draining = False
-        # the two cumulative counters INFO publishes, which redis-cli --stat reads. plain ints on this object because nothing else in the process holds either fact: the connection set's length is how many there are now, and these are how many there have been
+        # the two cumulative counters INFO publishes and redis-cli --stat reads: the connection set's length
+        # is how many there are now, and these are how many there have been
         self._total_connections_received = 0
         self._total_commands_processed = 0
-        # refusals in the current episode, counting the one already reported, and when the last one came. _log_refusal keeps both: a refusal that follows the one before it by more than REFUSAL_EPISODE_GAP_SECONDS starts the count again
+        # refusals in this episode, counting the one reported, and when the last came: a gap longer than
+        # REFUSAL_EPISODE_GAP_SECONDS starts the count again
         self._cap_refusals = 0
         self._last_refusal_at: float | None = None
-        # inbound bytes a stop threw away without dispatching them, in all five shapes they come in: what was sitting in a read buffer when the drain began, what a half-received command had already had parsed off that buffer and holds with the buffer empty, everything the drain read and discarded, whatever was still unread in a connection's kernel receive queue when that connection was closed or when the drain ran out of time, and whatever sat on a connection the kernel completed into the accept backlog after the stop, which is never served and never enters the connection set. _drain_for zeroes it on the way in and reports it on its one line. it exists because the pause makes this quantity large and nothing else reports it: a connection the high-water mark stopped reading has its requests waiting in the kernel's receive queue for as long as it stays paused, which is until it disconnects -- measured, all 50,000 of 50,000 pipelined SETs whose send() had already returned, over twenty-three runs in which the pause fired, with the pause edge confirmed from inside the process in twelve of twelve; README.md carries the figures and why the executed count moves. the two reply counts beside it on that line cannot show this, because a discarded request is not a reply anybody is owed
-        # the receive queue is the shape that dominates, and it is why the count is not just the drain's own reads. the drain ends the moment no connection owes a reply, which a client that reads its replies reaches long before the drain has emptied its receive queue, and --shutdown-drain-timeout 0 ends it before a single read: measured, a figure built from the drain's own reads reports every byte it read, which in both of those cases is 0 of a pipeline of 50,000
+        # inbound bytes a stop threw away undispatched, in five shapes: a read buffer, what a half-received
+        # command parsed off it, the drain's reads, an unread receive queue, and the accept backlog
         self._discarded_request_bytes = 0
-        # set only while _drain_for is accounting, so that _close contributes a closing connection's unread receive queue to the figure above exactly once, and the closes _shutdown makes after the line is written contribute nothing
+        # set only while _drain_for is accounting, so a closing connection's unread queue is counted once
+        # and the closes _shutdown makes after the line contribute nothing
         self._counting_unread_at_close = False
-        # one descriptor held in reserve for the accept-backlog sweeps, the standard reserve-descriptor technique: opened by run() once it has its listener, given back by the first sweep just before its first accept() (see _count_unaccepted_backlog for why), and None otherwise -- for a Server that has not run, for one whose drain is driven directly as the tests drive it, and once the first sweep has taken it. it is not opened in __init__, because a Server built and never run would hold a descriptor nothing ever closes
+        # one descriptor held in reserve for the backlog sweeps, released just before the shutdown save, and
+        # None otherwise. not opened in __init__: an unrun Server would hold one nothing closes
         self._spare_fd: int | None = None
 
     def _hold_spare_descriptor(self) -> None:
@@ -837,7 +723,8 @@ class Server:
         try:
             self._spare_fd = os.open(os.devnull, os.O_RDONLY)
         except OSError as exc:
-            # a table that is already full has nothing to spare, and that is not worth refusing to start for: the sweep then runs without a reserve and its failure arm says what it could not count. no exc_info, for the reason that arm has none: a traceback opens source files, and this is the state in which that fails
+            # a full table has nothing to spare and that is no reason to refuse to start: the sweep then runs
+            # without a reserve and says what it could not count. no traceback -- rendering one opens files
             logger.warning(
                 "could not reserve a descriptor for the shutdown's sweep of the accept backlog: %r", exc)
 
@@ -849,82 +736,49 @@ class Server:
 
     @property
     def connected_clients(self) -> int:
-        # public and read-only, not a plain attribute a handler could read as
-        # conn.server._connections: a private reach from commands/ into this module's own
-        # state is the same category of defect the store's own internals check exists to
-        # prevent, sitting just outside the set that check scans. A property rather than a
-        # method because the connection's own slot for this object grants attribute reads
-        # and nothing else -- no calls -- so what it exposes has to already be shaped as one
+        # public and read-only, so a handler cannot reach conn.server._connections: the slot grants
+        # attribute reads and no calls, so what it exposes has to already be shaped as one
         return len(self._connections)
 
     @property
     def total_connections_received(self) -> int:
-        # every socket accept() returned, the ones the cap then refused included, which is what
-        # "received" means in the reference's field of this name and what an operator watching
-        # redis-cli --stat wants: a cap turning a retrier away is traffic, and a count that hid it
-        # would read as an idle server. a property for the reason connected_clients is one
+        # every socket accept() returned, the cap's refusals included, which is what 'received' means and
+        # what --stat wants: a cap turning a retrier away is traffic, and hiding it reads as an idle server
         return self._total_connections_received
 
     @property
     def total_commands_processed(self) -> int:
-        # every command the dispatch loop answered, a rate-limit refusal included: a refusal is a
-        # request this server processed and answered, and counting only what reached a handler
-        # would make a limited client look idle in the one view that exists for watching a live
-        # server. that is not the reference's own rule, and docs/DESIGN.md says which is which
+        # every command the loop answered, a rate-limit refusal included: counting only what reached a
+        # handler would make a limited client look idle. not the reference's rule, and DESIGN.md says so
         return self._total_commands_processed
 
     @property
     def armed_snapshot_interval(self) -> int:
-        # the interval saves are scheduled at: snapshot_interval while run() has the save
-        # armed, and 0 before run() arms it, after run() returns, and throughout when
-        # _arm_periodic_tasks() arms nothing -- an interval of 0, or no snapshot path.
-        # CONFIG GET answers `save` from this rather than from the two settings, so a Server
-        # whose loop is driven without run(), as the tests drive one, or one that has
-        # stopped, says it saves nothing. A property for the reason connected_clients is
-        # one: the slot grants attribute reads
+        # the interval saves are actually scheduled at: the setting while run() has the arm, 0 before it,
+        # after it, and when nothing arms it. CONFIG GET answers `save` from this and not from the settings
         return self.snapshot_interval if self._next_snapshot_at is not None else 0
 
     @property
     def _ignored_snapshot_is_left_in_place(self) -> bool:
-        # the one pair of settings that skips the save on the way out: with the snapshot
-        # ignored and periodic saving off, the file was protected only because nothing
-        # wrote to it, and a save on the way out is a write. any other pairing saves: an
-        # interval of 0 alone included, and with a non-zero interval the next interval
-        # overwrites an ignored file anyway. the guarantee is kept rather than
-        # the prose corrected, on the principle the startup path already follows by
-        # removing no stale temporary file beside the snapshot, which may hold the only
-        # copy of a newer save: an operator reaching for the escape hatch is rescuing a
-        # file, and the stop must not be what destroys it
+        # the one pairing that skips the stop's own save: with the snapshot ignored and saving off, the file
+        # was protected only because nothing wrote it, and the operator rescuing it must not lose it here
         return self.ignore_snapshot and not self.snapshot_interval
 
     def _open_listener(self) -> socket.socket:
-        # the construction is inside the try as well as the bind: socket() itself fails with
-        # EMFILE on a descriptor table with no room, and left outside it that raise left as a
-        # traceback -- the exact outcome the clause below says this exists to prevent, through
-        # the one startup step the clause did not cover
+        # the construction is inside the try with the bind: socket() itself fails EMFILE on a full table,
+        # and left outside it that raise escaped as the traceback this clause exists to prevent
         listener = None
         try:
             listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
             listener.bind((self.host, self.port))
         except OSError as exc:
-            # the one startup step that fails after construction, and a port already in
-            # use is the ordinary way it does: starting a second instance by accident.
-            # Every other startup refusal this server has -- a corrupt snapshot, an
-            # unwritable path, a negative interval -- exits with one line, and this one
-            # alone unwound as a traceback out of main(), which reads as a crash rather
-            # than as the operator's own mistake. the socket is closed here because
-            # nothing else will: run() has not reached the assignment that would. None when
-            # socket() itself was what failed, where there is nothing to close
+            # the one startup step that fails after construction, and a port in use is the ordinary way:
+            # every other refusal exits on one line, where this alone unwound as a traceback out of main()
             if listener is not None:
                 listener.close()
-            # an IPv6 literal gets EAI_NONAME from an AF_INET bind, byte-identical to a
-            # misspelled hostname's, so it is named: ::1 is neither unknown nor unresolvable
-            # and the reason it is refused is that this listener is IPv4. keyed on the host
-            # really parsing as one and on this being a resolution failure, not on a colon and
-            # any OSError: --host 127.0.0.1:7000 is the likeliest mistake that holds a colon and
-            # was answered "127.0.0.1:7000 is an IPv6 address", and a real EMFILE at socket()
-            # told ::1 the same thing where 127.0.0.1 correctly read "Too many open files"
+            # an IPv6 literal gets EAI_NONAME from an AF_INET bind, the same as a misspelled hostname, so it
+            # is named. keyed on parsing as one, not on a colon: --host 127.0.0.1:7000 is the likely typo
             if isinstance(exc, socket.gaierror) and _is_an_ipv6_literal(self.host):
                 raise ListenFailed(
                     "cannot listen on [%s]:%d: this server listens on IPv4 only, and %s is "
@@ -940,28 +794,31 @@ class Server:
         try:
             sock, addr = listener.accept()
         except OSError as exc:
-            # a peer aborting between readiness and accept is normal and says nothing, so it stays silent and no per-connection boundary can cover it because no connection exists yet
-            # descriptor exhaustion is not that, and reading it as that was a defect: EMFILE and ENFILE arrive here too, the failed accept() takes the pending connection with it on this platform, and the client sees a reset with nothing logged -- where the connection cap, which refuses for the same reason, logs every refusal it makes. counted and reported through the same bounded path as a refusal, because what exhausts a descriptor table exhausts it as fast as a client can connect and logging writes to stderr with a blocking write on the only thread here
-            # it is also what the shutdown's sweep of the accept backlog was given a reserve descriptor for, on the premise that clients pile up unaccepted here: they do not, because this accept() consumed each one, so the figure that sweep exists to protect read 0 for every client refused this way
+            # a peer aborting between readiness and accept is normal and silent, and no boundary covers it yet
+            # EMFILE is not that: it arrives here too, and is reported through the cap's own bounded path
             if exc.errno in (errno.EMFILE, errno.ENFILE):
                 self._log_exhaustion(exc)
             return
-        # counted before the cap can refuse it, because a refused connection is still one received: it reached accept(), it cost a descriptor, and what an operator needs to see is the traffic the cap is turning away
+        # counted before the cap can refuse it: a refused connection still reached accept() and cost a
+        # descriptor, and the traffic a cap turns away is what an operator needs to see
         self._total_connections_received += 1
-        # one accept per readable event, so the level-triggered readiness re-reports a remaining backlog on the next select() return.
-        # >= where every byte limit is >: a byte limit compares a quantity already held against a ceiling it may legally reach, and this asks whether there is room for one more, so a count equal to the cap is full. the count is the set's own length because a second counter would disagree with the set silently in both directions
+        # one accept per readable event; level-triggered readiness re-reports any remaining backlog
+        # >= where byte limits are >: this asks if there is room for one more, so a count at the cap is full
         if self.max_connections and len(self._connections) >= self.max_connections:
             self._log_refusal(addr)
-            # closed with nothing written: a send() from this callback is on a socket nothing tracks, for a client that by construction is not being kept, and a close is a refusal the client can see. before Connection() so nothing owns the socket but this frame
+            # closed with nothing written: a send() here is on a socket nothing tracks, for a client not being
+            # kept. before Connection(), so nothing owns the socket but this frame
             sock.close()
             return
         sock.setblocking(False)
         conn = Connection(sock, addr, role=Role.CLIENT)
         try:
-            # register before tracking, so a connection is never in the set while unregistered, which would raise from the selector partway through shutdown
+            # register before tracking, so a connection is never in the set while unregistered -- which would
+            # raise from the selector partway through shutdown
             self._loop.register(conn)
         except (KeyError, ValueError, OSError):
-            # measured: the selector raises KeyError for a descriptor already registered and ValueError for a closed one, and the kqueue backend's own control call raises OSError. this callback is outside _guard, which takes a connection and closes it -- here nothing tracks this socket yet, so it is closed on the spot or never, and letting the raise out of run_once costs every other client
+            # measured: KeyError for a descriptor already registered, ValueError for a closed one, OSError
+            # from kqueue's control call. nothing tracks this socket yet, so it closes here or never
             logger.exception("dropping %s, which could not be registered", addr)
             conn.close()
             return
@@ -972,11 +829,8 @@ class Server:
         logger.info("accepted connection %d from %s; %d connected", conn.id, addr, len(self._connections))
 
     def _log_exhaustion(self, exc: OSError) -> None:
-        # bounded exactly as _log_refusal is, and through the same counter and the same episode
-        # gap: a table with no room refuses every arrival, and a line per arrival is a line per
-        # attempt of whatever is retrying. one episode covers both kinds, because an operator
-        # reading "the server is refusing connections" does not need them separated by cause --
-        # the message says which, and the count says how many
+        # bounded exactly as _log_refusal is, through the same counter and gap: a full table refuses every
+        # arrival. one episode covers both causes, since the message says which and the count how many
         self._log_capacity_refusal(
             first="could not accept a connection: the descriptor table is full (%r); the "
                   "accept() that failed took the pending connection with it, so the client saw "
@@ -989,9 +843,8 @@ class Server:
             quiet="could not accept a connection: the descriptor table is full")
 
     def _log_refusal(self, addr: tuple[str, int]) -> None:
-        # bounded by count, the way _guard_task bounds a failure that repeats: a full report for the first, one short line per REFUSALS_PER_LINE after it, DEBUG for the rest. what refuses here refuses as fast as a client can connect, and logging writes to stderr with a blocking write on the only thread here, so a line per refusal is a line per attempt of whatever is retrying in a loop
-        #
-        # cleared by a gap with no refusals and not by a connection closing, which is where _guard_task clears its own, on a success. a close is what a saturated cap's retrier is waiting for, and with slots turning over one comes between every pair of refusals, so clearing on it writes a full report per refusal: measured, 300 refusals at --max-connections 1 with the slot turning over are 300 WARNINGs
+        # bounded by count: a full report for the first, one short line per REFUSALS_PER_LINE, DEBUG for the
+        # rest. cleared by a gap and not by a close -- a close is what the retrier is waiting for
         self._log_capacity_refusal(
             first="refusing %s: %d connections is the --max-connections limit; further "
                   "refusals are logged at DEBUG, with a count every %d, until none has come "
@@ -1004,10 +857,8 @@ class Server:
             quiet="refusing %s: at the --max-connections limit" % (addr,))
 
     def _log_capacity_refusal(self, first: str, repeat: str, quiet: str) -> None:
-        # the counting half of _log_refusal, shared with _log_exhaustion so that a cap refusal
-        # and a descriptor-table refusal cannot each warn once per arrival by taking turns:
-        # one episode, one counter, one gap. the three messages are each caller's own, because
-        # each names the limit it hit and a test pins the cap's wording
+        # the counting half, shared with _log_exhaustion so two kinds of refusal cannot warn once per arrival
+        # by taking turns: one episode, one counter, one gap, and each caller's own message
         now = time.monotonic()
         if (self._last_refusal_at is not None
                 and now - self._last_refusal_at > REFUSAL_EPISODE_GAP_SECONDS):
@@ -1025,60 +876,33 @@ class Server:
         self._guard(conn, self._read_and_dispatch)
 
     def _on_writable(self, conn: Connection) -> None:
-        # the drain has two entry points and one body, so the write-interest decision is taken in exactly one place
+        # the drain has two entry points and one body, so write interest is decided in exactly one place
         self._guard(conn, self._flush)
 
     def _guard(self, conn: Connection, step: Callable[[Connection], None]) -> None:
-        # a single-threaded loop turns every uncaught exception into a total outage for every client, which is why this boundary is mandatory rather than defensive -- BlockingIOError and InterruptedError are named first because both are OSError subclasses
+        # one uncaught exception on a single-threaded loop is a total outage, so this boundary is mandatory
+        # BlockingIOError and InterruptedError are named first because both are OSError subclasses
         try:
             step(conn)
         except (BlockingIOError, InterruptedError):
             return
         except Exception:
-            # not wrapped: measured, handleError swallows the OSError family, so a full disk or a gone pipe cannot raise here. a closed stream raises ValueError straight through it, which nothing here can produce -- the handler _parse_and_run() configures writes to stderr and nothing here closes stderr
+            # not wrapped: measured, handleError swallows the OSError family, so a full
+            # disk cannot raise here, and a closed stream's ValueError is unreachable
             logger.exception("closing %s after an unhandled exception", conn.addr)
             self._abandon(conn)
 
     def _guard_task(self, what: str, step: Callable[[], None]) -> None:
-        # the periodic tasks' own boundary: _guard above takes a Connection and
-        # _abandons it on failure, which a periodic task has none of. one OSError from
-        # the snapshot path -- a full disk -- would otherwise reach the top of the only
-        # thread this server has
-        # no BlockingIOError/InterruptedError carve-out to match _guard's: those name a
-        # non-blocking socket operation that just needs retrying on the next readiness
-        # event, and neither periodic task touches a socket -- a blocked write here is a
-        # slow disk, not a signal to come back later
-        #
-        # what is reported is bounded, because what fails here fails on a timer. a save
-        # over a snapshot whose directory entry cannot be removed, or onto a full disk,
-        # fails identically once per interval for as long as the server runs, and
-        # logging writes to stderr with a blocking write(): a reader that stops -- a
-        # stalled collector, a pipeline whose far end died -- fills its buffer and then
-        # parks this call, which is on the only thread here, inside the tick. from there
-        # the loop never reaches select() again and every client is served nothing, with
-        # no further line to say so. the first failure is reported in full because it is
-        # the diagnostic; the repeats after it carry no information the first did not,
-        # and a count says more than a thousand copies of one line
-        #
-        # this bounds what this server writes. it does not make the write non-blocking,
-        # and nothing here can: O_NONBLOCK lives on the open file description, which
-        # belongs to whoever handed this process its stderr, and a writer thread is a
-        # second thread on a server whose single one is the point
+        # the periodic tasks' boundary: _guard takes a Connection and a task has none, so one OSError from
+        # the save would reach the top of the only thread. bounded, because a task fails on a timer
         try:
             step()
         except Exception as exc:
             failures = self._failures_in_a_row.get(what, 0) + 1
             self._failures_in_a_row[what] = failures
             if failures == 1:
-                # the error in the message and no exc_info: a traceback is rendered by
-                # opening source files, and a descriptor table with no room left is one of the
-                # ways every task guarded here fails -- the shutdown save's temporary file, the
-                # periodic save's, the sweep's accept. Rendering one there fails the same way and
-                # the handler swallows it, which leaves the operator "--- Logging error ---" and
-                # no account of what failed: measured, a full table lost the whole shutdown save
-                # and printed nothing else, under a drain line reading complete and exit 0.
-                # the class name and str(exc), not %r: OSError's str() carries the errno AND the path, "[Errno 2] No such file or directory: '/no/such/dir/dump.mrdb'", where %r gives "FileNotFoundError(2, 'No such file or directory')" and drops the one thing an operator needs. the class is named separately because str() of an exception raised with no argument is empty
-                # and the notes, because str() drops those too: persistence.save() attaches one to say it stranded a full-size copy of the keyspace, which nothing else reports, and a line that omits it leaves a file per failed interval on disk with no mention anywhere -- measured, four 104,816-byte copies under an ACL that denied the removal
+                # the error in the message and no traceback: rendering one opens files, and a
+                # full table is how these fail. the class, str(exc), and save()'s own notes
                 logger.error("%s failed: %s: %s%s", what, type(exc).__name__, exc, _notes_of(exc))
             elif failures % FAILURE_REPEATS_PER_LINE == 0:
                 # no traceback and no exc_info: this line exists to say the failure is
@@ -1087,35 +911,29 @@ class Server:
                     "%s has now failed %d times in a row; the first failure above is "
                     "still the one to read", what, failures)
         else:
-            # cleared on success rather than decayed: the next failure after a recovery
-            # is a different episode, and reporting it in full is the whole point of
-            # keeping this per task
+            # cleared on success rather than decayed: the next failure after a recovery is a new episode, and
+            # reporting it in full is why this is kept per task
             self._failures_in_a_row.pop(what, None)
 
     def _abandon(self, conn: Connection) -> None:
-        # the one place a close that itself fails is handled, reached from the boundary above and from the shutdown sweep, so a failing close ends the same way wherever it is noticed. every statement in _close can raise, and a raise from the boundary's own recovery reaches the top of the only thread this server has
+        # the one place a close that itself fails is handled, reached from the boundary and from the sweep:
+        # every statement in _close can raise, and a raise in the recovery reaches the top of the thread
         try:
             self._close(conn)
         except Exception:
             logger.exception("closing %s failed; abandoning it", conn.addr)
             # the connection cannot be tracked any more, so drop it and take the descriptor back
             self._connections.discard(conn)
-            # _close clears this on its own happy path, right after the same discard;
-            # reaching here means it raised before getting there, so the slot is still
-            # pointing at this Server unless this recovery clears it too
+            # _close clears this on its happy path, so reaching here means it raised first and the slot still
+            # points at this Server
             conn.server = None
             try:
-                # _close does this before the socket close; reaching here means it raised
-                # first, so the registration is still in the selector's map keyed by a
-                # descriptor about to be freed. the kernel hands that number to the next
-                # accept, and registering it raises "already registered" -- which
-                # _on_accept catches and turns into a refused, entirely unrelated client
+                # _close unregisters before the socket close, so reaching here leaves the map
+                # keyed by a descriptor the kernel is about to reuse
                 self._loop.unregister(conn)
             except Exception:
-                # broad, unlike _on_accept's named three, because this is the last resort:
-                # _close has already failed once and anything escaping here reaches the top
-                # of the only thread this server has. the registration stays leaked in that
-                # case, which is the lesser of the two outcomes
+                # broad, unlike _on_accept's named three: _close has already failed and
+                # anything escaping reaches the top of the thread
                 logger.exception("deregistering %s failed", conn.addr)
             try:
                 conn.close()
@@ -1126,15 +944,17 @@ class Server:
     def _read_and_dispatch(self, conn: Connection) -> None:
         if not conn.receive():
             if self._draining and conn.write_buffer:
-                # end of input is not a dead peer: a client that has shut down its sending half is finished asking and still reading, and closing it here discards every reply it is owed, which is the one thing the drain exists not to do. waiting costs nothing the drain does not already bound -- a peer that has really gone makes the next send fail, which flush() reports as a dead peer and _flush answers with a close the drain then counts, and a peer that has stopped reading is held by the drain's own deadline. reading is switched off for this connection because end of input stays readable: left registered, every pass would return at once having read nothing, for as long as the drain runs. write interest is already registered, because _flush keeps it equal to whether the buffer is non-empty, and the buffer is non-empty here, so clearing the read bit leaves a mask that is not empty. it does not stay that way: when the buffer empties _flush clears the write bit too, the mask reaches 0, and the applier unregisters the connection, which is right for a connection that owes nothing -- it stays open and in the set until _shutdown closes it
+                # end of input is not a dead peer: a half-closed client is still reading,
+                # and closing it discards the replies the drain exists to deliver
                 self._loop.set_read_interest(conn, False)
                 return
-            # a connection that owes nothing is closed, here as everywhere: there is nothing queued for the close to discard and nothing unread to turn it into a reset, and a half-close has nothing left to wait for when nothing is being sent
+            # a connection owing nothing is closed as everywhere: nothing queued for the close to discard, and
+            # nothing unread to turn it into a reset
             self._close(conn)
             return
         if self._draining:
-            # read and thrown away: a command dispatched now would queue a reply for a write the snapshot already missed, and a request left unread makes the close that follows a reset and not a FIN. measured, a reset does not take back what the peer has already received -- a client reads every byte and meets the error only on the read after the last -- but it discards what the closing socket itself has queued and the kernel has not yet put on the wire, and that is the tail of what the drain was waiting to deliver. the buffer is emptied so it cannot grow across passes, and nothing is parsed because this connection is only waiting to be closed
-            # counted before the clear, and the clear is what keeps one byte from being counted twice as the drain reads more into a buffer the setup pass already accounted for. the figure's sites are disjoint by what they measure, not by ordering: the setup pass counts a read buffer's contents and whatever a half-parsed command had already taken out of it, zeroing both; this counts what a read just added to an emptied one; _close and the drain's own survivor walk count what the kernel still holds and nothing ever read; and the backlog sweep counts sockets that never became connections at all
+            # read and thrown away: dispatching would queue a reply the snapshot missed,
+            # and leaving it unread makes the close a reset. counted before the clear
             self._discarded_request_bytes += len(conn.read_buffer)
             conn.read_buffer.clear()
             return
@@ -1143,27 +963,21 @@ class Server:
                 max_value_size=self.max_value_size, max_multibulk=self.max_multibulk
             )
         except BatchProtocolError as exc:
-            # everything take_commands() had already parsed off this batch is answered
-            # first, then the error, then the close -- exc.commands is what makes that
-            # possible, since the list take_commands() built is otherwise a local this
-            # raise would discard along with its frame
+            # everything already parsed off this batch is answered first, then the error, then the close:
+            # exc.commands carries that list, which the raise would otherwise discard with its frame
             self._dispatch_batch(conn, exc.commands)
             if conn.closed:
-                # dispatching those commands can itself trip --write-buffer-limit and
-                # close the connection, and an error queued onto it after that is a
-                # reply nobody reads. _flush and _close both already guard on
-                # this same flag, so nothing today makes this branch observable --
-                # kept because it states the intent at the line, and because it is
-                # what keeps this arm correct if anything reaching the wire is ever
-                # added after it
+                # dispatching can trip --write-buffer-limit and close the connection, and an
+                # error queued after that is a reply nobody reads
                 return
-            # exc.message is already the RESP error body; delivery is best-effort since the connection closes right after, so a short send() drops the tail of a message the peer was about to lose anyway
+            # exc.message is already the RESP body, and delivery is best-effort: the
+            # connection closes next, so a short send drops a tail already lost
             conn.queue(resp.encode_error(exc.message))
             self._flush(conn)
             self._close(conn)
             return
-        # the deadline for a half-sent command is armed here, on the transition into holding one, and cleared on the transition out. a command that is still outstanding keeps the reading it was armed with: restarting it on every recv would let a client sending a byte a second hold a buffer indefinitely, and that is the client the deadline is for. a command that completed in this batch is the other case -- whatever is held now is the start of the next one and gets a deadline of its own, or a client streaming a pipeline that every recv cuts in the middle of a command would never leave a clean buffer and would be closed at the timeout however quickly each command completed
-        # before the batch is dispatched and not after it: dispatching can pause this connection, and _flush suspends the deadline by clearing it, which an arm that came later would overwrite with a running one
+        # armed on the transition into holding a command, cleared on the way out, and
+        # before the dispatch -- which can pause this connection and clear it again
         if conn.has_incomplete_command:
             if conn.incomplete_since is None or parsed_commands:
                 conn.incomplete_since = time.monotonic()
@@ -1172,69 +986,39 @@ class Server:
         self._dispatch_batch(conn, parsed_commands)
 
     def _dispatch_batch(self, conn: Connection, parsed_commands: list[list[bytes]]) -> None:
-        # every command take_commands() returns is dispatched: level-triggered readiness re-reports unread socket bytes, not commands already taken out of the buffer, so a leftover here is never revisited and the client waits forever
+        # every command take_commands() returns is dispatched: readiness re-reports
+        # unread socket bytes, not parsed commands, so a leftover is never revisited
         for argv in parsed_commands:
-            # at the top of the loop rather than beside the dispatch below, so a rate-limit refusal counts: this is the count of commands answered, which is what INFO publishes it as
+            # at the top of the loop, so a rate-limit refusal counts: this is commands answered,
+            # which is what INFO publishes it as
             self._total_commands_processed += 1
-            # guarded, because the arguments are built before logger.debug is called and this is the hot loop: at the default level an unguarded call would pay for them once per dispatched command and write nothing. the name is cut and the arguments are counted, never shown -- a command name is a bulk element and may be as large as --max-value-size, and a key or a value does not belong in a log
-            # the count's own plural is spelt rather than left to %d, because "1 arguments" is what a bare one wrote, and this comment sits above the guard rather than inside it because tests/test_logging.py cuts the guard and the one line it guards out of this function's source to measure what the call costs, and a line between them is a line it cannot cut
+            # guarded because the arguments are built before the call and this is the hot loop; the name
+            # is cut and arguments counted. above the guard, never between it and the call: a test cuts both
             if logger.isEnabledFor(logging.DEBUG):
                 logger.debug("connection %d: %r with %d argument%s", conn.id, argv[0][:32], len(argv) - 1, "" if len(argv) == 2 else "s")
-            # inside the per-command loop and not once per readable event, which is the
-            # same place --write-buffer-limit is consulted and for the same reason: one
-            # recv carries a batch, so a check run per event would charge thousands of
-            # pipelined commands one unit and the limiter would bound read events rather
-            # than requests. refused means not dispatched, an error queued for that
-            # command alone, and the connection left open to send its next one -- a close
-            # would make a limiter indistinguishable from a protocol error to the client
+            # inside the per-command loop, like --write-buffer-limit: one recv carries a batch, so a
+            # per-event check would charge thousands of pipelined commands one unit
             if not self._rate_limit_permits(conn):
-                # queued and then fallen THROUGH to the size check below, never `continue`d
-                # past it. a refusal is a reply like any other and a batch of them is a batch
-                # of bytes: with a `continue` here, a refused flood skipped the one check that
-                # bounds what a single recv can queue, and the peak published as "the limit
-                # plus one reply" became 283,953 bytes past a 100-byte limit where the
-                # permitted path held to 105. measured, the in-loop check fired 9,855 times
-                # with the limiter off and once with it on, which is the per-batch throttling
-                # this placement exists to prevent -- the sixth review's finding 35
+                # queued and fallen THROUGH to the size check, never continued past it: a refused flood is
+                # bytes too, and with a continue the peak went 283,953 past a 100-byte limit
                 conn.queue(resp.encode_error(_RATE_LIMITED))
             else:
                 response, effects = commands.dispatch(self._store, conn, argv)
-                # drained once per command and before the reply is queued: the queue holds
-                # effects the lookups inside THIS command produced, so they precede the
-                # command's own -- an INCR that lazily expired its key must be preceded by the
-                # DEL, or a follower ends with the key absent while this server holds the new
-                # value. both lists are discarded because nothing consumes them: the only
-                # reader an effect was ever for is replication, which is specified in full and
-                # deliberately unbuilt, and the drain still runs because lazy expiry fills the
-                # queue from here on and nothing else would ever empty it
+                # drained once per command and before the reply, so an INCR that lazily expired its key is
+                # preceded by the DEL. both lists are discarded -- nothing consumes an effect
                 self._store.take_effects()
                 conn.queue(response)
-            # one recv can carry thousands of commands, and queueing every reply before
-            # the first send is what lets a few kilobytes of request commit gigabytes.
-            # the limit has to be consulted here as well as after the batch, or it bounds
-            # only what survives the flush and not the peak that got there. so does the
-            # high-water mark, and it is guarded by itself and not by the limit: with the
-            # limit at 0 this flush would never be reached, and a pause decided once per
-            # batch would let one recv of pipelined GETs queue the whole batch before
-            # anything throttled. the pause cannot unqueue what the batch has already
-            # parsed -- every command in it is still dispatched -- but it stops the next
-            # recv, and the flush gives the kernel the chance to take what is queued
+            # here as well as after the batch, or it bounds only what survives the flush and not the peak:
+            # one recv of pipelined GETs would queue the whole batch before anything throttled
             queued = len(conn.write_buffer)
             if ((self.write_buffer_limit and queued > self.write_buffer_limit)
                     or (self.write_buffer_high_water and queued > self.write_buffer_high_water)):
-                # drained before it is judged: a client reading normally can outrun any
-                # limit on a long enough pipeline, and closing it for the depth of its
-                # batch rather than for failing to read is not what the limit is for.
-                # _flush closes it if the buffer is still over once the kernel is done --
-                # which makes both comparisons here a trigger and not the decision, so
-                # their exact boundaries are not observable. mutating either to >= changes
-                # only how early the flush happens, and _flush's own > still decides.
-                # mutation testing reports that as a surviving mutant; it is an equivalent
-                # one, noted so the next reader spends no time on it
+                # drained before it is judged: a reader can outrun any limit on a long enough pipeline, and
+                # both comparisons only trigger the flush -- _flush's own > decides
                 self._flush(conn)
                 if conn.closed:
                     return
-        # one flush for the whole batch, not one per command: N replies concatenate into one buffer and N syscalls buy nothing
+        # one flush for the batch, not one per command: N replies concatenate and N syscalls buy nothing
         self._flush(conn)
 
     def _flush(self, conn: Connection) -> None:
@@ -1243,17 +1027,8 @@ class Server:
         if not conn.flush():
             self._close(conn)
             return
-        # checked after the send, so what it measures is what the kernel would not take
-        # rather than what was queued a moment ago. the limit closes rather than
-        # throttles, and the measurement behind that stands: refusing to read a client
-        # that has stopped reading cannot slow it down, because a client that writes its
-        # requests before reading any reply then blocks in send() waiting for room only
-        # its own reading would create, and both sides wait forever. the pause below
-        # refuses to read anyway and accepts that cost. what it does for a client that merely falls behind depends on the size of that client's replies: the resume takes up to RECV_SIZE of the receive queue that piled up while the connection was paused and every command in that read is answered, so the batch this check judges is bounded by what 64 KiB of requests produces. measured at the shipped defaults, a client asking for a 2 KiB value with a reader draining 64 KiB every 20 ms was never closed over 25 s, 2 of 2, where the same client with the pause off was closed inside a second; one asking for a 1 MiB value the same way was closed at 4.4 to 5.3 s against 2.7 to 2.8 s with the pause off. docs/DESIGN.md has the figures. the reference
-        # closes here too. a follower link would have needed exempting from this, on the
-        # same reasoning that would have kept it off the rate limiter -- a follower that
-        # falls behind is not a client that has stopped reading -- but replication is
-        # specified in full and deliberately unbuilt, so there is no such link to exempt
+        # checked after the send, so it measures what the kernel would not take. it closes rather than
+        # throttles: refusing to read a client that has stopped reading cannot slow it down
         if self.write_buffer_limit and len(conn.write_buffer) > self.write_buffer_limit:
             logger.warning(
                 "closing %s: %d bytes of queued replies exceeds the %d byte limit",
@@ -1261,61 +1036,51 @@ class Server:
             )
             self._close(conn)
             return
-        # read interest is decided before write interest, and the order matters: a paused connection whose buffer has just emptied wants neither, which the selector cannot hold as a mask and the loop spells unregistered. deciding read first means a buffer that drained to empty has already passed the resume below, so the write decision never meets a connection that wants neither
-        # none of it while the shutdown drain runs. what keeps the drain from dispatching is _read_and_dispatch discarding what it reads, so read interest is not this method's to decide there. the guard is for a connection whose peer has finished sending and is still reading: end of input switched its reading off, because end of input stays readable and would wake the loop on every pass, and the resume below fires as soon as its queue is under the low-water mark -- it would switch the reading back on, and the drain would spin on end of input until its deadline
+        # read interest is decided before write: a paused connection whose buffer just emptied wants
+        # neither, which is a mask the selector cannot hold. left alone while the drain runs
         if not self._draining:
             queued = len(conn.write_buffer)
             if self.write_buffer_high_water and queued > self.write_buffer_high_water:
-                # a paused connection cannot finish its command, because this server is what stopped reading it, so the deadline for a half-sent one stops with the reading. set_read_interest reports whether the registration changed, which is what makes the pause an edge and not a level: this runs on every flush that finds the queue above the mark, and only the one that did the pausing suspends anything
+                # a paused connection cannot finish its command, so the deadline stops with the reading, and
+                # set_read_interest's return is what makes this an edge rather than a level
                 if self._loop.set_read_interest(conn, False):
                     conn.incomplete_since = None
             elif queued <= self.write_buffer_low_water:
-                # at or below the low-water mark and not only at it, since one send can carry the queue past it. between the marks neither branch runs and the registration is left as it is, which is the hysteresis. a resume re-arms the deadline only if the registration actually changed and a command is actually outstanding: re-arming on every flush would restart it on each byte of a trickle, and arming for a connection holding nothing would close an idle client
+                # at or below the mark, not only at it: one send can carry the queue past. a resume re-arms
+                # the deadline only if the registration changed and a command is outstanding
                 if self._loop.set_read_interest(conn, True) and conn.has_incomplete_command:
                     conn.incomplete_since = time.monotonic()
-        # write interest tracks the buffer's emptiness exactly: a connection left permanently writable spins the loop at 100% CPU without dropping a single reply
+        # write interest tracks the buffer's emptiness exactly: left writable, a connection spins the
+        # loop at full CPU without dropping a reply
         self._loop.set_write_interest(conn, bool(conn.write_buffer))
 
     def _close(self, conn: Connection) -> None:
-        # idempotent, because the protocol-error path closes twice: _flush closes on a failed send and the caller closes again, and a second unregister raises from inside _guard's own recovery -- the one exception that escapes the boundary and takes the process with it
+        # idempotent, because the protocol-error path closes twice: a second unregister would raise
+        # inside _guard's own recovery, which is the one escape that takes the process with it
         if conn.closed:
             return
-        # taken before anything below touches the socket, and only while the drain is accounting: what is still in this connection's receive queue is about to go, because a close over a non-empty one is a reset and nothing dispatches it either way. counted here rather than in _drain_for's walk so that one figure covers every connection the stop disposes of -- the ones the setup pass abandons for owing nothing, and the ones _flush closes mid-drain for a dead peer or the write-buffer limit -- and not only the ones still open when the drain ends, which _drain_for adds itself
-        # read off the socket rather than asked of the kernel, because this connection has been read from and that is the state the ioctl cannot be trusted in: a kernel that sums each queued buffer's whole length answers for the half of one that a previous recv already took, which the drain's read path has already counted. emptying the queue also makes the close below a FIN where it would have been a reset, so the flush on the next line keeps what it hands the kernel
+        # taken before anything touches the socket and only while the drain accounts: a close over a
+        # non-empty queue is a reset. read off, not asked of the kernel, whose answer is not portable
         if self._counting_unread_at_close:
             self._discarded_request_bytes += conn.discard_unread_from_kernel()
-        # a queued reply is owed to the client and conn.close() discards it, so take whatever the kernel will still accept. not wrapped: measured, flush() catches BlockingIOError and OSError below this point and returns False rather than raising, even on a socket whose peer is gone
+        # a queued reply is owed and close() discards it, so take what the kernel will still accept
+        # not wrapped: flush() catches BlockingIOError and OSError and returns False instead
         conn.flush()
-        # unregister before closing: fileno() is -1 once the socket is closed, and the selector then finds the registration only by scanning its whole map for a matching object.
+        # unregister before closing: fileno() is -1 afterwards, and the selector then has to scan its
+        # whole map for a matching object
         self._loop.unregister(conn)
-        # discarded before the close rather than after it: close() sets the flag first, so a raise from the socket would leave this connection in the set with every later _close returning at the guard above
+        # discarded before the close: close() sets the flag first, so a raise from the socket would
+        # leave this connection in the set with every later _close returning at the guard
         self._connections.discard(conn)
-        # cleared before close() for the same reason: a raise from the socket would
-        # otherwise leave this connection pointing at a Server it is no longer part of,
-        # with every later _close returning at the guard above before reaching this line
+        # cleared before close() for the same reason: a raise would leave it pointing at a Server it
+        # is no longer part of
         conn.server = None
         conn.close()
         logger.info("closed connection %d from %s; %d connected", conn.id, conn.addr, len(self._connections))
 
     def _tick(self) -> None:
-        # each deadline is re-taken from the clock rather than advanced from the one it missed:
-        # a save blocks this thread until the whole keyspace is serialized, which on a large one
-        # outlasts several sweep intervals, and firing every skipped sweep back to back the
-        # moment it returns would land the whole backlog in the p99 the sampling algorithm
-        # exists to protect
-        #
-        # the two arms re-arm at different points around their own task for the same reason they
-        # can miss an interval at all: the sweep is bounded by its own millisecond budget, so
-        # re-arming it from this tick's own reading and then running it inside that budget keeps
-        # the two readings within a millisecond of each other either way. a save has no such
-        # bound -- on a keyspace large enough, it blocks this thread for longer than the interval
-        # itself -- so re-arming it from a reading taken before it runs would count the save's own
-        # duration against the next interval, running saves back to back exactly as the reference
-        # does not: redis-server counts a save's interval from its completion (server.c's cron
-        # compares unixtime against lastsave, and rdb.c sets lastsave when the save finishes), and
-        # CONFIG GET save publishes that same schedule. re-arming the snapshot deadline from a
-        # fresh reading taken after the save returns is what keeps this server's schedule honest
-        # against what it claims
+        # each deadline is re-taken from the clock, not advanced: a save can outlast several sweep
+        # intervals, and the save re-arms after it returns so the interval is the gap CONFIG GET publishes
         now = time.monotonic()
         if self._next_sweep_at is not None and now >= self._next_sweep_at:
             self._next_sweep_at = now + self._sweep_interval_seconds
@@ -1328,118 +1093,69 @@ class Server:
 
     def _close_stalled_commands(self) -> None:
         now = time.monotonic()
-        # a copy, because closing discards from the set being walked: iterating the set itself raises RuntimeError the first time anything is closed
+        # a copy, because closing discards from the set: iterating it raises RuntimeError on the first close
         for conn in list(self._connections):
             armed_at = conn.incomplete_since
             if armed_at is not None and now - armed_at > self.incomplete_command_timeout:
                 logger.warning(
                     "closing %s: a command has been incomplete for %d seconds, past the %d second limit",
                     conn.addr, now - armed_at, self.incomplete_command_timeout)
-                # _abandon and not _close: one close that raises would otherwise end the sweep with every connection behind it in iteration order still holding its half-sent command
+                # _abandon and not _close: one close that raises would end the sweep with every connection
+                # behind it still holding its half-sent command
                 self._abandon(conn)
 
     def _sweep_expired(self) -> None:
-        # bounded by elapsed time and nothing else -- no iteration cap -- because a
-        # sample's own cost is not the quantity the 1 ms budget protects; an iteration
-        # cap bounds dict lookups, and if one sampling step ever turns expensive, only a
-        # time budget still bounds the stall this puts in the p99
+        # bounded by elapsed time and no iteration cap: an iteration cap bounds dict lookups, where only
+        # a time budget bounds the stall this puts in the p99
         deadline = time.monotonic() + SWEEP_BUDGET_SECONDS
         try:
             while time.monotonic() < deadline:
                 sampled, expired = self._store.sample_and_expire(SWEEP_SAMPLE_SIZE)
-                # sampled == 0 is checked before the division to its right, not only to stop
-                # on an empty expiry index: without it, an empty index divides zero by zero
-                # on that clause instead of breaking out of the loop
+                # sampled == 0 is tested before the division beside it: an empty index divides zero by zero
                 if sampled == 0 or expired / sampled <= SWEEP_RELOOP_THRESHOLD:
                     break
         finally:
-            # in a finally, and not the loop's last line: a later pass raising -- the
-            # sampler itself, or a value the sweep does not otherwise touch -- would
-            # otherwise leave an earlier pass's DELs on the queue for whichever command
-            # dispatches next to be blamed for, exactly the misattribution this drain
-            # running once per tick rather than once per dispatched command exists to
-            # prevent. server.py's other drain, inside _dispatch_batch, runs once per
-            # dispatched command
+            # in a finally, not the loop's last line: a pass that raises would leave an earlier pass's DELs on
+            # the queue for the next command to be blamed for
             self._store.take_effects()
 
     def _save_snapshot(self) -> None:
-        # runs whether or not the keyspace changed since the last save -- no dirty-key
-        # counter, so a save is a flat cost paid on the interval rather than a decision
-        #
-        # the guard lives at each call site and not here: _tick() only reaches this call
-        # once _next_snapshot_at holds a deadline, which _arm_periodic_tasks() sets only for
-        # a path, and run()'s shutdown save checks the path itself because it runs with
-        # --snapshot-interval 0, where nothing is ever armed
+        # runs whether or not the keyspace changed -- no dirty counter, so a save is a flat interval cost
+        # the path guard lives at each call site: the stop's save runs with the interval at 0
         persistence.save(self._store, self.snapshot_path)
 
     def _arm_periodic_tasks(self) -> None:
-        # its own method for the same reason _tick() already is one: callable on its
-        # own, so a test can exercise one arming guard without driving run()'s loop
-        # taken once, in this method, rather than inside _tick: both arms' first
-        # deadlines are relative to when the server actually starts running, not to
-        # when it was built
+        # its own method so a test can exercise one arming guard without driving run()'s loop, and the
+        # reading is taken once here: both first deadlines are relative to when the server starts
         now = time.monotonic()
         if self.expiry_sweep_interval:
             self._next_sweep_at = now + self._sweep_interval_seconds
-        # snapshot_interval alone is not enough in this method: its default is a
-        # nonzero 60 while snapshot_path defaults to None, so a Server built with no
-        # path and otherwise left at its defaults still has a nonzero interval, and
-        # only this second check keeps that combination from arming a save with
-        # nowhere to write it
+        # snapshot_interval alone is not enough: its default is 60 while the path defaults to None, so
+        # only this second check keeps that pairing from arming a save with nowhere to write
         if self.snapshot_interval and self.snapshot_path is not None:
             self._next_snapshot_at = now + self.snapshot_interval
 
     def _count_unaccepted_backlog(self, listener: socket.socket) -> int:
-        # the listener leaves the select set when the loop stops, but the socket itself stays open
-        # until _shutdown, so the kernel goes on completing handshakes into its backlog for the
-        # whole of the save and the drain. Those clients are never served: nothing reads them or
-        # answers them, and the listener's close resets them -- measured, three of them sent
-        # 201,000 bytes of complete SETs that the figure reported as 0. they are accepted here,
-        # but only to be asked what each one holds and closed, and are never registered, tracked,
-        # counted by connected_clients or dispatched to. that is what the listener's close was
-        # going to do to them anyway, and a swept client that had sent bytes sees the same reset
-        # the listener's close gave it, while an idle one now sees an orderly close instead:
-        # measured against a build that swept nothing, an idle client's ECONNRESET became EOF
-        # (FIN), and a client that sent PING and one holding a half-sent command both still saw
-        # ECONNRESET
-        # no release here: run() gives the reserve back before the shutdown save instead, which is
-        # the step whose failure costs the keyspace rather than a figure, and the save closes its
-        # temporary file before returning, so the slot is free again by the time this runs. the
-        # order is deliberate -- one reserve, spent on the more consequential of the two steps
-        # first -- and this sweep keeps the slot each swept socket needs because every socket it
-        # accepts is closed before the next accept
-        #
-        # what the reserve does NOT buy here is a client refused by _on_accept: that accept()
-        # consumed the pending connection, so it never reaches a backlog this could sweep, which
-        # is why the refusal is logged there rather than counted here
+        # the listener leaves the select set but stays open, so the kernel keeps completing handshakes
+        # through the save and the drain: accepted only to be asked what each holds and closed
         total = 0
         while True:
             try:
                 sock, _addr = listener.accept()
             except BlockingIOError:
-                # nothing further pending. the listener is non-blocking, so this is the ordinary
-                # way out rather than an error. InterruptedError is not named beside it: since
-                # PEP 475 accept() retries a call interrupted by a signal inside the call, so it
-                # cannot surface here, and a handler for it could not be reached by any test
+                # nothing further pending, and the listener is non-blocking, so this is the ordinary way out
+                # InterruptedError cannot surface: since PEP 475 accept() retries inside the call
                 break
             except OSError as exc:
-                # a listener this cannot accept from is not worth a traceback inside the one
-                # report a stop writes; whatever is left in its backlog is reset by its close.
-                # logged without exc_info and with the error in the message: a traceback is
-                # rendered by opening source files, the likeliest reason to be here is EMFILE, and
-                # that open fails the same way, so the operator would be left with only
-                # "--- Logging error ---" and no account of why the figure is short
+                # a listener this cannot accept from is not worth a traceback in the one line a stop writes,
+                # and EMFILE is the likeliest reason to be here -- rendering one fails the same way
                 logger.error(
                     "could not sweep the accept backlog: %r; the request bytes discarded figure "
                     "does not count what it still held", exc)
                 break
             try:
-                # the ioctl and not a read, and this is the one site where it is the answer rather
-                # than a ceiling: this socket was accepted a moment ago and nothing has ever read
-                # it, so every buffer on its receive queue is whole and a kernel that sums their
-                # whole lengths and one that sums only the unconsumed part of each cannot
-                # disagree. the two sites that ask about a connection this process has read from
-                # go through Connection.discard_unread_from_kernel() instead, where they can
+                # the ioctl is the answer here and not a ceiling: nothing has ever read this socket, so every
+                # buffer on its queue is whole and the two kernels cannot disagree
                 total += unread_in_kernel(sock)
             finally:
                 try:
@@ -1450,16 +1166,12 @@ class Server:
 
     def _rate_limit_permits(self, conn: Connection) -> bool:
         """True when this command may be dispatched; spends one permit when it is."""
-        # off by default and off by this line: with no limit configured there is no window
-        # object, no clock reading and no deque, so a default server pays one attribute
-        # test per command for a feature it is not running
+        # off by default and off by this line: with no limit there is no window, no clock reading and no
+        # deque, so a default server pays one attribute test per command
         if not self.rate_limit:
             return True
-        # the exemption, and it is a three-value test rather than `is not Role.FOLLOWER`
-        # because the roles point opposite ways: FOLLOWER is a peer syncing off us,
-        # LEADER_LINK is our own outbound connection to our leader. A two-value check
-        # classifies that link as an ordinary client and rate-limits this process's own
-        # replication stream, with no error anywhere that says so
+        # a three-value test and not `is not Role.FOLLOWER`, because the roles point opposite ways: a
+        # two-value check would rate-limit this process's own link to its leader, silently
         if conn.role is not Role.CLIENT:
             return True
         window = conn.rate_limit_state
@@ -1475,33 +1187,22 @@ class Server:
 
     def _drain_for(self, timeout: int, listener: socket.socket | None = None) -> None:
         deadline = time.monotonic() + timeout
-        # what keeps the remaining work a fixed number of bytes is that nothing is dispatched, not that nothing is read, and a connection has to be drained of inbound bytes before it is closed: closing a socket that still holds unread ones sends a reset instead of a FIN, and a reset discards the closing socket's own send queue -- what this process handed the kernel and the kernel has not yet put on the wire -- so the last replies of a slow reader would go with it. what the peer had already received is not taken back
-        # every connection that owes bytes when the drain begins, kept because a close empties the set it was found in and the report in the finally clause has to count what the drain lost as well as what it is still waiting on. the set only shrinks from here on, because the listener is no longer registered, so nothing can arrive that this list does not hold
+        # what bounds the remaining work is that nothing is dispatched, not that nothing is read: a socket
+        # closed with unread bytes sends a reset, which discards its own send queue
         owing = []
-        # zeroed here rather than in __init__ alone, so the figure on the line below belongs to this stop and not to the life of the process
+        # zeroed here and not in __init__ alone, so the figure below belongs to this stop
         self._discarded_request_bytes = 0
-        # from here until the finally clears it, every close adds the closing connection's unread receive queue to that figure
+        # from here until the finally clears it, every close adds its unread receive queue to that figure
         self._counting_unread_at_close = True
         try:
-            # swept here as well as in the finally clause, and not for the figure: the sweep in the
-            # finally clause counts everything this one does, so removing this one leaves the
-            # counted total identical. what this one does is reset a client that was already
-            # waiting in the backlog when the stop landed at the start of the drain, where leaving
-            # it to the sweep at the end resets it only when the drain is over, up to the whole
-            # --shutdown-drain-timeout later for a client that is connected the whole time and
-            # whose requests nothing will ever read. before the connections because these sockets
-            # are not in the set and nothing else looks at them. None when _drain_for is driven
-            # directly, as the tests do, where there is no listener and nothing can be in a backlog
+            # swept here as well as in the finally, and not for the figure: this one resets a client already
+            # waiting when the stop landed, where the later sweep leaves it until the drain is over
             if listener is not None:
                 self._discarded_request_bytes += self._count_unaccepted_backlog(listener)
             # a copy, because _abandon discards from the set being walked
             for conn in list(self._connections):
-                # counted and cleared for every connection, owing or not, before either arm below: these are bytes that arrived before the stop and will never be dispatched, since the drain dispatches nothing. clearing is what makes the count in _read_and_dispatch additive rather than overlapping -- from here on a buffer holds only what arrived after this pass
-                # the buffer's length is not the whole of what this connection holds: a
-                # multibulk whose header and early elements are parsed keeps them in the
-                # connection's own count with an empty buffer, and those bytes are discarded here
-                # exactly as the buffered ones are -- measured, 1,400,019 bytes of one MSET that
-                # never completed were reported as 0 before this was added
+                # counted and cleared for every connection, owing or not
+                # never dispatched. a parsed multibulk's own count goes too -- 1,400,019 bytes once read as 0
                 self._discarded_request_bytes += (
                     len(conn.read_buffer) + conn.consumed_for_incomplete_command)
                 conn.read_buffer.clear()
@@ -1509,37 +1210,37 @@ class Server:
                 # arrives after this pass, so the read path's own count cannot overlap this one
                 conn.consumed_for_incomplete_command = 0
                 if not conn.write_buffer:
-                    # _abandon rather than _close: this walk runs after the loop has exited, where _guard no longer applies, so one close that raises would strand every connection behind it in iteration order
+                    # _abandon and not _close: this walk runs after the loop, where _guard no longer applies
                     self._abandon(conn)
                     continue
                 owing.append(conn)
-                # reading is switched back on for every connection that owes bytes, because one whose reading is off here was switched off by the high-water mark and by nothing else: outside the drain _flush is the only thing that clears it, and end of input outside the drain closes the connection instead of holding it. left off, the requests it had not read would stay in its receive queue for the whole drain, and the close at the end would be a reset, which discards what the kernel had not yet sent. switched on, _read_and_dispatch reads and discards them as it does for any other connection. the mask cannot reach 0 by this: the buffer is non-empty and _flush keeps write interest equal to that, so write interest is registered, and for a connection already being read nothing changes. unlike _flush's resume, this does NOT re-arm conn.incomplete_since, and the asymmetry is the point: _flush resumes a connection this server intends to keep serving, where a half-sent command still has to be finished or timed out, while the drain resumes one only to empty its receive queue before closing it. nothing reads the deadline here -- the drain drives run_once() and never _tick(), so the sweep cannot run -- and arming it would mean a sweep that ever did run during a drain could close a connection the drain is still trying to deliver bytes to, which is the loss the drain exists to prevent
+                # reading back on for every connection that owes bytes: left off, its unread requests make the
+                # close a reset. incomplete_since is deliberately not re-armed -- the drain never ticks
                 self._loop.set_read_interest(conn, True)
-            # write interest is not set for these: _flush leaves it equal to whether the buffer is non-empty after every send, and the only two places a reply is queued -- _dispatch_batch, and the protocol error in _read_and_dispatch -- each end in a _flush, so a connection that owes bytes is already registered for EVENT_WRITE. read interest does not last the drain: end of input on a connection that owes bytes clears it, leaving that connection registered for writing only, and the _draining guard in _flush keeps the resume there from undoing that. when its buffer empties _flush clears the write bit too, which leaves mask 0 and the applier spells that unregistered. the connection is still open and still in the set, and a connection that owes nothing has nothing left to wake the loop for, so that is the intended end of its part in the drain and not a lost registration
-            # run_once() alone, not the main loop's pairing with _tick(): a tick here would run the expiry sweep, whose DELs after the snapshot are writes no snapshot holds, and a periodic save inside a shutdown that has already saved. the deadline is read between passes, so the timeout plus one select timeout bounds the part of the drain that waits on connections. four steps between the loop stopping and exit sit outside that bound and have no deadline of their own: the snapshot save, which this flag does not limit either; the two accept-backlog sweeps, which run at this drain's entry and in its finally; the survivor walk below, which became one when its ask became a read -- O(queued bytes) where the ioctl was O(connections), measured at 1.84 GB/s and inside the noise at 400 connections, with no worst case taken; and _shutdown's teardown pass, whose per-connection _close() calls Connection.flush(), a loop that sends until the buffer empties, once per surviving connection and so bounded only by --max-connections. the count was published as two until the third was measured, and as one until the save was. what bounds a sweep is arrivals and not the backlog's size: its loop ends the first time accept() finds the backlog empty, so a client connecting during it extends it, and one sweep accepted more connections than SOMAXCONN. docs/DESIGN.md carries the measured costs
+            # write interest is left alone: _flush already keeps it equal to a non-empty buffer, and every
+            # queue site ends in a flush. run_once() alone, since a tick would sweep and save after the save
             while any(conn.write_buffer for conn in self._connections) and time.monotonic() < deadline:
                 self._loop.run_once()
         finally:
-            # cleared before the survivors are counted, so that _shutdown's own closes -- which run after this line is written -- add nothing to a figure that has already been reported
+            # cleared before the survivors are counted, so _shutdown's later closes add nothing to a figure
+            # that has already been reported
             self._counting_unread_at_close = False
-            # and the backlog once more, for the same reason the survivors below are asked again:
-            # the sweep at entry caught what was pending then, and the kernel goes on completing
-            # handshakes for the whole of the drain. this is the last look before the figure is
-            # computed, so what is left unaccounted is only what arrives between here and the
-            # listener's own close in _shutdown -- the same irreducible window the survivors have
+            # the backlog once more, because the kernel kept completing handshakes through the drain: this is
+            # the last look, so what goes unaccounted is only what arrives before _shutdown's own close
             if listener is not None:
                 self._discarded_request_bytes += self._count_unaccepted_backlog(listener)
-            # the connections the drain did not dispose of: still open, so _close has not asked them yet, and holding whatever arrived that no pass of the drain reached. the set at this point holds exactly the open members of this list, since the setup pass abandoned every connection that was not added to it and nothing has been added since. what is left unaccounted is what the peer's own kernel still holds unsent, which FIONREAD cannot reach for anyone: it answers for this socket's receive queue alone. how much that is depends on the client and not on the timeout, and it is usually nothing, because this host's loopback receive queue overcommits -- measured on this host's loopback while the walk still ASKED, FIONREAD returned a whole 1,588,890-byte pipeline against an SO_RCVBUF of 408,300, and the client's send queue was empty by the time this ran. that observation is kept for the overcommit it shows and is no longer a premise of the count: the walk reads now, so what it reports is what it took, whatever the ioctl would have said. where it is not nothing it equals the client's own SO_NWRITE, which is the one quantity this process cannot ask for. docs/DESIGN.md carries the measurements and says which client shape each was taken with; nothing bounds the remainder
+            # the connections the drain did not dispose of: still open, so _close has not asked them yet, and
+            # holding whatever arrived that no pass reached
             for conn in owing:
                 if not conn.closed:
                     self._discarded_request_bytes += conn.discard_unread_from_kernel()
-            # a close that discarded a reply leaves it in the buffer, so a connection that is closed and still has bytes queued was lost, and one that is closed with an empty buffer had everything handed to the kernel first
+            # a close that discarded a reply leaves it in the buffer, so closed with bytes queued was lost and
+            # closed with an empty one was handed over
             closed_owing = sum(1 for conn in owing if conn.closed and conn.write_buffer)
             still_owing = sum(1 for conn in owing if not conn.closed and conn.write_buffer)
             incomplete = bool(closed_owing or still_owing)
-            # in a finally so that it is the only line this writes however it ends, including a pass that raises. it is a WARNING whenever any connection was owed bytes it did not get -- closed while owed them (a peer that went away, the write-buffer limit, an unhandled error) or still owed them at the deadline -- and INFO when none was, so the level says whether anything was lost
-            # the third figure does not move the level, deliberately. has_incomplete_command answers for bytes in a read buffer and for a multibulk held with the buffer empty, which are the first two shapes; it cannot answer for the shape that dominates, because the bytes in a kernel receive queue were never parsed. so the bytes of a half-sent command and the bytes of a whole request nobody will answer are distinguishable where they have been read and not where most of them are -- and even where they can be told apart, no threshold separates them by size, which is the argument that carries: the magnitudes invert. measured, 4 of 4, one client caught mid-upload of a declared 8 MiB value having sent a 4 MiB body reported 4,194,334 bytes, against 1,588,890 for a whole discarded pipeline of fifty thousand SETs. nothing useful bounds the first: consumed_for_incomplete_command counts a multibulk's finished elements and all of their framing, so it is the two caps' product plus that framing -- 64 TiB at the defaults, which protects nothing -- and measured it exceeds the bare product whenever the elements are small beside their own headers. a threshold above the pipeline misses the pipeline and one below it warns on an ordinary upload. the word on this line is therefore about replies alone -- complete means every connection that was owed bytes got them, not that nothing inbound was thrown away -- and the figure is what has to be read for the other half
-            # what the figure is for is that the loss is visible at all: before it, a stop that discarded a paused client's entire pipeline reported nothing but the replies it still owed
+            # in a finally, so this is the only line a stop writes however it ends: WARNING when a connection
+            # was owed bytes it did not get, INFO when none was. the request figure does not move it
             logger.log(
                 logging.WARNING if incomplete else logging.INFO,
                 "shutdown drain %s; connections closed while owed bytes: %d; connections still owed bytes: %d; request bytes discarded undispatched: %d",
@@ -1549,10 +1250,11 @@ class Server:
     def _shutdown(self, listener: socket.socket) -> None:
         try:
             for conn in list(self._connections):
-                # _abandon rather than _close: this sweep runs after the loop has exited, where _guard no longer applies, so one connection that cannot be closed would otherwise strand every connection after it in iteration order with its descriptor still open
+                # _abandon and not _close: after the loop _guard no longer applies
+                # would strand every connection after it with its descriptor open
                 self._abandon(conn)
         finally:
-            # the sweep is still nested, so anything escaping it that _abandon does not answer for cannot cost the port and the selector
+            # the sweep is still nested, so anything _abandon does not answer for cannot cost the port
             try:
                 listener.close()
             finally:
@@ -1560,124 +1262,77 @@ class Server:
                 self._loop.close()
 
     def run(self) -> None:
-        # the selector is built in __init__ and closed on the way out, so a second run fails inside selectors with an error naming kqueue rather than the reuse
+        # the selector is built in __init__ and closed on the way out, so a second run would fail inside
+        # selectors naming kqueue rather than the reuse
         if self._ran:
             raise RuntimeError("this Server has already run; construct a new one")
-        # raised before the handlers exist, because a signal delivered between installing them and this line would be cleared by the handler and then overwritten here.
+        # raised before the handlers exist: a signal between installing them and this line would be
+        # cleared by the handler and then overwritten here
         self._running = True
-        # restored on the way out: run() is also called in-process, and a handler left pointing at a discarded Server swallows every later signal in that process
-        # SIGTERM unconditionally, SIGINT only when it is not already ignored. a process started
-        # from a non-interactive background job, under nohup or under setsid inherits SIGINT as
-        # SIG_IGN, and Python leaves an inherited SIG_IGN alone, so installing over it would take
-        # a decision the parent already made -- the convention every long-running program here
-        # follows. it is also what left SIGINT with two dispositions in one process: main()
-        # leaves it alone, so a Ctrl-C during the snapshot load was discarded in silence, while
-        # this line made the same signal one second later a clean saving stop. measured on a
-        # 26,000,016-byte snapshot, the server went on to answer PING after a SIGINT at 0.15 s
-        # and then exited 0 with a drain line on the next one
+        # restored on the way out, since run() is also called in-process. SIGTERM always, SIGINT only when
+        # it is not already SIG_IGN -- a parent that ignored it decided that, and nohup and setsid do
         restore = [(signal.SIGTERM, signal.signal(signal.SIGTERM, self._request_stop))]
         if signal.getsignal(signal.SIGINT) is not signal.SIG_IGN:
             restore.append(
                 (signal.SIGINT, signal.signal(signal.SIGINT, self._request_stop)))
-        # after the handlers are armed and not before: a stop that arrived while _parse_and_run() was
-        # building this server -- which includes the whole snapshot load -- is honoured here, and
-        # one that arrives from this line on reaches _request_stop. the loop body then never runs
-        # and the ordinary way out is taken whole, so the listener is still opened and closed, the
-        # snapshot is still saved and the drain still writes its line: a stop during startup ends
-        # exactly like a stop one millisecond into the loop, rather than being discarded
+        # after the handlers are armed: a stop that arrived during _parse_and_run(), the snapshot load
+        # included, is honoured here, so the ordinary way out runs whole rather than being discarded
         if _consume_stop_requested_during_startup():
             self._running = False
         try:
-            # inside the try, so every way out of run() -- a stop, a failed bind, a raise --
-            # passes the finally below that disarms both again; and below the if self._ran:
-            # check above, so a second run() on an already-ran server hits that raise before
-            # arming anything, rather than announcing a schedule this call will never honour.
-            # ahead of the listener is not itself load-bearing: nothing accepts a connection
-            # until the loop runs, so moving this call after _open_listener() would not be
-            # observable
+            # inside the try, so every way out passes the finally that disarms both, and below the _ran check,
+            # so a second run() raises before announcing a schedule it will never honour
             self._arm_periodic_tasks()
             listener = self._open_listener()
-            # right behind the listener, so a table that fills afterwards still leaves the shutdown's sweep of its backlog one descriptor to accept with
+            # right behind the listener, so a table that fills afterwards still leaves the backlog sweep one
             self._hold_spare_descriptor()
-            # set once the listener is open, because what a second run must not reuse is the selector, and nothing has touched it yet -- a failed bind leaves this instance usable
+            # set once the listener is open, because what a second run must not reuse is the selector
+            # bind leaves this instance usable
             self._ran = True
             self._loop.register_listener(listener)
-            # the bound address, not self.port: --port 0 asks the kernel to choose, and this is the only way to learn what it chose. printed rather than logged because it is not a diagnostic -- a foreground server that says nothing on success is indistinguishable from one that died, and the documented way to check this one is alive is a round trip on a port another Redis may already own, which answers either way
+            # the bound address, not self.port: --port 0 asks the kernel to choose. printed and not logged --
+            # it is not a diagnostic, and it is the line the suite's launcher reads
             host, port = listener.getsockname()[:2]
             print(f"listening on {host}:{port}", flush=True)
             try:
                 while self._running:
                     self._loop.run_once()
-                    # every iteration, not only when a socket was ready: run_once()
-                    # itself returns at least every SELECT_TIMEOUT_SECONDS even with
-                    # nothing to read or write, which is what lets an idle server with no
-                    # connections still sweep and save on schedule
+                    # every iteration, not only when a socket was ready: run_once() returns at least every
+                    # SELECT_TIMEOUT_SECONDS, which is what makes an idle server still sweep and save
                     self._tick()
-                # leaving the select set stops accept dispatch while the listener itself stays open until _shutdown, so a replacement server cannot bind this port while this process is still running
+                # leaving the select set stops accept dispatch while the socket stays open until _shutdown
+                # replacement server cannot bind this port yet
                 self._loop.unregister_listener(listener)
-                # the reserve goes back before the save and not before the first backlog sweep: at a
-                # full descriptor table the save cannot open its temporary file, and a save that fails
-                # costs the whole keyspace where a short figure costs a number. measured, a full table
-                # lost a write already answered OK with no snapshot written. the save closes that file
-                # before returning, so the sweeps below still find the slot free
+                # the reserve goes back before the save, not before the first sweep: at a full table the save
+                # cannot open its temporary file, and a failed save costs the keyspace where a figure
                 self._release_spare_descriptor()
-                # saved before the drain, not after: a client that never reads holds the drain to its whole timeout, and an operator who gives up and sends SIGKILL must not find the snapshot was the thing waiting behind it. the path is checked here and not through the arming guard, because this save runs with --snapshot-interval 0, where that guard never arms, and it is skipped when _ignored_snapshot_is_left_in_place says the file is to be left alone
+                # saved before the drain: a client that never reads holds the drain to its whole timeout
+                # SIGKILL must not find the snapshot waiting behind it
                 if self.snapshot_path is not None and not self._ignored_snapshot_is_left_in_place:
                     self._guard_task("shutdown snapshot save", self._save_snapshot)
                 self._draining = True
                 self._drain_for(self.shutdown_drain_timeout, listener)
             finally:
-                # reached from every way out, including a drain that raised, so the port and the selector are still released
+                # reached from every way out, a drain that raised included
                 self._shutdown(listener)
         finally:
-            # nothing is scheduled once run() is on its way out, however it got here, and
-            # armed_snapshot_interval reads the save deadline: left set, CONFIG GET save
-            # would go on answering a schedule for a server that will never save again. a
-            # run() retried after a failed bind arms both afresh
+            # nothing is scheduled once run() is on its way out, and armed_snapshot_interval reads the save
+            # deadline: left set, CONFIG GET save would answer a schedule nothing will honour
             self._next_sweep_at = None
             self._next_snapshot_at = None
-            # unwound rather than looped: a signal delivered during one restore raises out of a flat loop's body, and every handler after it stays bound to a discarded Server -- the exact leak the restore exists to prevent. ExitStack runs all of them and still re-raises the first, with no except clause of its own
+            # unwound rather than looped: a signal during one restore would leave every handler after it bound
+            # to a discarded Server. ExitStack runs them all and still re-raises the first
             with contextlib.ExitStack() as stack:
-                # a way out that never reached the backlog sweep -- a failed register_listener, a raise in the loop -- still has the reserve to give back, and it is a callback here so that neither it nor a handler's restore can skip the other
+                # a way out that never reached the sweep still has the reserve to give back
+                # so neither it nor a handler's restore can skip the other
                 stack.callback(self._release_spare_descriptor)
                 for signum, handler in restore:
                     stack.callback(signal.signal, signum, handler)
 
 
 def main(argv=None) -> None:
-    # This function is the startup signal handler and nothing else. Everything that can take
-    # time or fail is in _parse_and_run below, so that a SIGTERM arriving at any point after
-    # this process reached main() is recorded rather than lost:
-    # 1. clear any request left by an earlier in-process main(), so this one starts clean
-    # 2. install the recording handler for SIGTERM, and for SIGTERM alone: SIGINT keeps whatever
-    #    it had, normally default_int_handler, so that Ctrl-C during a slow load still raises
-    #    KeyboardInterrupt and abandons it. recording it too was measured to take that away: over
-    #    five alternating pairs on a real 83.6 MB snapshot with the signal delivered inside the
-    #    load, the build that leaves SIGINT alone died of the signal at a median 0.018 s and the
-    #    one that recorded it exited 0 at a median 0.794 s, having finished the load, and three
-    #    further Ctrl-Cs did not abort it, 3 of 3. what the load costs tracks the entry count and
-    #    not the byte count, so neither figure transfers to another snapshot by its size. the
-    #    defect this function closes is `docker stop`, which sends SIGTERM
-    # 3. do the whole of the work with it installed
-    # 4. restore whatever was there before, on every way out, so an in-process main() leaves the
-    #    host process's handler as it found it
-    # 5. clear the record once more as the very last step, after the handler is back, so that a
-    #    main() which recorded a stop and then died before run() -- a usage error, a refused
-    #    snapshot, an OSError out of the Server's construction -- does not leave it set for a
-    #    Server built directly afterwards in the same process, which would honour a request that
-    #    was made of another one. nothing can record after the handler is gone, which is why
-    #    this is the last step and not the first
-    # The recording is here rather than at import, for the reason _parse_and_run() configures
-    # logging rather than this module doing it at import: importing this module must leave an
-    # embedding program's handlers alone.
-    # What is left unprotected is the interpreter's own startup and this module's imports, which
-    # is the floor -- nothing this program runs can install a handler before it is running. It is
-    # a fixed cost that does not grow with the keyspace, where the window this closes did: the
-    # snapshot load is inside Server's construction, so it used to run with SIGTERM at its
-    # default disposition, and in a container the server is PID 1, where the kernel does not
-    # deliver a default-disposition signal at all. `docker stop` was discarded for as long as the
-    # load took, the container served on for the rest of the stop timeout, died on SIGKILL with
-    # no save, and a write acknowledged in that window was gone after a restart
+    # the startup signal handler and nothing else: everything that can take time or fail is in
+    # _parse_and_run, so a SIGTERM after main() is recorded rather than lost. SIGTERM alone
     _consume_stop_requested_during_startup()
     with contextlib.ExitStack() as startup_signals:
         # registered before the handler is, so that it runs after the handler has been put back
@@ -1698,9 +1353,11 @@ def _parse_and_run(argv) -> None:
             args.write_buffer_limit, args.write_buffer_high_water,
             "write buffer limit", "write buffer high water")
     except ValueError as exc:
-        # caught around this call alone and not around the construction below, which would fold every other ValueError into a one-line message. a pair of flags that contradict each other is a usage error and exits 2, where a corrupt snapshot is not and exits 1
+        # caught around this call alone: a contradictory pair of flags is a usage error and exits 2,
+        # where a corrupt snapshot is not and exits 1
         parser.error(str(exc))
-    # the one place logging is configured. importing this module must leave the host application's logging alone, and Server reads no level: it logs, and whoever started the process decided what is shown
+    # the one place logging is configured: importing this module must leave an embedding program's
+    # own alone, and Server reads no level
     logging.basicConfig(level=args.log_level)
     try:
         server = Server(
@@ -1719,19 +1376,11 @@ def _parse_and_run(argv) -> None:
             host=args.host,
         )
     except persistence.SnapshotError as exc:
-        # this specific exception, not a bare Exception: anything else raised while
-        # constructing a Server -- a bug, an unrelated OSError -- is left to crash with
-        # its own traceback rather than being folded into a one-line CLI message that
-        # was never meant to describe it
-        # exit 1 rather than argparse's 2: a corrupt snapshot is not a usage error
+        # this exception and not a bare Exception: anything else raised while constructing a Server is
+        # left to crash with its own traceback. exit 1, since a corrupt snapshot is not a usage error
         print(f"error: {exc}", file=sys.stderr)
-        # the remedy, named here and not in the message: persistence.py knows nothing about flags,
-        # and every numeric refusal this parser writes already points at its own way out, where
-        # the one refusal with a flag built for it said nothing. only for a load that was refused
-        # -- a path no save could write is not what --ignore-snapshot is for, since it would start
-        # and then fail at the first save -- and asked by type, because the substrings this used
-        # to read are a message the operator's own path is interpolated into: a corrupt snapshot
-        # under a directory named "cannot write" lost the remedy
+        # the remedy named here and not in the message, because persistence.py knows nothing about flags
+        # only for a refused load, and asked by type: a path named 'cannot write' lost it to a substring
         if not isinstance(exc, persistence.UnwritablePath):
             print(
                 "       --ignore-snapshot starts with an empty keyspace without reading that "
@@ -1742,10 +1391,8 @@ def _parse_and_run(argv) -> None:
     try:
         server.run()
     except ListenFailed as exc:
-        # its own exception type, not OSError: run() is the whole event loop, and an
-        # OSError raised anywhere inside it -- a selector, a socket, a bug -- would be
-        # folded into a one-line CLI message that was never meant to describe it. Only
-        # the bind raises this
+        # its own exception type and not OSError: run() is the whole loop, and any OSError inside it would
+        # be folded into a one-line CLI message. only the bind raises this
         print(f"error: {exc}", file=sys.stderr)
         raise SystemExit(1)
 

@@ -314,18 +314,16 @@ def test_a_recovered_key_still_carries_a_ttl_in_the_right_units(crash):
     in_file = crash.on_disk[TTL_KEY][1]
     print("\ndeadline in the snapshot: %d ms since the epoch; wall clock around the SET: %d to %d"
           % (in_file, crash.wall_before_ms, crash.wall_after_ms))
-    # the file holds an absolute Unix millisecond. a monotonic reading would be a small
-    # number from a different epoch and a count of seconds would be a thousand times too
-    # small, and either reads as a long-expired key after a restart
+    # the file holds an absolute Unix millisecond: a monotonic reading would be a small number from
+    # another epoch and seconds a thousand times too small, either reading as long expired on restart
     assert (crash.wall_before_ms + TTL_MS - CLOCK_SLACK_MS
             <= in_file
             <= crash.wall_after_ms + TTL_MS + CLOCK_SLACK_MS)
 
     # the key survived the restart, so a deadline already in the past is ruled out too
     assert TTL_KEY in crash.recovered
-    # time passed between the SET and this read, so the remainder lies between the TTL less
-    # the longest that can have passed and the TTL less the shortest. a TTL restarted at
-    # load, or one that did not shrink, falls above the upper bound
+    # the remainder lies between the TTL less the longest elapsed and less the shortest: a TTL restarted
+    # at load, or one that did not shrink, falls above the upper bound
     longest_ms = (crash.pttl_replied_at - crash.ttl_sent_at) * 1000
     shortest_ms = (crash.pttl_sent_at - crash.ttl_acked_at) * 1000
     print("recovered PTTL: %d ms of %d ms set, %.0f to %.0f ms having passed"
@@ -407,11 +405,8 @@ def test_the_documented_data_loss_window_is_bounded_by_the_snapshot_interval(tmp
     delay, (aged, late) = outcome
     print("after the kill: the write a save had covered is %r, the one it had not is %r"
           % (aged, late))
-    # the interval, from both sides. the write was made just after a save landed, so the
-    # next one is a whole interval away: on disk within it, with a margin for the tick that
-    # starts the save and for the poll that saw it (the wait above already failed if not),
-    # and not much sooner, because a save that comes early narrows the window below the one
-    # configured and the bound would then be measuring some other number
+    # the interval from both sides: the write landed just after a save, so the next is a whole interval
+    # away -- and not much sooner, or a narrowed window leaves the bound measuring another number
     assert WINDOW_INTERVAL - POLL_LATENCY_SECONDS <= delay <= WINDOW_INTERVAL + WINDOW_MARGIN_SECONDS
     # what the bound protects: a write that a save covered survives the crash
     assert aged == b"1"

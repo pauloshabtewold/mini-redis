@@ -20,13 +20,14 @@ import pytest
 
 from tests.conftest import launch_server, stop_server
 
-# far past the handful a hand-written test uses, so one select() pass routinely finds many connections readable at once
+# far past the handful a hand-written test uses, so one select() pass routinely finds many readable
 CLIENTS = 64
-# about 90 KiB of SETs per client, past one 64 KiB recv, so commands split across reads while other connections are served
+# about 90 KiB of SETs per client, past one 64 KiB recv, so commands split across reads
 KEYS_PER_CLIENT = 500
-# an order of magnitude over CLIENTS and passed explicitly, so this stays a concurrency test and never becomes a cap test
+# an order of magnitude over CLIENTS and passed explicitly, so this never becomes a cap test
 MAX_CONNECTIONS = 512
-# bounds a failure and not a pass: a healthy run finishes well inside a second, and a shortfall is reported the moment this passes
+# bounds a failure and not a pass: a healthy run finishes well inside a second, and a shortfall is
+# reported the moment this passes
 DEADLINE_SECONDS = 15
 
 RECV_SIZE = 65536
@@ -54,7 +55,8 @@ def _key(client, index):
 
 
 def _value(client, index):
-    # seeded per key so the expected bytes are recomputed rather than stored, and at least 16 random bytes so one client's value is never mistaken for another's
+    # seeded per key so the expected bytes are recomputed rather than stored, with at least 16 random
+    # bytes so one client's value is never mistaken for another's
     length = 16 + (index * 37 + client * 11) % 240
     return random.Random(client * 1_000_003 + index).randbytes(length)
 
@@ -120,7 +122,8 @@ def read_replies_until_deadline(sock, expected, deadline_seconds):
                 replies.append(bytes(buffer[position:end]))
                 position = end
     finally:
-        # the caller sends on this socket next, and a timeout left at the last sliver of the deadline would fail that send
+        # the caller sends on this socket next, and a timeout left at the last sliver of the deadline
+        # would fail that send
         sock.settimeout(previous_timeout)
     if len(replies) < expected:
         raise AssertionError("got %d of %d expected replies: %s" % (len(replies), expected, cause))
@@ -128,7 +131,8 @@ def read_replies_until_deadline(sock, expected, deadline_seconds):
 
 
 def _client(port, index, start, read_back):
-    # the payloads are built before the barrier so the release is followed straight away by sends and not by every thread building its own
+    # the payloads are built before the barrier, so the release is followed by sends and not by every
+    # thread building its own
     sets = b"".join(
         _command(b"SET", _key(index, i), _value(index, i)) for i in range(KEYS_PER_CLIENT)
     )
@@ -153,7 +157,7 @@ def _run_clients(port, read_back):
         try:
             outcomes[index] = _client(port, index, start, read_back)
         except Exception as exc:
-            # a client that dies before the barrier would otherwise leave the rest waiting out its whole timeout
+            # a client that dies before the barrier would otherwise leave the rest waiting out its timeout
             start.abort()
             outcomes[index] = exc
 
@@ -169,7 +173,8 @@ def _run_clients(port, read_back):
 
     failures = [(i, o) for i, o in enumerate(outcomes) if isinstance(o, Exception)]
     if failures:
-        # an abort makes every other client raise BrokenBarrierError, which names nobody; the first real failure does
+        # an abort makes every other client raise BrokenBarrierError, which names nobody; the first
+        # real failure does
         real = [f for f in failures if not isinstance(f[1], threading.BrokenBarrierError)]
         index, exc = (real or failures)[0]
         raise AssertionError("client %d failed (%d clients did): %r" % (index, len(failures), exc)) from exc

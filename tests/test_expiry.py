@@ -131,9 +131,8 @@ def test_expire_and_pexpireat_are_type_agnostic():
 
 
 def test_expire_accepts_the_value_one_step_inside_the_overflow_boundary(store):
-    # the accepting side of the same boundary: an off-by-a-multiplier guard rejects this
-    # and passes every rejecting case, so only the accept side catches it -- the same
-    # shape of case, applied to the expiry family's own arithmetic
+    # the accepting side of the boundary: an off-by-a-multiplier guard rejects this and passes every
+    # rejecting case, so only the accept side catches it
     store.write(b"k", b"v", keep_ttl=False)
     assert r(store, b"EXPIRE", b"k", b"999999999999999") == (
         b":1\r\n", [[b"PEXPIREAT", b"k", b"%d" % (FROZEN + 999999999999999 * 1000)]])
@@ -199,19 +198,15 @@ def test_expire_family_arity_is_exact_not_a_minimum(store, argv, expected):
 @pytest.mark.parametrize(
     "seconds, expected",
     [
-        # the reference divides its own bound with C semantics, which truncate toward
-        # zero; Python's // floors, and the two differ on exactly this one value. a
-        # floored bound accepts it, resolves a deadline far in the past, and deletes
-        # the key -- where the reference answers an error and the key survives
+        # the reference truncates toward zero where Python's // floors, and the two differ on exactly
+        # this value: a floored bound accepts it, resolves a past deadline and deletes the key
         (b"-9223372036854776", b"-ERR invalid expire time in 'expire' command\r\n"),
-        # one step inside it is still accepted, so the bound rejects the boundary
-        # rather than everything near it. measured against redis-server 7.2.7, which
-        # answers :1 here and the error above
+        # one step inside is still accepted, so the bound rejects the boundary and not everything near
+        # it; measured against redis-server 7.2.7, which answers :1 here and the error above
         (b"-9223372036854775", b":1\r\n"),
         (b"-9223372036854774", b":1\r\n"),
-        # the positive side never reached this bound: every value large enough to
-        # trouble it is already caught by the millisecond conversion below, which is
-        # why only the negative half of the range moved
+        # the positive side never reached this bound: anything large enough is already caught by the
+        # millisecond conversion below, which is why only the negative half moved
         (b"9223372036854775", b"-ERR invalid expire time in 'expire' command\r\n"),
         (b"9223372036854776", b"-ERR invalid expire time in 'expire' command\r\n"),
     ],
@@ -234,21 +229,16 @@ def test_expire_at_the_negative_bound_leaves_the_key_alone(store):
 @pytest.mark.skipif(NO_CONVERSION_CEILING, reason=NO_CEILING_REASON)
 @pytest.mark.parametrize("argv0", [b"EXPIRE", b"PEXPIRE", b"PEXPIREAT"])
 def test_a_digit_run_past_the_conversion_ceiling_is_refused_not_raised(store, argv0):
-    # parse_int64's length guard is what keeps this off int(), which raises above the
-    # interpreter's conversion ceiling -- an escaping ValueError closes the client's
-    # connection and logs a traceback where the protocol asks for one error reply
+    # parse_int64's length guard keeps this off int(), which raises above the interpreter's conversion
+    # ceiling: an escaping ValueError closes the client and logs a traceback instead of one error reply
     store.write(b"k", b"v", keep_ttl=False)
     assert r(store, argv0, b"k", OVERSIZED_DIGIT_RUN) == (
         b"-ERR value is not an integer or out of range\r\n", [])
 
 
 def test_a_remaining_time_is_never_reported_as_one_of_the_two_negative_facts():
-    # _remaining_ms reads the clock twice -- once inside lookup(), once for the
-    # subtraction -- and a deadline that falls between the two reads makes the
-    # difference negative. -1 and -2 are not small numbers here, they are "this key has
-    # no deadline" and "this key does not exist", and a key that has both would be
-    # answering the client the opposite of the truth. the reference clamps for this
-    # reason; this pins the clamp with a clock that always crosses the deadline
+    # _remaining_ms reads the clock twice, and a deadline falling between the reads makes the difference
+    # negative -- -1 and -2 mean "no deadline" and "no such key", so the clamp keeps those honest
     class ClockCrossesTheDeadline(Store):
         def __init__(self):
             super().__init__()
@@ -276,14 +266,8 @@ def test_a_remaining_time_is_never_reported_as_one_of_the_two_negative_facts():
     (b"PEXPIRE", 1, b"-ERR invalid expire time in 'pexpire' command\r\n"),
 ])
 def test_the_millisecond_conversion_bound_is_exact_at_int64_max(argv0, unit, error):
-    # the existing coverage lands grossly past INT64_MAX, so `> INT64_MAX` and
-    # `>= INT64_MAX` look identical to it. a deadline landing exactly on INT64_MAX is
-    # legal -- PEXPIREAT accepts one -- and the check must not refuse it.
-    #
-    # the clock is chosen rather than frozen at the shared value, because EXPIRE multiplies
-    # by 1000 and INT64_MAX - FROZEN is not a multiple of 1000: no whole number of seconds
-    # lands on the boundary from there, so the comparison is simply unreachable and a test
-    # written against that clock cannot tell > from >= however it is phrased
+    # existing coverage lands grossly past INT64_MAX, so `>` and `>=` look alike to it, and a deadline
+    # exactly on INT64_MAX is legal -- a chosen clock, since INT64_MAX - FROZEN is no multiple of 1000
     amount = 4_000_000
     now = INT64_MAX - amount * unit
 

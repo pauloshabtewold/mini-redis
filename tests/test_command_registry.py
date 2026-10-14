@@ -2,7 +2,8 @@ import commands
 
 Kind = commands.registry.Kind
 
-# set-equality on (name, kind) pairs, not presence: a mistagged command fails outright, and a command this map does not carry fails here until the map is edited deliberately
+# set-equality on (name, kind) pairs and not presence: a mistagged command fails outright, and one this
+# map does not carry fails until the map is edited deliberately
 EXPECTED = {
     b"PING": Kind.OTHER,
     b"ECHO": Kind.OTHER,
@@ -39,8 +40,7 @@ def test_every_registered_command_carries_its_expected_kind():
 
 
 def test_every_kind_is_a_distinct_value():
-    # StrEnum makes a duplicated value an alias rather than an error, and the map above compares
-    # tags that would then be equal: a WRITE tagged "read" is a write the rate limiter exempts,
-    # with every tag in this file still matching
+    # StrEnum makes a duplicated value an alias rather than an error, and a WRITE tagged "read" is a
+    # write the rate limiter exempts with every tag in this file still matching
     assert len(list(Kind)) == 3
     assert len({kind.value for kind in Kind}) == 3

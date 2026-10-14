@@ -256,9 +256,8 @@ def test_get_raises_wrongtype_through_dispatch():
 
 
 def test_set_del_exists_type_stay_type_agnostic_against_the_same_store():
-    # the three assertions after SET are the ones that fail against a WRONGTYPE check
-    # added to SET, EXISTS or DEL "for consistency" -- a behaviour change list support
-    # would have to undo
+    # the three assertions after SET are the ones a WRONGTYPE check added to SET, EXISTS or DEL
+    # "for consistency" would fail
     s = Store()
     commands.dispatch(s, None, [b"RPUSH", b"w", b"v"])
     assert commands.dispatch(s, None, [b"SET", b"w", b"v2"])[0] == b"+OK\r\n"
@@ -303,9 +302,8 @@ def test_parse_int64_grammar():
          "cross-family", "overflow-then-valid"],
 )
 def test_set_validates_only_the_ttl_option_that_survives_a_repeat(store, conn, options, expected):
-    # parsing inside the scanning loop rejects a malformed earlier occurrence that a
-    # later one legally overrides. the overflow check was already deferred past the loop
-    # for exactly this reason; the grammar check has to be deferred with it
+    # parsing inside the scanning loop rejects a malformed earlier occurrence a later one legally
+    # overrides: the grammar check has to be deferred past the loop like the overflow check
     response, _effects = commands.dispatch(store, conn, [b"SET", b"k", b"v"] + options)
     assert response == expected
 
@@ -412,9 +410,8 @@ def test_the_new_options_are_case_insensitive_like_the_old_ones(store, conn, opt
 
 
 def test_keepttl_is_carried_into_the_effect_so_a_replay_keeps_the_deadline_too(conn):
-    # the effect is what a follower replays, and a plain SET's own keep_ttl=False clears
-    # the deadline this command exists to preserve. dropping the token leaves the two
-    # ends disagreeing about when the key dies, with nothing to notice
+    # the effect is what a follower replays, and a plain SET's keep_ttl=False clears the deadline this
+    # command exists to preserve: dropping the token leaves the two ends disagreeing about when it dies
     leader = FrozenStore()
     commands.dispatch(leader, conn, [b"SET", b"k", b"v1", b"EX", b"100"])
     _response, effects = commands.dispatch(leader, conn, [b"SET", b"k", b"v2", b"KEEPTTL"])
@@ -430,11 +427,8 @@ def test_keepttl_is_carried_into_the_effect_so_a_replay_keeps_the_deadline_too(c
 @pytest.mark.parametrize("token, argument", [(b"EXAT", b"1"), (b"PXAT", b"1")],
                          ids=["exat", "pxat"])
 def test_an_absolute_deadline_already_past_deletes_rather_than_scheduling(conn, token, argument):
-    # EXAT and PXAT are the only options that resolve a valid argument to an instant
-    # already gone. A follower has no license to remove a key on its own initiative, and a
-    # key written into the index would reach the follower as a DEL only once the leader's
-    # own lookup or sweep got to the key -- a sampled pass promises nothing about this one
-    # key, so nothing bounds when. EXPIRE's own path deletes on the spot for this reason too
+    # EXAT and PXAT are the only options that resolve a valid argument to an instant already gone: a
+    # follower cannot delete on its own, and nothing bounds when a sampled pass would reach the key
     store = FrozenStore()
     response, effects = commands.dispatch(store, conn, [b"SET", b"k", b"v", token, argument])
     assert response == b"+OK\r\n"
@@ -461,11 +455,8 @@ def test_a_thousand_past_dated_writes_leave_nothing_behind(conn):
 
 
 def test_set_with_get_raises_wrongtype_through_dispatch():
-    # SET is type-agnostic and overwrites anything, but GET makes it read the value it is
-    # replacing, and reading a value of the wrong kind is WRONGTYPE. Without the kind on
-    # that lookup the command answers a plausible-looking old value and overwrites the
-    # key -- the corruption the check exists to prevent. This path was unreachable before
-    # a second value kind existed; a real list, built with RPUSH, reaches it now
+    # GET makes a type-agnostic SET read the value it replaces, and without the kind on that lookup the
+    # command answers a plausible old value and overwrites the key -- the corruption the check prevents
     store = Store()
     commands.dispatch(store, None, [b"RPUSH", b"w", b"v"])
     assert commands.dispatch(store, None, [b"SET", b"w", b"new", b"GET"]) == (
@@ -476,10 +467,8 @@ def test_set_with_get_raises_wrongtype_through_dispatch():
 @pytest.mark.parametrize("token, argument", [(b"EXAT", FROZEN // 1000), (b"PXAT", FROZEN)],
                          ids=["exat", "pxat"])
 def test_an_absolute_deadline_landing_exactly_on_now_deletes(conn, token, argument):
-    # every other test of this branch uses PXAT 1 -- far enough in the past that `<= now` and
-    # `< now` agree, so the boundary itself is untested and a strict comparison passes. the
-    # sibling checks in _apply_expiry and Store.lookup are both pinned at the exact instant;
-    # this is the third copy of the same rule and it was not
+    # every other test of this branch uses PXAT 1, far enough past that `<= now` and `< now` agree, so
+    # the boundary itself is untested and a strict comparison passes
     store = FrozenStore()
     response, effects = commands.dispatch(
         store, conn, [b"SET", b"k", b"v", token, b"%d" % argument])

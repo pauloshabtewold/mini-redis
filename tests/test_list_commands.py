@@ -123,9 +123,8 @@ def test_popping_the_last_element_from_the_right_also_removes_the_key(store, con
 
 
 def test_popping_the_last_element_drops_a_ttl_set_on_the_key():
-    # the container is gone, and store.remove() clears the expiry index along with the
-    # keyspace entry -- a deadline outliving the key it was set on is exactly the
-    # orphan check_invariants() watches for
+    # store.remove() clears the expiry index with the keyspace entry: a deadline outliving the key it
+    # was set on is exactly the orphan check_invariants() watches for
     s = FrozenStore()
     commands.dispatch(s, None, [b"RPUSH", b"t", b"a"])
     commands.dispatch(s, None, [b"EXPIRE", b"t", b"100"])
@@ -137,9 +136,8 @@ def test_popping_the_last_element_drops_a_ttl_set_on_the_key():
 
 
 def test_a_push_preserves_an_existing_ttl():
-    # in-place mutation is what makes this automatic: the key is never rewritten after
-    # the first push creates it, so nothing here has to remember to carry a deadline
-    # forward the way SET's own keep_ttl parameter does
+    # in-place mutation makes this automatic: the key is never rewritten after the first push, so
+    # nothing here has to carry a deadline forward the way SET's keep_ttl does
     s = FrozenStore()
     commands.dispatch(s, None, [b"RPUSH", b"t", b"a", b"b"])
     commands.dispatch(s, None, [b"EXPIRE", b"t", b"100"])
@@ -152,13 +150,8 @@ def test_a_push_preserves_an_existing_ttl():
 
 
 def test_lrange_reads_the_same_run_from_whichever_end_is_nearer(store, conn):
-    # lrange walks forward from the head for a range in the front half and backward off
-    # reversed() for one in the back half, because islice only ever starts at the head and
-    # a range near the tail would otherwise pay the whole length of the list. The two
-    # walks have to agree on every range, including the ones that straddle the midpoint,
-    # so the oracle here is a plain list slice -- a different computation from either
-    # walk, and the one thing the backward path could get wrong without the forward path
-    # noticing. Nine elements puts the boundary at index four with ranges on both sides
+    # the forward and the backward walk have to agree on every range, the ones straddling the midpoint
+    # included, so the oracle is a plain list slice; nine elements puts the boundary at index four
     elements = [b"e%d" % i for i in range(9)]
     commands.dispatch(store, conn, [b"RPUSH", b"k"] + elements)
     for start in range(-12, 13):
@@ -197,12 +190,8 @@ class _CountingDeque(deque):
 
 
 def test_lrange_walks_from_the_nearer_end_rather_than_always_from_the_head(store, conn):
-    # the reason the walk has two directions, asserted as steps rather than as elapsed
-    # time -- a wall-clock budget on a shared machine is a flake, and the step count is
-    # the thing that actually changed. islice always starts at the head, so a head-first
-    # read of the last of a thousand elements visits all thousand; from the tail it
-    # visits one. Without this the suite cannot tell the two-ended walk from the
-    # head-first one it replaced, since they answer identically on every input
+    # asserted as steps and not elapsed time: islice starts at the head, so a head-first read of the
+    # last of a thousand elements visits all thousand, and from the tail it visits one
     container = _CountingDeque(b"e%d" % i for i in range(1000))
     store.write(b"k", container, keep_ttl=False)
 
@@ -223,9 +212,8 @@ def test_lrange_walks_from_the_nearer_end_rather_than_always_from_the_head(store
 
 
 def test_lrange_reads_a_single_element_off_the_tail_without_walking_the_list(store, conn):
-    # the shape the two-ended walk exists for. Timing is not the assertion -- a wall-clock
-    # budget on a shared machine is a flake -- so this asserts the answer on a list long
-    # enough that a head-first walk would be doing thousands of steps for one element
+    # the shape the two-ended walk exists for, asserted as the answer on a list long enough that a
+    # head-first walk would take thousands of steps for one element
     commands.dispatch(
         store, conn, [b"RPUSH", b"k"] + [b"e%d" % i for i in range(5000)])
     assert commands.dispatch(store, conn, [b"LRANGE", b"k", b"-1", b"-1"]) == (
