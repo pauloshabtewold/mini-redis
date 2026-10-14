@@ -273,6 +273,7 @@ commands/       __init__.py, registry.py, server.py, string.py and list.py; twen
 Dockerfile      single-service image: non-root user, snapshot in a volume at /data
 tests/          test suite, run in CI against Python 3.11, 3.13 and 3.14
 scripts/        check-the-front-page.sh: clones this repository and runs the commands on this page
+docs/           DESIGN.md, why each module is shaped this way; MEASUREMENTS.md, how every figure was taken
 ```
 
 ### In a container
@@ -328,5 +329,8 @@ the OOM killer when `--memory` is too small for the snapshot, which leaves an em
 ---
 
 [Design notes](docs/DESIGN.md) cover why each module is shaped the way it is and every
-deliberate difference from real Redis. The measurements behind the figures above, and the
-log of every defect that escaped a gate, are kept outside this repository.
+deliberate difference from real Redis. [How the figures were taken](docs/MEASUREMENTS.md) is the
+method behind every figure in both files -- what to run, what the reading depends on, and what a
+second one should be expected to agree with, including the handful it names as published without a
+first reading I can hand anyone. The observations themselves, and the log of every defect that
+escaped a gate, are kept outside this repository.

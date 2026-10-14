@@ -2,7 +2,8 @@
 
 Why mini-redis is shaped the way it is, and where it deliberately differs from real Redis.
 Split out of the README so that file stays short. Nothing here is needed to run or read the
-code.
+code. Every figure below was taken rather than estimated, and the method behind each
+one is in [MEASUREMENTS.md](MEASUREMENTS.md) beside this file.
 
 ## The protocol layer
 
