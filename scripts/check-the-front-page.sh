@@ -18,6 +18,8 @@
 # means the page changed under the check. Anything else in a block runs exactly as published.
 #
 # What it checks:
+#   0. The tree it checks: a fresh clone of HEAD with the working tree copied over it, so an
+#      uncommitted edit to the page is read here rather than only by CI after the push.
 #   1. The quickstart's own setup block, run in a fresh clone: the venv and the dev install.
 #   2. The quickstart's own run block: the server started as published, and `listening on` read
 #      off its standard output, which is the line the page tells a reader to wait for.
@@ -37,6 +39,9 @@
 # to wait for. The snapshot arm is demonstrated differently -- the file is absent before the stop
 # and present after it, measured -- because removing one call site does not kill it: there are
 # three, and a mutation narrow enough to be interesting leaves the others standing.
+# The working-tree arm is demonstrated by reproducing the regression that made it necessary:
+# the `--ignore-snapshot` row deleted from README.md and left uncommitted, which this fails
+# on and which the same check against the clone alone had passed.
 #
 # Usage:  sh scripts/check-the-front-page.sh [--keep]
 #         CONTAINER=1 sh scripts/check-the-front-page.sh      # adds step 6
@@ -85,12 +90,83 @@ PY
 fi
 
 # ---------------------------------------------------------------------------------------------
+# 1. the tree under test: a fresh clone, brought up to the working tree
+# ---------------------------------------------------------------------------------------------
+if ! git clone -q "$REPO" "$WORK/fresh" 2>"$WORK/clone.err"; then
+    fail "git clone of this repository failed: $(tr -d '\n' < "$WORK/clone.err")"
+    printf 'FRONT PAGE DIRTY\n'; exit 1
+fi
+ok "cloned into a scratch directory"
+
+# A clone carries HEAD, and HEAD is not what is about to be published. One regression got through
+# exactly there: the document cut dropped the `--ignore-snapshot` row from the page, this check
+# read the committed page and reported clean, and CI -- which checks out the pushed commit -- went
+# red on all five jobs. So every path git tracks or holds staged is copied over the clone at its
+# working-tree contents, and a path HEAD carries that the index no longer does is removed. In CI
+# the checkout is clean and the overlay is a no-op, which is the point: the bytes checked here
+# before a push are the bytes checked there after it. An untracked file is deliberately NOT copied
+# -- a clone cannot have it either -- and is named in a note, so a page that leans on a file
+# nobody staged fails here rather than at someone else's clone.
+( cd "$REPO" && git ls-files -z ) > "$WORK/index.z" \
+    || { printf 'fail  git ls-files failed\n'; exit 2; }
+( cd "$REPO" && git ls-files -z --deleted ) > "$WORK/deleted.z" \
+    || { printf 'fail  git ls-files --deleted failed\n'; exit 2; }
+( cd "$REPO" && git ls-files -z --others --exclude-standard ) > "$WORK/others.z" \
+    || { printf 'fail  git ls-files --others failed\n'; exit 2; }
+( cd "$REPO" && git ls-tree -r -z --name-only HEAD ) > "$WORK/head.z" \
+    || { printf 'fail  git ls-tree HEAD failed\n'; exit 2; }
+python3 - "$WORK" "$WORK/fresh" <<'PY' || exit 2
+import pathlib, sys
+work, fresh = pathlib.Path(sys.argv[1]), pathlib.Path(sys.argv[2])
+def names(stem):
+    raw = (work / (stem + ".z")).read_bytes()
+    return [n.decode("utf-8", "surrogateescape") for n in raw.split(b"\0") if n]
+index, deleted, head, others = names("index"), names("deleted"), names("head"), names("others")
+present = [n for n in index if n not in set(deleted)]
+if not present:
+    print("fail  git lists no tracked paths at all, so there is nothing to put over the clone")
+    sys.exit(2)
+(work / "present.z").write_bytes(b"".join(n.encode("utf-8", "surrogateescape") + b"\0" for n in present))
+removed = 0
+for name in sorted(set(head) - set(present)):
+    path = fresh / name
+    if path.is_symlink() or path.is_file():
+        path.unlink()
+        removed += 1
+print("note  %d tracked path(s) to copy over the clone, %d of HEAD's removed" % (len(present), removed))
+if others:
+    print("note  %d untracked file(s) left out, which a clone would not have either: %s"
+          % (len(others), ", ".join(sorted(others)[:4])))
+PY
+if ! ( cd "$REPO" && tar -cf - --null -T "$WORK/present.z" ) | ( cd "$WORK/fresh" && tar -xf - ); then
+    printf 'fail  copying the working tree over the clone failed\n'; exit 2
+fi
+# and the copy is verified rather than assumed, because a tar that wrote nothing would leave this
+# checking HEAD again in silence -- which is the whole defect this step exists for
+python3 - "$REPO" "$WORK/fresh" "$WORK/present.z" <<'PY' || exit 2
+import hashlib, pathlib, sys
+repo, fresh = pathlib.Path(sys.argv[1]), pathlib.Path(sys.argv[2])
+raw = pathlib.Path(sys.argv[3]).read_bytes()
+names = [n.decode("utf-8", "surrogateescape") for n in raw.split(b"\0") if n]
+def digest(path):
+    return hashlib.sha256(path.read_bytes()).hexdigest() if path.is_file() else None
+bad = [n for n in names if digest(repo / n) != digest(fresh / n)]
+if bad:
+    print("fail  %d path(s) in the clone are not the working tree's: %s"
+          % (len(bad), ", ".join(bad[:4])))
+    sys.exit(2)
+print("ok    the clone is the working tree over HEAD, %d path(s) compared by digest" % len(names))
+PY
+
+# ---------------------------------------------------------------------------------------------
 # the extraction. every fenced block is pulled out of README.md by index, so a block that moves
 # is still the same block and a block that disappears fails the run rather than being skipped.
+# It is read out of the clone and not out of $REPO, so the page extracted and the page run are
+# one artifact and cannot be two versions of the same file.
 # ---------------------------------------------------------------------------------------------
 blocks=$WORK/blocks
 mkdir -p "$blocks"
-python3 - "$REPO/README.md" "$blocks" <<'PY'
+python3 - "$WORK/fresh/README.md" "$blocks" <<'PY'
 import pathlib, re, sys
 text = pathlib.Path(sys.argv[1]).read_text()
 out = pathlib.Path(sys.argv[2])
@@ -125,15 +201,6 @@ SUITE=$(block_with "pytest") || { printf 'fail  no published block runs pytest\n
 SDIST=$(block_with "python -m build") || { printf 'fail  no published block builds a distribution\n'; exit 2; }
 
 ok "the page publishes the setup, transcript, suite and distribution blocks this check runs"
-
-# ---------------------------------------------------------------------------------------------
-# 1. a fresh clone, and the page's own setup commands
-# ---------------------------------------------------------------------------------------------
-if ! git clone -q "$REPO" "$WORK/fresh" 2>"$WORK/clone.err"; then
-    fail "git clone of this repository failed: $(tr -d '\n' < "$WORK/clone.err")"
-    printf 'ONE USER DIRTY\n'; exit 1
-fi
-ok "cloned into a scratch directory"
 
 # the setup block holds the venv line and the server line; only the first is setup
 sed -n '1p' "$SETUP" > "$WORK/setup.sh"
