@@ -7,9 +7,10 @@ limiter.
 
 This is `v1` and it is finished. Leader-follower replication is specified in full and
 deliberately unbuilt; [Designed and not built](#designed-and-not-built) says what that
-leaves in the code. `v1` and `v1.5` are tags and the tree has moved past both of them, on
-purpose — every commit since repairs something found in the closing commits or corrects
-something this page claimed.
+leaves in the code. Three tags mark where it has been: `v1` closed the build, `v1.5` added
+the limiter, and `v1.6` is the repairs and the republications after it, with no new
+behaviour among them. Anything past the newest tag repairs something found in the closing
+commits or corrects something this page claimed.
 
 ## Quickstart
 
